@@ -280,21 +280,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		root.addView(mTvGain, gainValLP);
 		
 		// ── Вертикальный VU-метр (справа от Gain-слайдера, полная высота) ──────
+		// 28dp: 10dp сегменты + 18dp зона подписей dB слева от сегментов
 		mVu = new VuMeterView(this);
-		FrameLayout.LayoutParams vuVertLP = new FrameLayout.LayoutParams(dp(14), ViewGroup.LayoutParams.MATCH_PARENT);
+		FrameLayout.LayoutParams vuVertLP = new FrameLayout.LayoutParams(dp(28), ViewGroup.LayoutParams.MATCH_PARENT);
 		vuVertLP.gravity = Gravity.LEFT;
 		vuVertLP.leftMargin = dp(44);
 		root.addView(mVu, vuVertLP);
 
 		// ── Правая колонка: Focus-слайдер + Zoom-рычаг ───────────────────────
-		// Добавляем в root (полная высота экрана), а не в content —
-		// иначе при открытии панели настроек content сжимается и рычаги «схлопываются»
+		// Добавляем в content (рабочая зона БЕЗ нижней панели) —
+		// барабан фокуса и рычаг зума не будут перекрывать кнопку REC.
 		LinearLayout rightCol = new LinearLayout(this);
 		rightCol.setOrientation(LinearLayout.HORIZONTAL);
 		FrameLayout.LayoutParams rightColLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
 		ViewGroup.LayoutParams.MATCH_PARENT);
 		rightColLP.gravity = Gravity.RIGHT;
-		root.addView(rightCol, rightColLP);
+		content.addView(rightCol, rightColLP);
 		
 		// Слайдер фокуса (скрыт по умолчанию)
 		mFocusColumn = buildFocusColumn();
@@ -1533,21 +1534,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		@Override
 		protected void onDraw(Canvas canvas) {
 			final float w = getWidth(), h = getHeight();
+			// Левая зона — подписи dB, правая — сегменты
+			final float lblW = w * 0.56f; // ~16dp из 28dp
+			final float barX = lblW + 1f;
+			final float barW = w - barX - 1f;
+
 			final float segH = (h - N - 1f) / N;
-			final float segW = w - 2f;
+
+			// Краска для подписей
+			Paint lblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+			lblPaint.setColor(0xAAFFFFFF);
+			lblPaint.setTextAlign(Paint.Align.RIGHT);
+			lblPaint.setTextSize(Math.max(6f, segH * 0.85f));
 
 			for (int i = 0; i < N; i++) {
 				float segDb = MIN_DB + (float) i / N * (-MIN_DB);
 				boolean lit = mLevelDb >= segDb;
 				int color;
-				if (!lit)             color = 0xFF181818;
+				if (!lit)              color = 0xFF181818;
 				else if (segDb < -12f) color = 0xFF00CC55;
 				else if (segDb <  -6f) color = 0xFFFFBB00;
 				else                   color = 0xFFFF2200;
 				mSegPaint.setColor(color);
 				float y = h - 1f - i * (segH + 1f) - segH;
-				mRect.set(1f, y, 1f + segW, y + segH);
-				canvas.drawRoundRect(mRect, 2f, 2f, mSegPaint);
+				mRect.set(barX, y, barX + barW, y + segH);
+				canvas.drawRoundRect(mRect, 1.5f, 1.5f, mSegPaint);
+
+				// Подписи на кратных 12 dB + 0dB + -6dB
+				int dbRound = Math.round(segDb);
+				if (dbRound == 0 || dbRound == -6 || dbRound == -12 ||
+						dbRound == -24 || dbRound == -36 || dbRound == -48 || dbRound == -60) {
+					float baseline = y + segH * 0.85f;
+					canvas.drawText(dbRound == 0 ? "0" : String.valueOf(dbRound),
+							lblW - 1f, baseline, lblPaint);
+				}
 			}
 
 			// Пик-маркер
@@ -1562,7 +1582,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				boolean fading = now > mPeakHoldUntil - 400;
 				if (!fading || (now / 150) % 2 == 0) {
 					mPeakPaint.setColor(peakColor);
-					canvas.drawLine(0, py, w, py, mPeakPaint);
+					canvas.drawLine(barX, py, barX + barW, py, mPeakPaint);
 				}
 			}
 		}
@@ -2191,14 +2211,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// Фон полностью прозрачный — не рисуем ничего
 			// canvas.drawRect(0, 0, w, h, mBgPaint);
 
-			final float lblH = mLblPaint.getTextSize() + 2f;
+			// Вычисляем baseline для текста так, чтобы он целиком влез в View
+			Paint.FontMetrics fm = mLblPaint.getFontMetrics();
+			// descent — насколько буквы опускаются ниже baseline
+			final float lblBaseline = h - 1f - fm.descent;
+			final float lblH = -fm.ascent + fm.descent + 3f; // полная высота строки + зазор
 			final float barAreaH = h - lblH;
 
 			// Логарифмическая сетка + подписи частот
 			Paint gridPaint = new Paint();
 			gridPaint.setColor(0x44FFFFFF);
 			gridPaint.setStrokeWidth(0.8f);
-			float[] freqMarks  = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
+			float[] freqMarks   = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
 			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
 			float fMin = (float) Math.log10(20.0);
 			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
@@ -2207,11 +2231,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
 				canvas.drawLine(xf, 0, xf, barAreaH, gridPaint);
-				// Метка: рисуем только если не выходит за правый край и не перекрывает предыдущую
+				// Метка: рисуем только если не перекрывает предыдущую и влезает по ширине
 				float lblW = mLblPaint.measureText(freqLabels[fi]);
 				float lblX = xf - lblW / 2f;
-				if (lblX > prevLblRight && lblX + lblW < w - 2f) {
-					canvas.drawText(freqLabels[fi], xf, h - 1f, mLblPaint);
+				if (lblX >= prevLblRight && lblX + lblW < w - 1f) {
+					canvas.drawText(freqLabels[fi], xf, lblBaseline, mLblPaint);
 					prevLblRight = lblX + lblW + 3f;
 				}
 			}
@@ -2248,8 +2272,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int red   = Math.min(255, (int)(val * 510f));
 				int green = Math.min(255, (int)((1f - val) * 510f));
 				mBarPaint.setColor(0xDD000000 | (red << 16) | (green << 8) | 0x22);
-				float barH = val * barAreaH;
-				canvas.drawRect(x0, barAreaH - barH, x1, barAreaH, mBarPaint);
+				float barH2 = val * barAreaH;
+				canvas.drawRect(x0, barAreaH - barH2, x1, barAreaH, mBarPaint);
 
 				if (pk > 0.02f) {
 					float peakY = barAreaH - pk * barAreaH;
