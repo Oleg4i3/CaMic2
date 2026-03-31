@@ -1,0 +1,2203 @@
+package com.simplecam;
+
+import android.Manifest;
+import android.annotation.SuppressLint;
+import android.app.Activity;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.graphics.*;
+import android.graphics.drawable.GradientDrawable;
+import android.hardware.camera2.*;
+import android.hardware.camera2.params.MeteringRectangle;
+import android.media.*;
+import android.media.MediaCodecInfo.CodecCapabilities;
+import android.media.MediaCodecInfo.CodecProfileLevel;
+import android.os.*;
+import android.view.*;
+import android.widget.*;
+
+import android.content.ContentValues;
+import android.net.Uri;
+import android.os.Environment;
+import android.os.ParcelFileDescriptor;
+import android.provider.MediaStore;
+
+import android.media.AudioDeviceInfo;
+import android.media.AudioManager;
+import android.media.audiofx.AutomaticGainControl;
+import android.media.audiofx.NoiseSuppressor;
+import android.media.audiofx.AcousticEchoCanceler;
+
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+/**
+* SimpleCam — минималистичная камера для горизонтального экрана.
+*
+* Слева — вертикальный Gain-слайдер (полная высота).
+* Справа — рычаг Zoom + появляющийся слайдер Manual Focus.
+* Снизу — панель управления с круглой кнопкой REC.
+*/
+public class MainActivity extends Activity implements SurfaceHolder.Callback {
+	
+	// ─── Константы ────────────────────────────────────────────────────────────
+	private static final int VIDEO_W = 1280;
+	private static final int VIDEO_H = 720;
+	private static final int VIDEO_BPS = 6_000_000;
+	private static final int VIDEO_FPS = 30;
+	private static final int AUDIO_SR = 44100;
+	private static final int REQ_PERMS = 1;
+	private static final float MAX_ZOOM_SPEED = 0.08f;
+	
+	// ─── UI ───────────────────────────────────────────────────────────────────
+	private SurfaceView mSv;
+	private Spinner mSpinner;
+	private VerticalSeekBar mSeekGain;
+	private FocusDrumView mFocusDrum; // барабан ручного фокуса
+	private TextView mTvGain, mTvStatus, mTvFocus;
+	private Button mBtn, mSrcToggleBtn;
+	private VuMeterView mVu;
+	private OscilloscopeView mOscilloscope;
+	private SpectrumView mSpectrum;
+	private ZoomLeverView mZoomLever;
+	private LinearLayout mAudioSrcPanel;
+	private CheckBox mCbSoftClip, mCbManualFocus, mCbFocusAssist;
+	private boolean mAudioSrcExpanded = false;
+	private View mFocusColumn; // контейнер слайдера фокуса
+	
+	// Focus Assist: сохранённый зум до ассиста и хэндлер восстановления
+	private volatile float mSavedZoomBeforeAssist = 1f;
+	private Handler mFocusAssistHandler;
+	
+	// REC-кнопки фоны
+	private GradientDrawable mBtnBgIdle, mBtnBgRec;
+	
+	// ─── Camera2 ──────────────────────────────────────────────────────────────
+	private CameraManager mCamMgr;
+	private CameraDevice mCamDev;
+	private CameraCaptureSession mCapSess;
+	private HandlerThread mCamThread;
+	private Handler mCamHandler;
+	private boolean mSurfaceReady;
+	private boolean mPermsOk;
+	private int mSensorOrientation = 90;
+	private Rect mSensorRect;
+	private float mMaxZoom = 1f;
+	private volatile float mZoomLevel = 1f;
+	private volatile float mZoomLeverPos = 0f;
+	
+	// Фокус
+	private volatile boolean mManualFocus = false;
+	private volatile float mFocusValue = 0f; // 0..1 (0=∞, 1=macro)
+	private float mMinFocusDist = 0f; // минимальная дистанция (диоптрии)
+	
+	// ─── Запись ───────────────────────────────────────────────────────────────
+	private volatile boolean mRecording;
+	private volatile float mGain = 1f;
+	private volatile boolean mSoftClip = false;
+	private volatile int mAudChannels = 2;
+	
+	private MediaCodec mVidEnc, mAudEnc;
+	private MediaMuxer mMuxer;
+	private Surface mEncSurface;
+	private AudioRecord mAudRec;
+	private Thread mAudThread, mVidThread;
+	
+	private int mVidTrack = -1, mAudTrack = -1;
+	private volatile boolean mMuxReady;
+	private final Object mMuxLock = new Object();
+	
+	// ─── MediaStore ───────────────────────────────────────────────────────────
+	private Uri mPendingUri;
+	private ParcelFileDescriptor mPfd;
+	
+	// ─── Синхронизация ────────────────────────────────────────────────────────
+	private volatile CountDownLatch mSessionLatch;
+	
+	// ─── Аудио-источники ──────────────────────────────────────────────────────
+	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
+	
+	// ─── Единый аудио-поток ───────────────────────────────────────────────────
+	private volatile boolean mAudRunning;
+	private volatile boolean mEncoding;
+	private CountDownLatch mAudDoneLatch;
+	
+	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
+	private final Runnable mZoomRunnable = new Runnable() {
+		@Override
+		public void run() {
+			float lever = mZoomLeverPos;
+			if (Math.abs(lever) > 0.02f) {
+				float abs = Math.abs(lever);
+				float speed = (float) ((Math.exp(abs * 3.0) - 1.0) / (Math.exp(3.0) - 1.0)) * MAX_ZOOM_SPEED
+				* Math.signum(lever);
+				mZoomLevel = Math.max(1f, Math.min(mMaxZoom, mZoomLevel + speed));
+				buildAndSendRequest();
+			}
+			if (mCamHandler != null)
+			mCamHandler.postDelayed(this, 33);
+		}
+	};
+	
+	// =========================================================================
+	// Lifecycle
+	// =========================================================================
+	
+	@Override
+	protected void onCreate(Bundle saved) {
+		super.onCreate(saved);
+		getWindow()
+		.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
+		mFocusAssistHandler = new Handler(Looper.getMainLooper());
+		setContentView(buildLayout());
+		mCamMgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+		checkPerms();
+	}
+	
+	@Override
+	protected void onPause() {
+		super.onPause();
+		if (mRecording)
+		mRecording = false;
+	}
+	
+	@Override
+	protected void onDestroy() {
+		super.onDestroy();
+		if (mCamHandler != null)
+		mCamHandler.removeCallbacks(mZoomRunnable);
+		stopAudio();
+		try {
+			if (mCapSess != null)
+			mCapSess.close();
+			} catch (Exception ignored) {
+		}
+		try {
+			if (mCamDev != null)
+			mCamDev.close();
+			} catch (Exception ignored) {
+		}
+		if (mCamThread != null)
+		mCamThread.quitSafely();
+	}
+	
+	// =========================================================================
+	// Layout
+	// =========================================================================
+	
+	private View buildLayout() {
+		FrameLayout root = new FrameLayout(this);
+		root.setBackgroundColor(Color.BLACK);
+		
+		// Превью
+		mSv = new SurfaceView(this);
+		mSv.getHolder().addCallback(this);
+		root.addView(mSv, mp_mp());
+
+		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
+		mOscilloscope = new OscilloscopeView(this);
+		FrameLayout.LayoutParams oscLP = new FrameLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
+		oscLP.gravity = Gravity.TOP | Gravity.LEFT;
+		oscLP.leftMargin = dp(50); // не перекрывать Gain-слайдер
+		oscLP.rightMargin = dp(60);
+		oscLP.topMargin = dp(6);
+		root.addView(mOscilloscope, oscLP);
+		
+		mBtnBgIdle = makeOval(0xFFDDCC00);
+		mBtnBgRec = makeOval(0xFFCC1100);
+		
+		// Внешний вертикальный контейнер: рабочая зона + нижняя панель
+		LinearLayout outer = new LinearLayout(this);
+		outer.setOrientation(LinearLayout.VERTICAL);
+		root.addView(outer, mp_mp());
+		
+		// ── Рабочая зона ──────────────────────────────────────────────────────
+		FrameLayout content = new FrameLayout(this);
+		outer.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
+		
+		// ── Gain-слайдер (слева, ПОЛНАЯ высота экрана включая нижнюю панель) ──
+		// Диапазон: -20 dB .. +20 dB (800 шагов), 0 dB = прогресс 400 (середина)
+		mSeekGain = new VerticalSeekBar(this);
+		mSeekGain.setMax(800);
+		mSeekGain.setProgress(400); // 0 dB = середина
+		mSeekGain.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+			public void onProgressChanged(SeekBar s, int p, boolean u) {
+				// p=0 → -20 dB, p=400 → 0 dB, p=800 → +20 dB
+				float db = -20f + p * 40f / 800f;
+				mGain = (float) Math.pow(10.0, db / 20.0);
+				if (mTvGain != null)
+				mTvGain.setText(String.format("%+.1f", db) + "dB");
+			}
+			
+			public void onStartTrackingTouch(SeekBar s) {}
+			public void onStopTrackingTouch(SeekBar s) {}
+		});
+		// Добавляем в root (полная высота экрана), а не в content
+		FrameLayout.LayoutParams gainLP = new FrameLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT);
+		gainLP.gravity = Gravity.LEFT;
+		root.addView(mSeekGain, gainLP);
+		
+		TextView tvGainLbl = smallLabel("GAIN");
+		FrameLayout.LayoutParams gainLblLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+		ViewGroup.LayoutParams.WRAP_CONTENT);
+		gainLblLP.gravity = Gravity.LEFT | Gravity.TOP;
+		gainLblLP.leftMargin = dp(6);
+		gainLblLP.topMargin = dp(4);
+		root.addView(tvGainLbl, gainLblLP);
+		
+		mTvGain = smallLabel("+0.0dB");
+		FrameLayout.LayoutParams gainValLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+		ViewGroup.LayoutParams.WRAP_CONTENT);
+		gainValLP.gravity = Gravity.LEFT | Gravity.BOTTOM;
+		gainValLP.leftMargin = dp(6);
+		gainValLP.bottomMargin = dp(4);
+		root.addView(mTvGain, gainValLP);
+		
+		// ── Правая колонка: Focus-слайдер + Zoom-рычаг ───────────────────────
+		// Добавляем в root (полная высота экрана), а не в content —
+		// иначе при открытии панели настроек content сжимается и рычаги «схлопываются»
+		LinearLayout rightCol = new LinearLayout(this);
+		rightCol.setOrientation(LinearLayout.HORIZONTAL);
+		FrameLayout.LayoutParams rightColLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+		ViewGroup.LayoutParams.MATCH_PARENT);
+		rightColLP.gravity = Gravity.RIGHT;
+		root.addView(rightCol, rightColLP);
+		
+		// Слайдер фокуса (скрыт по умолчанию)
+		mFocusColumn = buildFocusColumn();
+		mFocusColumn.setVisibility(View.GONE);
+		rightCol.addView(mFocusColumn, new LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT));
+		
+		// Рычаг Zoom
+		mZoomLever = new ZoomLeverView(this);
+		mZoomLever.setListener(pos -> mZoomLeverPos = pos);
+		rightCol.addView(mZoomLever, new LinearLayout.LayoutParams(dp(54), ViewGroup.LayoutParams.MATCH_PARENT));
+		
+		// ── Нижняя панель ─────────────────────────────────────────────────────
+		LinearLayout panel = new LinearLayout(this);
+		panel.setOrientation(LinearLayout.VERTICAL);
+		panel.setBackgroundColor(0x00000000);
+		// Левый паддинг = ширина слайдера Gain (44dp) + зазор 8dp = 52dp.
+		// Правый такой же — контент строго по центру экрана.
+		panel.setPadding(dp(52), dp(2), dp(52), dp(3));
+		outer.addView(panel, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+		ViewGroup.LayoutParams.WRAP_CONTENT));
+		
+		// Тоггл аудио-источника — шестерёнка СЛЕВА от статуса.
+		// panel имеет paddingLeft=52dp (чтобы не заходить за слайдер Gain),
+		// поэтому шестерёнка слева не перекрывается ни слайдером, ни рычагом зума справа.
+		mSrcToggleBtn = new Button(this);
+		mSrcToggleBtn.setText("⚙");
+		mSrcToggleBtn.setAllCaps(false);
+		mSrcToggleBtn.setTextSize(28);
+		mSrcToggleBtn.setTextColor(0xFFBBBBBB);
+		mSrcToggleBtn.setBackground(null);
+		mSrcToggleBtn.setPadding(0, 0, dp(8), 0);
+		mSrcToggleBtn.setOnClickListener(v -> {
+			mAudioSrcExpanded = !mAudioSrcExpanded;
+			mAudioSrcPanel.setVisibility(mAudioSrcExpanded ? View.VISIBLE : View.GONE);
+			mSrcToggleBtn.setText(mAudioSrcExpanded ? "⚙ ▴" : "⚙");
+		});
+		
+		mTvStatus = new TextView(this);
+		mTvStatus.setTextColor(0xFFAAAAAA);
+		mTvStatus.setTextSize(11);
+		mTvStatus.setText("Ready");
+		mTvStatus.setSingleLine(false);
+		mTvStatus.setMaxLines(2);
+		mTvStatus.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+		// Шестерёнка слева, статус справа (weight=1)
+		panel.addView(hrow(mSrcToggleBtn, mTvStatus));
+		
+		// Схлопываемая панель: спиннер + soft clip + manual focus
+		// Центрируем по экрану — слайдер Gain слева не перекрывает
+		mAudioSrcPanel = new LinearLayout(this);
+		mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL);
+		mAudioSrcPanel.setVisibility(View.GONE);
+		mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
+		
+		mSpinner = new Spinner(this);
+		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
+		new ArrayList<String>());
+		ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+		mSpinner.setAdapter(ad);
+		// Фиксированная ширина вместо weight=1 — не тянется на весь экран
+		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
+		mSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+			@Override
+			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+				if (!mRecording) {
+					stopAudio();
+					startMonitor();
+				}
+			}
+			
+			@Override
+			public void onNothingSelected(AdapterView<?> p) {
+			}
+		});
+		
+		LinearLayout srcRow = new LinearLayout(this);
+		srcRow.setOrientation(LinearLayout.HORIZONTAL);
+		srcRow.setGravity(Gravity.CENTER_VERTICAL);
+		srcRow.addView(smallLabel("Src: "));
+		srcRow.addView(mSpinner);
+		mAudioSrcPanel.addView(srcRow);
+		
+		mCbSoftClip = new CheckBox(this);
+		mCbSoftClip.setText("Soft clip");
+		mCbSoftClip.setTextColor(0xCCCCCCCC);
+		mCbSoftClip.setTextSize(12);
+		mCbSoftClip.setChecked(true);
+		mSoftClip = true;
+		mCbSoftClip.setOnCheckedChangeListener((cb, checked) -> mSoftClip = checked);
+		
+		mCbManualFocus = new CheckBox(this);
+		mCbManualFocus.setText("Manual focus");
+		mCbManualFocus.setTextColor(0xCCCCCCCC);
+		mCbManualFocus.setTextSize(12);
+		mCbManualFocus.setOnCheckedChangeListener((cb, checked) -> {
+			mManualFocus = checked;
+			mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
+			// Чекбокс Focus Assist — только при ручной фокусировке
+			if (mCbFocusAssist != null)
+			mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (!checked) {
+				// Скрываем ассист и отменяем восстановление зума
+				if (mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
+			}
+			if (mCamHandler != null)
+			mCamHandler.post(this::buildAndSendRequest);
+		});
+		
+		LinearLayout cbRow = new LinearLayout(this);
+		cbRow.setOrientation(LinearLayout.HORIZONTAL);
+		cbRow.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow.addView(mCbSoftClip);
+		cbRow.addView(mCbManualFocus);
+		mAudioSrcPanel.addView(cbRow);
+		
+		// Focus Assist — появляется только при ручной фокусировке
+		mCbFocusAssist = new CheckBox(this);
+		mCbFocusAssist.setText("Focus assist (zoom while focusing)");
+		mCbFocusAssist.setTextColor(0xCCCCCCCC);
+		mCbFocusAssist.setTextSize(12);
+		mCbFocusAssist.setVisibility(View.GONE); // скрыт до включения Manual focus
+		mAudioSrcPanel.addView(mCbFocusAssist);
+		
+		panel.addView(mAudioSrcPanel);
+		
+		// Кнопка REC
+		mBtn = new Button(this);
+		mBtn.setText("REC");
+		mBtn.setTextColor(Color.WHITE);
+		mBtn.setTextSize(12);
+		mBtn.setBackground(mBtnBgIdle);
+		LinearLayout.LayoutParams btnLP = new LinearLayout.LayoutParams(dp(52), dp(52));
+		btnLP.gravity = Gravity.CENTER_HORIZONTAL;
+		btnLP.topMargin = dp(2);
+		btnLP.bottomMargin = dp(2);
+		mBtn.setLayoutParams(btnLP);
+		mBtn.setOnClickListener(v -> onRecordClick());
+		LinearLayout recRow = new LinearLayout(this);
+		recRow.setOrientation(LinearLayout.HORIZONTAL);
+		recRow.setGravity(Gravity.CENTER);
+		recRow.addView(mBtn);
+		panel.addView(recRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+		ViewGroup.LayoutParams.WRAP_CONTENT));
+		
+		// VU-метр
+		mVu = new VuMeterView(this);
+		LinearLayout.LayoutParams vuLP = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(28));
+		vuLP.topMargin = dp(2);
+		panel.addView(mVu, vuLP);
+
+		// ── Спектр-анализатор (компактный, не закрывает камеру) ────────────
+		mSpectrum = new SpectrumView(this);
+		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
+		specLP.topMargin = dp(2);
+		panel.addView(mSpectrum, specLP);
+
+		return root;
+	}
+	
+	/** Строит колонку с барабаном фокуса (как кольцо на настоящей камере) */
+	private View buildFocusColumn() {
+		FrameLayout col = new FrameLayout(this);
+		col.setBackgroundColor(0x33000000);
+		
+		mFocusDrum = new FocusDrumView(this);
+		mFocusDrum.setOnFocusChangeListener(value -> {
+			mFocusValue = value; // 0=∞, 1=macro
+			updateFocusLabel(value);
+			if (mManualFocus && mCamHandler != null)
+			mCamHandler.post(MainActivity.this::buildAndSendRequest);
+		});
+		mFocusDrum.setOnDrumScrollListener(new FocusDrumView.OnDrumScrollListener() {
+			@Override
+			public void onScrollStart() {
+				if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return;
+				// Отменяем отложенное восстановление (вдруг снова начали крутить)
+				mFocusAssistHandler.removeCallbacksAndMessages(null);
+				// Запоминаем текущий зум и форсируем максимальный (или ×3, но не меньше 4)
+				mSavedZoomBeforeAssist = mZoomLevel;
+				float assistZoom = Math.min(mMaxZoom, Math.max(mZoomLevel * 3f, 4f));
+				mZoomLevel = assistZoom;
+				if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
+			}
+			@Override
+			public void onScrollStop() {
+				if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return;
+				// Через 300 мс восстанавливаем зум
+				mFocusAssistHandler.removeCallbacksAndMessages(null);
+				mFocusAssistHandler.postDelayed(() -> {
+					mZoomLevel = mSavedZoomBeforeAssist;
+					if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
+				}, 300);
+			}
+		});
+		
+		FrameLayout.LayoutParams drumLP = new FrameLayout.LayoutParams(
+		ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+		col.addView(mFocusDrum, drumLP);
+		
+		// Метки ∞ сверху, макро снизу
+		TextView tvTop = smallLabel("∞");
+		FrameLayout.LayoutParams topLP = new FrameLayout.LayoutParams(
+		ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		topLP.gravity = Gravity.TOP | Gravity.CENTER_HORIZONTAL;
+		topLP.topMargin = dp(4);
+		col.addView(tvTop, topLP);
+		
+		TextView tvBot = smallLabel("▲");
+		FrameLayout.LayoutParams botLP = new FrameLayout.LayoutParams(
+		ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		botLP.gravity = Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL;
+		botLP.bottomMargin = dp(4);
+		col.addView(tvBot, botLP);
+		
+		mTvFocus = smallLabel("∞");
+		FrameLayout.LayoutParams midLP = new FrameLayout.LayoutParams(
+		ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+		midLP.gravity = Gravity.CENTER;
+		col.addView(mTvFocus, midLP);
+		
+		return col;
+	}
+	
+	private void updateFocusLabel(float value) {
+		if (mTvFocus == null)
+		return;
+		String txt = value < 0.005f ? "∞" : String.format("%.1f", value * mMinFocusDist) + "m⁻¹";
+		mTvFocus.setText(txt);
+	}
+	
+	// ── Helpers ───────────────────────────────────────────────────────────────
+	
+	private GradientDrawable makeOval(int color) {
+		GradientDrawable d = new GradientDrawable();
+		d.setShape(GradientDrawable.OVAL);
+		d.setColor(color);
+		return d;
+	}
+	
+	private TextView smallLabel(String t) {
+		TextView v = new TextView(this);
+		v.setText(t);
+		v.setTextColor(0xCCCCCCCC);
+		v.setTextSize(11);
+		v.setBackgroundColor(0x88000000);
+		v.setPadding(dp(3), dp(1), dp(3), dp(1));
+		return v;
+	}
+	
+	private LinearLayout hrow(View... views) {
+		LinearLayout ll = new LinearLayout(this);
+		ll.setOrientation(LinearLayout.HORIZONTAL);
+		ll.setGravity(Gravity.CENTER_VERTICAL);
+		LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+		ViewGroup.LayoutParams.WRAP_CONTENT);
+		lp.bottomMargin = dp(2);
+		ll.setLayoutParams(lp);
+		for (View v : views) {
+			if (v.getLayoutParams() == null)
+			v.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
+			ViewGroup.LayoutParams.WRAP_CONTENT));
+			ll.addView(v);
+		}
+		return ll;
+	}
+	
+	private ViewGroup.LayoutParams mp_mp() {
+		return new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+	}
+	
+	private int dp(int x) {
+		return Math.round(x * getResources().getDisplayMetrics().density);
+	}
+	
+	// =========================================================================
+	// Разрешения
+	// =========================================================================
+	
+	private void checkPerms() {
+		List<String> need = new ArrayList<>();
+		if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
+		need.add(Manifest.permission.CAMERA);
+		if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+		need.add(Manifest.permission.RECORD_AUDIO);
+		if (need.isEmpty()) {
+			mPermsOk = true;
+			if (mSurfaceReady)
+			openCamera();
+		} else
+		requestPermissions(need.toArray(new String[0]), REQ_PERMS);
+	}
+	
+	@Override
+	public void onRequestPermissionsResult(int req, String[] perms, int[] res) {
+		for (int r : res) {
+			if (r != PackageManager.PERMISSION_GRANTED) {
+				status("Permissions required");
+				return;
+			}
+		}
+		mPermsOk = true;
+		if (mSurfaceReady)
+		openCamera();
+	}
+	
+	// =========================================================================
+	// SurfaceHolder.Callback
+	// =========================================================================
+	
+	@Override
+	public void surfaceCreated(SurfaceHolder h) {
+		mSurfaceReady = true;
+		if (mPermsOk)
+		openCamera();
+	}
+	
+	@Override
+	public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {
+	}
+	
+	@Override
+	public void surfaceDestroyed(SurfaceHolder h) {
+		mSurfaceReady = false;
+	}
+	
+	// =========================================================================
+	// Camera2
+	// =========================================================================
+	
+	@SuppressLint("MissingPermission")
+	private void openCamera() {
+		if (mCamThread == null || !mCamThread.isAlive()) {
+			mCamThread = new HandlerThread("cam");
+			mCamThread.start();
+			mCamHandler = new Handler(mCamThread.getLooper());
+		}
+		try {
+			String camId = null;
+			for (String id : mCamMgr.getCameraIdList()) {
+				CameraCharacteristics ch = mCamMgr.getCameraCharacteristics(id);
+				Integer facing = ch.get(CameraCharacteristics.LENS_FACING);
+				if (facing != null && facing == CameraCharacteristics.LENS_FACING_BACK) {
+					camId = id;
+					Integer so = ch.get(CameraCharacteristics.SENSOR_ORIENTATION);
+					if (so != null)
+					mSensorOrientation = so;
+					Rect rect = ch.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE);
+					if (rect != null)
+					mSensorRect = rect;
+					Float maxZ = ch.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM);
+					if (maxZ != null)
+					mMaxZoom = maxZ;
+					Float minFocus = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
+					if (minFocus != null)
+					mMinFocusDist = minFocus;
+					break;
+				}
+			}
+			if (camId == null)
+			camId = mCamMgr.getCameraIdList()[0];
+			
+			mCamMgr.openCamera(camId, new CameraDevice.StateCallback() {
+				@Override
+				public void onOpened(CameraDevice dev) {
+					mCamDev = dev;
+					startPreview();
+					buildAudioSources();
+					mCamHandler.post(mZoomRunnable);
+				}
+				
+				@Override
+				public void onDisconnected(CameraDevice dev) {
+					dev.close();
+					mCamDev = null;
+				}
+				
+				@Override
+				public void onError(CameraDevice dev, int e) {
+					dev.close();
+					mCamDev = null;
+				}
+			}, mCamHandler);
+			} catch (Exception e) {
+			status("openCamera: " + e.getMessage());
+		}
+	}
+	
+	private void startPreview() {
+		if (mCamDev == null || !mSurfaceReady)
+		return;
+		try {
+			if (mCapSess != null) {
+				mCapSess.close();
+				mCapSess = null;
+			}
+			Surface preview = mSv.getHolder().getSurface();
+			List<Surface> targets = new ArrayList<>();
+			targets.add(preview);
+			if (mEncSurface != null && mEncSurface.isValid())
+			targets.add(mEncSurface);
+			
+			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
+				@Override
+				public void onConfigured(CameraCaptureSession sess) {
+					mCapSess = sess;
+					buildAndSendRequest();
+					CountDownLatch l = mSessionLatch;
+					if (l != null) {
+						l.countDown();
+						mSessionLatch = null;
+					}
+				}
+				
+				@Override
+				public void onConfigureFailed(CameraCaptureSession sess) {
+					status("Session config failed");
+				}
+			}, mCamHandler);
+			} catch (Exception e) {
+			status("startPreview: " + e.getMessage());
+		}
+	}
+	
+	private void buildAndSendRequest() {
+		CameraCaptureSession sess = mCapSess;
+		CameraDevice dev = mCamDev;
+		if (sess == null || dev == null || !mSurfaceReady)
+		return;
+		try {
+			// Всегда TEMPLATE_PREVIEW — шаблон не переключается при старте записи,
+			// поэтому AE не пересчитывается и яркость не прыгает.
+			// Encoder surface просто добавляется как дополнительный target.
+			int tmpl = CameraDevice.TEMPLATE_PREVIEW;
+			Surface preview = mSv.getHolder().getSurface();
+			CaptureRequest.Builder rb = dev.createCaptureRequest(tmpl);
+			rb.addTarget(preview);
+			if (mEncSurface != null && mEncSurface.isValid())
+			rb.addTarget(mEncSurface);
+			
+			if (mManualFocus) {
+				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
+				// Верх слайдера = прогресс 100 = macro (mMinFocusDist)
+				// Низ слайдера  = прогресс 0   = бесконечность (0 диоптрий)
+				float diopters = mFocusValue * mMinFocusDist;
+				rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
+				rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, diopters);
+				} else {
+				rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_VIDEO);
+			}
+			
+			rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+			
+			if (mSensorRect != null) {
+				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
+				int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
+				int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
+				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+			}
+			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
+			} catch (Exception ignored) {
+		}
+	}
+	
+	// =========================================================================
+	// REC / STOP
+	// =========================================================================
+	
+	private void onRecordClick() {
+		if (mRecording) {
+			mRecording = false;
+			mBtn.setEnabled(false);
+			status("Stopping…");
+			} else {
+			mBtn.setEnabled(false);
+			status("Starting…");
+			new Thread(this::doStart).start();
+		}
+	}
+	
+	// =========================================================================
+	// Запуск записи
+	// =========================================================================
+	
+	@SuppressLint("MissingPermission")
+	private void doStart() {
+		try {
+			String displayPath;
+			if (Build.VERSION.SDK_INT >= 29) {
+				ContentValues cv = new ContentValues();
+				cv.put(MediaStore.Video.Media.DISPLAY_NAME, "VID_" + System.currentTimeMillis() + ".mp4");
+				cv.put(MediaStore.Video.Media.MIME_TYPE, "video/mp4");
+				cv.put(MediaStore.Video.Media.RELATIVE_PATH, "DCIM/CaMic");
+				cv.put(MediaStore.Video.Media.IS_PENDING, 1);
+				mPendingUri = getContentResolver().insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, cv);
+				mPfd = getContentResolver().openFileDescriptor(mPendingUri, "rw");
+				mMuxer = new MediaMuxer(mPfd.getFileDescriptor(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+				displayPath = "DCIM/CaMic";
+				} else {
+				@SuppressWarnings("deprecation")
+				File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+				"CaMic");
+				//noinspection ResultOfMethodCallIgnored
+				dir.mkdirs();
+				File f = new File(dir, "VID_" + System.currentTimeMillis() + ".mp4");
+				mMuxer = new MediaMuxer(f.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
+				displayPath = f.getAbsolutePath();
+			}
+			@SuppressWarnings("deprecation")
+			int rot = getWindowManager().getDefaultDisplay().getRotation() * 90;
+			mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
+			
+			MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
+			vf.setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BPS);
+			vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
+			vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+			vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface);
+			vf.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline);
+			vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
+			mVidEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+			mVidEnc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+			mEncSurface = mVidEnc.createInputSurface();
+			mVidEnc.start();
+			
+			stopAudio();
+			int pos = mSpinner.getSelectedItemPosition();
+			AudioSrcItem src = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
+			int audioSrc = src != null ? src.audioSource : MediaRecorder.AudioSource.DEFAULT;
+			
+			int chanCfg = AudioFormat.CHANNEL_IN_STEREO;
+			int channels = 2;
+			int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+			if (minBuf <= 0) {
+				chanCfg = AudioFormat.CHANNEL_IN_MONO;
+				channels = 1;
+				minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+			}
+			int bufSize = Math.max(minBuf, AUDIO_SR * channels * 2 / 5);
+			mAudRec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+			if (mAudRec.getState() != AudioRecord.STATE_INITIALIZED && channels == 2) {
+				mAudRec.release();
+				chanCfg = AudioFormat.CHANNEL_IN_MONO;
+				channels = 1;
+				minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+				bufSize = Math.max(minBuf, AUDIO_SR * 2 / 5);
+				mAudRec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+			}
+			if (mAudRec.getState() != AudioRecord.STATE_INITIALIZED) {
+				mAudRec.release();
+				channels = 2;
+				chanCfg = AudioFormat.CHANNEL_IN_STEREO;
+				minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+				mAudRec = new AudioRecord(MediaRecorder.AudioSource.DEFAULT, AUDIO_SR, chanCfg,
+				AudioFormat.ENCODING_PCM_16BIT, Math.max(minBuf, AUDIO_SR * 4 / 5));
+				status("Source unavailable, using Default");
+			}
+			mAudChannels = channels;
+			if (Build.VERSION.SDK_INT >= 23 && src != null && src.device != null)
+			mAudRec.setPreferredDevice(src.device);
+			disableAudioEffects(mAudRec.getAudioSessionId());
+			
+			MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SR, mAudChannels);
+			af.setInteger(MediaFormat.KEY_BIT_RATE, mAudChannels == 1 ? 96_000 : 192_000);
+			af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
+			mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+			mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+			mAudEnc.start();
+			
+			mVidTrack = -1;
+			mAudTrack = -1;
+			mMuxReady = false;
+			
+			mAudDoneLatch = new CountDownLatch(1);
+			mRecording = true;
+			startAudioThread(true);
+			
+			mSessionLatch = new CountDownLatch(1);
+			runOnUiThread(this::startPreview);
+			if (!mSessionLatch.await(4, TimeUnit.SECONDS))
+			throw new Exception("Camera session timeout");
+			Thread.sleep(100);
+			
+			final String fp = displayPath;
+			mVidThread = new Thread(() -> videoLoop(fp), "vid");
+			mVidThread.start();
+			
+			runOnUiThread(() -> {
+				mBtn.setText("⏹ STOP");
+				mBtn.setBackground(mBtnBgRec);
+				mBtn.setEnabled(true);
+				status("● REC  →  " + fp);
+			});
+			} catch (Exception e) {
+			mRecording = false;
+			cleanup(null);
+			runOnUiThread(() -> {
+				mBtn.setText("⏺ REC");
+				mBtn.setBackground(mBtnBgIdle);
+				mBtn.setEnabled(true);
+				status("Error: " + e.getMessage());
+			});
+		}
+	}
+	
+	// =========================================================================
+	// Аудио-пайплайн
+	// =========================================================================
+	
+	@SuppressLint("MissingPermission")
+	private void startMonitor() {
+		if (mAudRunning || !mPermsOk)
+		return;
+		int pos = mSpinner.getSelectedItemPosition();
+		AudioSrcItem src = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
+		int audioSrc = src != null ? src.audioSource : MediaRecorder.AudioSource.MIC;
+		
+		int chanCfg = AudioFormat.CHANNEL_IN_STEREO;
+		int channels = 2;
+		int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+		if (minBuf <= 0) {
+			chanCfg = AudioFormat.CHANNEL_IN_MONO;
+			channels = 1;
+			minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+		}
+		int bufSize = Math.max(minBuf, AUDIO_SR * channels * 2 / 5);
+		AudioRecord rec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+		if (rec.getState() != AudioRecord.STATE_INITIALIZED && channels == 2) {
+			rec.release();
+			chanCfg = AudioFormat.CHANNEL_IN_MONO;
+			channels = 1;
+			minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+			bufSize = Math.max(minBuf, AUDIO_SR * 2 / 5);
+			rec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+		}
+		if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
+			rec.release();
+			return;
+		}
+		if (Build.VERSION.SDK_INT >= 23 && src != null && src.device != null)
+		rec.setPreferredDevice(src.device);
+		disableAudioEffects(rec.getAudioSessionId());
+		mAudRec = rec;
+		mAudChannels = channels;
+		startAudioThread(false);
+	}
+	
+	private void startAudioThread(boolean encoding) {
+		mAudRunning = true;
+		mEncoding = encoding;
+		mAudThread = new Thread(this::audioMainLoop, "aud-main");
+		mAudThread.setDaemon(true);
+		mAudThread.start();
+	}
+	
+	private void stopAudio() {
+		mAudRunning = false;
+		AudioRecord rec = mAudRec;
+		if (rec != null)
+		try {
+			rec.stop();
+			} catch (Exception ignored) {
+		}
+		if (mAudThread != null) {
+			try {
+				mAudThread.join(500);
+				} catch (InterruptedException ignored) {
+			}
+			mAudThread = null;
+		}
+		if (mAudRec != null) {
+			try {
+				mAudRec.release();
+				} catch (Exception ignored) {
+			}
+			mAudRec = null;
+		}
+	}
+	
+	private void disableAudioEffects(int sid) {
+		try {
+			if (AutomaticGainControl.isAvailable()) {
+				AutomaticGainControl a = AutomaticGainControl.create(sid);
+				if (a != null) {
+					a.setEnabled(false);
+					a.release();
+				}
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (NoiseSuppressor.isAvailable()) {
+				NoiseSuppressor n = NoiseSuppressor.create(sid);
+				if (n != null) {
+					n.setEnabled(false);
+					n.release();
+				}
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (AcousticEchoCanceler.isAvailable()) {
+				AcousticEchoCanceler e = AcousticEchoCanceler.create(sid);
+				if (e != null) {
+					e.setEnabled(false);
+					e.release();
+				}
+			}
+			} catch (Exception ignored) {
+		}
+	}
+	
+	private void audioMainLoop() {
+		final AudioRecord rec = mAudRec;
+		final int ch = mAudChannels;
+		final int chunkSamples = AUDIO_SR * ch / 50;
+		short[] buf = new short[chunkSamples];
+		long pts = 0;
+		rec.startRecording();
+		
+		while (mAudRunning) {
+			int r = rec.read(buf, 0, chunkSamples);
+			if (r <= 0)
+			continue;
+			
+			final float g = mGain;
+			final boolean sc = mSoftClip;
+			long sumSq = 0;
+			for (int i = 0; i < r; i++) {
+				float s = buf[i] * g;
+				if (sc) {
+					final float T = 32768f * 0.7f;
+					final float knee = 32768f - T;
+					float abs = Math.abs(s);
+					if (abs > T)
+					s = Math.signum(s) * (T + knee * (float) Math.tanh((abs - T) / knee));
+				}
+				if (s > 32767f)
+				s = 32767f;
+				else if (s < -32768f)
+				s = -32768f;
+				buf[i] = (short) s;
+				sumSq += (long) buf[i] * buf[i];
+			}
+			// Истинный пик (после gain/soft-clip)
+		float peakAmp = 0f;
+		for (int _pi = 0; _pi < r; _pi++) {
+			float _a = Math.abs(buf[_pi]) / 32768f;
+			if (_a > peakAmp) peakAmp = _a;
+		}
+		mVu.setPeak(peakAmp);
+		mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
+		if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
+		if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
+			
+			if (!mEncoding) {
+				pts = 0;
+				continue;
+			}
+			if (!mRecording) {
+				int idx = mAudEnc.dequeueInputBuffer(50_000);
+				if (idx >= 0)
+				mAudEnc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+				drainAudioCodec(true);
+				mEncoding = false;
+				pts = 0;
+				CountDownLatch latch = mAudDoneLatch;
+				if (latch != null)
+				latch.countDown();
+				continue;
+			}
+			
+			int idx = mAudEnc.dequeueInputBuffer(10_000);
+			if (idx >= 0) {
+				ByteBuffer bb = mAudEnc.getInputBuffer(idx);
+				bb.clear();
+				for (int i = 0; i < r; i++) {
+					bb.put((byte) (buf[i] & 0xFF));
+					bb.put((byte) (buf[i] >> 8 & 0xFF));
+				}
+				mAudEnc.queueInputBuffer(idx, 0, r * 2, pts, 0);
+			}
+			pts += (long) r * 1_000_000L / AUDIO_SR / ch;
+			drainAudioCodec(false);
+		}
+		mVu.setLevel(0f);
+		try {
+			rec.stop();
+			} catch (Exception ignored) {
+		}
+	}
+	
+	private void drainAudioCodec(boolean eos) {
+		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+		while (true) {
+			int out = mAudEnc.dequeueOutputBuffer(info, eos ? 50_000 : 0);
+			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+				synchronized (mMuxLock) {
+					mAudTrack = mMuxer.addTrack(mAudEnc.getOutputFormat());
+					tryStartMuxer();
+				}
+				} else if (out >= 0) {
+				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+				if (mMuxReady && !cfg && info.size > 0) {
+					ByteBuffer data = mAudEnc.getOutputBuffer(out);
+					synchronized (mMuxLock) {
+						if (mMuxReady)
+						mMuxer.writeSampleData(mAudTrack, data, info);
+					}
+				}
+				mAudEnc.releaseOutputBuffer(out, false);
+				if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0)
+				break;
+			} else
+			break;
+		}
+	}
+	
+	// =========================================================================
+	// Видео-поток
+	// =========================================================================
+	
+	private void videoLoop(String path) {
+		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+		boolean eosSent = false;
+		long baseTs = -1;
+		while (true) {
+			if (!mRecording && !eosSent) {
+				try {
+					mVidEnc.signalEndOfInputStream();
+					} catch (Exception ignored) {
+				}
+				eosSent = true;
+			}
+			int out = mVidEnc.dequeueOutputBuffer(info, 20_000);
+			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+				synchronized (mMuxLock) {
+					mVidTrack = mMuxer.addTrack(mVidEnc.getOutputFormat());
+					tryStartMuxer();
+				}
+				} else if (out >= 0) {
+				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+				if (mMuxReady && !cfg && info.size > 0) {
+					if (baseTs < 0)
+					baseTs = info.presentationTimeUs;
+					ByteBuffer data = mVidEnc.getOutputBuffer(out);
+					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
+					n.set(info.offset, info.size, info.presentationTimeUs - baseTs, info.flags);
+					synchronized (mMuxLock) {
+						if (mMuxReady)
+						mMuxer.writeSampleData(mVidTrack, data, n);
+					}
+				}
+				mVidEnc.releaseOutputBuffer(out, false);
+				if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0)
+				break;
+			}
+		}
+		try {
+			if (mAudDoneLatch != null)
+			mAudDoneLatch.await(5000, TimeUnit.MILLISECONDS);
+			} catch (InterruptedException ignored) {
+		}
+		cleanup(path);
+	}
+	
+	private void tryStartMuxer() {
+		if (!mMuxReady && mVidTrack >= 0 && mAudTrack >= 0) {
+			mMuxer.start();
+			mMuxReady = true;
+			if (mVidEnc != null)
+			try {
+				Bundle p = new Bundle();
+				p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+				mVidEnc.setParameters(p);
+				} catch (Exception ignored) {
+			}
+		}
+	}
+	
+	// =========================================================================
+	// Финализация
+	// =========================================================================
+	
+	private void cleanup(String savedPath) {
+		try {
+			if (mVidEnc != null) {
+				mVidEnc.stop();
+				mVidEnc.release();
+				mVidEnc = null;
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (mAudEnc != null) {
+				mAudEnc.stop();
+				mAudEnc.release();
+				mAudEnc = null;
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (mEncSurface != null) {
+				mEncSurface.release();
+				mEncSurface = null;
+			}
+			} catch (Exception ignored) {
+		}
+		synchronized (mMuxLock) {
+			try {
+				if (mMuxer != null) {
+					if (mMuxReady)
+					mMuxer.stop();
+					mMuxer.release();
+					mMuxer = null;
+					mMuxReady = false;
+				}
+				} catch (Exception ignored) {
+			}
+		}
+		try {
+			if (mPfd != null) {
+				mPfd.close();
+				mPfd = null;
+			}
+			} catch (Exception ignored) {
+		}
+		if (Build.VERSION.SDK_INT >= 29 && mPendingUri != null) {
+			ContentValues cv = new ContentValues();
+			cv.put(MediaStore.Video.Media.IS_PENDING, 0);
+			getContentResolver().update(mPendingUri, cv, null, null);
+			mPendingUri = null;
+		}
+		final String msg = savedPath != null ? "Saved: " + savedPath : "Stopped";
+		runOnUiThread(() -> {
+			mBtn.setText("⏺ REC");
+			mBtn.setBackground(mBtnBgIdle);
+			mBtn.setEnabled(true);
+			status(msg);
+			startPreview();
+		});
+	}
+	
+	private void status(String s) {
+		runOnUiThread(() -> mTvStatus.setText(s));
+	}
+	
+	// =========================================================================
+	// Аудио-источники
+	// =========================================================================
+	
+	private void buildAudioSources() {
+		List<AudioSrcItem> list = new ArrayList<>();
+		if (Build.VERSION.SDK_INT >= 23) {
+			AudioManager am = (AudioManager) getSystemService(AUDIO_SERVICE);
+			AudioDeviceInfo[] devs = am.getDevices(AudioManager.GET_DEVICES_INPUTS);
+			boolean hasBuiltin = false;
+			for (AudioDeviceInfo d : devs) {
+				int t = d.getType();
+				if (t == AudioDeviceInfo.TYPE_BUILTIN_MIC) {
+					if (hasBuiltin)
+					continue;
+					hasBuiltin = true;
+					list.add(new AudioSrcItem("Built-in mic", MediaRecorder.AudioSource.MIC, d));
+					if (Build.VERSION.SDK_INT >= 24)
+					list.add(new AudioSrcItem("Built-in mic (raw)", MediaRecorder.AudioSource.UNPROCESSED, d));
+					} else if (t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+					CharSequence pn = d.getProductName();
+					list.add(new AudioSrcItem("USB: " + (pn != null && pn.length() > 0 ? pn : "audio"),
+					MediaRecorder.AudioSource.MIC, d));
+					} else if (t == AudioDeviceInfo.TYPE_WIRED_HEADSET) {
+					list.add(new AudioSrcItem("Wired headset", MediaRecorder.AudioSource.MIC, d));
+					} else if (t == AudioDeviceInfo.TYPE_BLUETOOTH_SCO) {
+					list.add(new AudioSrcItem("Bluetooth mic", MediaRecorder.AudioSource.MIC, d));
+				}
+			}
+		}
+		if (list.isEmpty()) {
+			list.add(new AudioSrcItem("Default", MediaRecorder.AudioSource.DEFAULT, null));
+			list.add(new AudioSrcItem("Microphone", MediaRecorder.AudioSource.MIC, null));
+			list.add(new AudioSrcItem("Camcorder", MediaRecorder.AudioSource.CAMCORDER, null));
+			list.add(new AudioSrcItem("Communication", MediaRecorder.AudioSource.VOICE_COMMUNICATION, null));
+			if (Build.VERSION.SDK_INT >= 24)
+			list.add(new AudioSrcItem("Unprocessed (raw)", MediaRecorder.AudioSource.UNPROCESSED, null));
+		}
+		runOnUiThread(() -> {
+			mSrcList.clear();
+			mSrcList.addAll(list);
+			List<String> names = new ArrayList<>();
+			for (AudioSrcItem item : mSrcList)
+			names.add(item.name);
+			@SuppressWarnings("unchecked")
+			ArrayAdapter<String> ad2 = (ArrayAdapter<String>) mSpinner.getAdapter();
+			ad2.clear();
+			ad2.addAll(names);
+			ad2.notifyDataSetChanged();
+			
+			int defaultIdx = 0;
+			for (int i = 0; i < mSrcList.size(); i++) {
+				AudioSrcItem item = mSrcList.get(i);
+				if (item.device != null && Build.VERSION.SDK_INT >= 23) {
+					int t = item.device.getType();
+					if (t == AudioDeviceInfo.TYPE_USB_DEVICE || t == AudioDeviceInfo.TYPE_USB_HEADSET) {
+						defaultIdx = i;
+						break;
+					}
+				}
+			}
+			if (defaultIdx == 0) {
+				for (int i = 0; i < mSrcList.size(); i++) {
+					if (mSrcList.get(i).audioSource == MediaRecorder.AudioSource.UNPROCESSED) {
+						defaultIdx = i;
+						break;
+					}
+				}
+			}
+			mSpinner.setSelection(defaultIdx);
+			if (!mRecording) {
+				stopAudio();
+				startMonitor();
+			}
+		});
+	}
+	
+	// =========================================================================
+	// Вспомогательные классы
+	// =========================================================================
+	
+	private static class AudioSrcItem {
+		final String name;
+		final int audioSource;
+		final AudioDeviceInfo device;
+		
+		AudioSrcItem(String n, int s, AudioDeviceInfo d) {
+			name = n;
+			audioSource = s;
+			device = d;
+		}
+	}
+	
+	// ─── Вертикальный SeekBar ─────────────────────────────────────────────────
+	// Полностью кастомная отрисовка — без ротации стандартного SeekBar.
+	// Верх = max, низ = 0. Нет расхождения между треком и бегунком.
+	
+	static class VerticalSeekBar extends View {
+		private int mMax = 100;
+		private int mProgress = 0;
+		
+		private final Paint mTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mThumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		
+		private SeekBar.OnSeekBarChangeListener mListener;
+		
+		VerticalSeekBar(Context c) {
+			super(c);
+			mTrackPaint.setColor(0x44FFFFFF);
+			mFillPaint.setColor(0xFFDDCC00); // жёлтый, как кнопка REC
+			mThumbPaint.setColor(0xFFFFFFFF);
+			setClickable(true);
+		}
+		
+		void setMax(int max) {
+			mMax = max;
+			invalidate();
+		}
+		
+		void setProgress(int p) {
+			mProgress = Math.max(0, Math.min(mMax, p));
+			invalidate();
+		}
+		
+		int getMax() {
+			return mMax;
+		}
+		
+		int getProgress() {
+			return mProgress;
+		}
+		
+		void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l) {
+			mListener = l;
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			final float trackW = w * 0.35f;
+			final float cx = w / 2f;
+			final float trkX1 = cx - trackW / 2f;
+			final float trkX2 = cx + trackW / 2f;
+			final float thumbR = w * 0.42f;
+			final float padV = thumbR + 2f; // минимальный отступ — только чтобы бегунок не обрезался
+			final float trkT = padV;
+			final float trkB = h - padV;
+			final float trkH = trkB - trkT;
+			
+			// Позиция бегунка: progress=max → top, progress=0 → bottom
+			float frac = mMax > 0 ? (float) mProgress / mMax : 0f;
+			float thumbY = trkB - frac * trkH;
+			
+			// Трек (фон)
+			RectF track = new RectF(trkX1, trkT, trkX2, trkB);
+			canvas.drawRoundRect(track, trackW / 2f, trackW / 2f, mTrackPaint);
+			
+			// Заполненная часть (от thumbY до низа)
+			RectF fill = new RectF(trkX1, thumbY, trkX2, trkB);
+			canvas.drawRoundRect(fill, trackW / 2f, trackW / 2f, mFillPaint);
+			
+			// Метка нуля — горизонтальная черта посередине трека
+			float zeroY = trkB - 0.5f * trkH; // 0 dB = середина (p=400/800)
+			Paint zeroPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+			zeroPaint.setColor(0x88FFFFFF);
+			zeroPaint.setStrokeWidth(1.5f);
+			canvas.drawLine(trkX1 - 4f, zeroY, trkX2 + 4f, zeroY, zeroPaint);
+			
+			// Бегунок
+			canvas.drawCircle(cx, thumbY, thumbR, mThumbPaint);
+		}
+		
+		@Override
+		public boolean onTouchEvent(MotionEvent e) {
+			if (!isEnabled())
+			return false;
+			final float h = getHeight();
+			final float w = getWidth();
+			final float thumbR = w * 0.42f;
+			final float padV = thumbR + 2f;
+			final float trkT = padV;
+			final float trkB = h - padV;
+			final float trkH = trkB - trkT;
+			
+			switch (e.getAction()) {
+				case MotionEvent.ACTION_DOWN:
+				if (mListener != null)
+				mListener.onStartTrackingTouch(null);
+				// fall through
+				case MotionEvent.ACTION_MOVE: {
+					float frac = 1f - (e.getY() - trkT) / trkH;
+					int p = Math.max(0, Math.min(mMax, Math.round(frac * mMax)));
+					mProgress = p;
+					invalidate();
+					if (mListener != null)
+					mListener.onProgressChanged(null, p, true);
+					return true;
+				}
+				case MotionEvent.ACTION_UP:
+				case MotionEvent.ACTION_CANCEL:
+				if (mListener != null)
+				mListener.onStopTrackingTouch(null);
+				return true;
+			}
+			return false;
+		}
+	}
+	
+	// ─── VU-метр dBFS ────────────────────────────────────────────────────────
+	
+	static class VuMeterView extends View {
+		private static final int N = 30;
+		private static final float MIN_DB = -60f;
+		private static final long PEAK_HOLD_MS = 1800;
+		
+		private final Paint mSegPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mLblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mPeakPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final RectF mRect = new RectF();
+		private float mLevelDb = MIN_DB;
+		private float mPeakDb = MIN_DB;
+		private long mPeakHoldUntil = 0;
+		
+		VuMeterView(Context c) {
+			super(c);
+			mLblPaint.setColor(0xAAFFFFFF);
+			mLblPaint.setTextAlign(Paint.Align.CENTER);
+			mLblPaint.setTextSize(9 * c.getResources().getDisplayMetrics().density);
+			mPeakPaint.setColor(0xFFFFFFFF);
+			mPeakPaint.setStrokeWidth(2.5f);
+			mPeakPaint.setStyle(Paint.Style.STROKE);
+		}
+		
+		void setLevel(float rms) {
+			mLevelDb = rms > 1e-6f ? Math.max(MIN_DB, (float) (20.0 * Math.log10(rms))) : MIN_DB;
+			postInvalidate();
+		}
+		
+		void setPeak(float peak) {
+			float db = peak > 1e-6f ? Math.max(MIN_DB, (float) (20.0 * Math.log10(peak))) : MIN_DB;
+			if (db >= mPeakDb || System.currentTimeMillis() > mPeakHoldUntil) {
+				mPeakDb = db;
+				mPeakHoldUntil = System.currentTimeMillis() + PEAK_HOLD_MS;
+			} else if (System.currentTimeMillis() > mPeakHoldUntil - 300) {
+				// Decay after hold
+				mPeakDb -= 1.5f;
+				if (mPeakDb < MIN_DB) mPeakDb = MIN_DB;
+			}
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			final float lblH = mLblPaint.getTextSize() + 2f;
+			final float bw = w / N, gap = bw * 0.15f;
+			final float barB = h - lblH;
+			for (int i = 0; i < N; i++) {
+				float segDb = MIN_DB + (float) i / N * (-MIN_DB);
+				boolean lit = mLevelDb >= segDb;
+				int color;
+				if (!lit)
+				color = 0xFF181818;
+				else if (segDb < -12f)
+				color = 0xFF00CC55;
+				else if (segDb < -6f)
+				color = 0xFFFFBB00;
+				else
+				color = 0xFFFF2200;
+				mSegPaint.setColor(color);
+				float x = i * bw + gap * 0.5f;
+				mRect.set(x, 2f, x + bw - gap, barB);
+				canvas.drawRoundRect(mRect, 3f, 3f, mSegPaint);
+			}
+			// Peak hold маркер
+			if (mPeakDb > MIN_DB) {
+				float px = (mPeakDb - MIN_DB) / (-MIN_DB) * w;
+				long now = System.currentTimeMillis();
+				// Цвет: зелёный / жёлтый / красный + мигание при decay
+				int peakColor;
+				if (mPeakDb >= -3f) peakColor = 0xFFFF2200;
+				else if (mPeakDb >= -12f) peakColor = 0xFFFFBB00;
+				else peakColor = 0xFF00FF88;
+				boolean fading = now > mPeakHoldUntil - 400;
+				if (!fading || (now / 150) % 2 == 0) {
+					mPeakPaint.setColor(peakColor);
+					canvas.drawLine(px, 2f, px, barB, mPeakPaint);
+				}
+			}
+			int[] marks = { -40, -20, -10, -6, -3, 0 };
+			for (int db : marks) {
+				float xPos = (db - MIN_DB) / (-MIN_DB) * w;
+				canvas.drawText(db == 0 ? "0" : String.valueOf(db), xPos, h - 1f, mLblPaint);
+			}
+		}
+	}
+	
+	// ─── Рычаг зума ──────────────────────────────────────────────────────────
+	
+	static class ZoomLeverView extends View {
+		interface Listener {
+			void onLever(float pos);
+		}
+		
+		private Listener mListener;
+		private volatile float mPos = 0f;
+		private boolean mTracking = false;
+		private float trkT, trkB, trkH, trkW, mid, cx;
+		
+		private final Paint mTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mThumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mMarkPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mTextPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		
+		ZoomLeverView(Context c) {
+			super(c);
+			mTrackPaint.setColor(0x55FFFFFF);
+			mThumbPaint.setColor(0xFFFFFFFF);
+			mMarkPaint.setColor(0xAAFFFFFF);
+			mMarkPaint.setStyle(Paint.Style.STROKE);
+			mMarkPaint.setStrokeWidth(1.5f * c.getResources().getDisplayMetrics().density);
+			mTextPaint.setColor(0xCCFFFFFF);
+			mTextPaint.setTextAlign(Paint.Align.CENTER);
+			mTextPaint.setTextSize(11 * c.getResources().getDisplayMetrics().density);
+			setBackgroundColor(0x44000000);
+		}
+		
+		void setListener(Listener l) {
+			mListener = l;
+		}
+		
+		private void recalc() {
+			float w = getWidth(), h = getHeight();
+			float lblH = mTextPaint.getTextSize() + dp(4);
+			trkT = lblH;
+			trkB = h - lblH;
+			trkH = trkB - trkT;
+			trkW = dp(16);
+			mid = (trkT + trkB) / 2f;
+			cx = w / 2f;
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			recalc();
+			float h = getHeight();
+			RectF track = new RectF(cx - trkW / 2f, trkT, cx + trkW / 2f, trkB);
+			canvas.drawRoundRect(track, dp(5), dp(5), mTrackPaint);
+			canvas.drawLine(cx - trkW / 2f - dp(6), mid, cx + trkW / 2f + dp(6), mid, mMarkPaint);
+			float thumbCY = mid - mPos * trkH / 2f;
+			float thumbH = dp(28), thumbW = trkW + dp(12);
+			mThumbPaint.setAlpha((int) (160 + 90 * Math.abs(mPos)));
+			canvas.drawRoundRect(
+			new RectF(cx - thumbW / 2f, thumbCY - thumbH / 2f, cx + thumbW / 2f, thumbCY + thumbH / 2f), dp(6),
+			dp(6), mThumbPaint);
+			Paint.FontMetrics fm = mTextPaint.getFontMetrics();
+			float pad = mTextPaint.getTextSize() + dp(2);
+			canvas.drawText("T+", cx, pad / 2f - (fm.ascent + fm.descent) / 2f, mTextPaint);
+			canvas.drawText("W−", cx, h - pad / 2f - fm.ascent, mTextPaint);
+		}
+		
+		@Override
+		public boolean onTouchEvent(MotionEvent e) {
+			recalc();
+			switch (e.getAction()) {
+				case MotionEvent.ACTION_DOWN:
+				case MotionEvent.ACTION_MOVE:
+				removeCallbacks(mSpring);
+				mTracking = true;
+				mPos = Math.max(-1f, Math.min(1f, (mid - e.getY()) / (trkH / 2f)));
+				if (mListener != null)
+				mListener.onLever(mPos);
+				invalidate();
+				return true;
+				case MotionEvent.ACTION_UP:
+				case MotionEvent.ACTION_CANCEL:
+				mTracking = false;
+				post(mSpring);
+				return true;
+			}
+			return super.onTouchEvent(e);
+		}
+		
+		private final Runnable mSpring = new Runnable() {
+			@Override
+			public void run() {
+				if (mTracking)
+				return;
+				mPos *= 0.75f;
+				if (mListener != null)
+				mListener.onLever(mPos);
+				invalidate();
+				if (Math.abs(mPos) > 0.01f)
+				postDelayed(this, 16);
+				else {
+					mPos = 0f;
+					if (mListener != null)
+					mListener.onLever(0f);
+					invalidate();
+				}
+			}
+		};
+		
+		private int dp(int x) {
+			return Math.round(x * getResources().getDisplayMetrics().density);
+		}
+	}
+	
+	// ─── Focus Assist — зумированное окно в центре экрана ───────────────────
+	// Захватывает центральную область превью через PixelCopy и рисует её
+	// с увеличением x4. Обновляется каждые ~100 мс.
+	// Поверх — сетка Петцваля и рамка.
+	
+	class FocusAssistView extends View implements Runnable {
+		private Bitmap mBmp;
+		private final Paint mBmpPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
+		private final Paint mBorderPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mGridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private static final int ZOOM = 4;
+		private static final int SAMPLE_SIZE = 120; // px стороны захватываемого квадрата
+		private volatile boolean mRunning;
+		
+		FocusAssistView(Context c) {
+			super(c);
+			mBorderPaint.setColor(0xFFDDCC00);
+			mBorderPaint.setStyle(Paint.Style.STROKE);
+			mBorderPaint.setStrokeWidth(2f);
+			mGridPaint.setColor(0x55FFFFFF);
+			mGridPaint.setStyle(Paint.Style.STROKE);
+			mGridPaint.setStrokeWidth(0.8f);
+			mLabelPaint.setColor(0xFFDDCC00);
+			mLabelPaint.setTextAlign(Paint.Align.CENTER);
+			mLabelPaint.setTextSize(10 * getResources().getDisplayMetrics().density);
+			mLabelPaint.setAntiAlias(true);
+			setBackgroundColor(0x00000000);
+		}
+		
+		@Override
+		protected void onAttachedToWindow() {
+			super.onAttachedToWindow();
+			mRunning = true;
+			postDelayed(this, 100);
+		}
+		
+		@Override
+		protected void onDetachedFromWindow() {
+			super.onDetachedFromWindow();
+			mRunning = false;
+			removeCallbacks(this);
+		}
+		
+		@Override
+		public void run() {
+			if (!mRunning || getVisibility() != View.VISIBLE) {
+				if (mRunning) postDelayed(this, 200);
+				return;
+			}
+			capture();
+			postDelayed(this, 100);
+		}
+		
+		private void capture() {
+			if (mSv == null || !mSurfaceReady) return;
+			if (android.os.Build.VERSION.SDK_INT < 26) {
+				// PixelCopy недоступен — рисуем заглушку
+				invalidate();
+				return;
+			}
+			try {
+				int svW = mSv.getWidth(), svH = mSv.getHeight();
+				if (svW <= 0 || svH <= 0) return;
+				
+				// Центральная область SAMPLE_SIZE × SAMPLE_SIZE
+				int cx = svW / 2, cy = svH / 2, half = SAMPLE_SIZE / 2;
+				int l = Math.max(0, cx - half), t = Math.max(0, cy - half);
+				int r = Math.min(svW, l + SAMPLE_SIZE), b = Math.min(svH, t + SAMPLE_SIZE);
+				android.graphics.Rect src = new android.graphics.Rect(l, t, r, b);
+				
+				Bitmap dst = Bitmap.createBitmap(r - l, b - t, Bitmap.Config.ARGB_8888);
+				android.view.PixelCopy.request(mSv, src, dst, result -> {
+					if (result == android.view.PixelCopy.SUCCESS) {
+						mBmp = dst;
+						postInvalidate();
+					}
+				}, new Handler(android.os.Looper.getMainLooper()));
+			} catch (Exception ignored) {}
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			
+			// Фон — чёрный полупрозрачный
+			canvas.drawARGB(200, 0, 0, 0);
+			
+			if (mBmp != null && !mBmp.isRecycled()) {
+				// Рисуем захваченный фрагмент, растянутый на весь квадрат
+				android.graphics.RectF dst = new android.graphics.RectF(0, 0, w, h);
+				canvas.drawBitmap(mBmp, null, dst, mBmpPaint);
+				} else {
+				// Заглушка когда PixelCopy ещё не отработал
+				Paint p = new Paint();
+				p.setColor(0xFF333333);
+				canvas.drawRect(0, 0, w, h, p);
+			}
+			
+			// Сетка — тонкая перекрёстная линия (центральная)
+			canvas.drawLine(w / 2f, 0, w / 2f, h, mGridPaint);
+			canvas.drawLine(0, h / 2f, w, h / 2f, mGridPaint);
+			// Третьи (по правило третей)
+			canvas.drawLine(w / 3f, 0, w / 3f, h, mGridPaint);
+			canvas.drawLine(2 * w / 3f, 0, 2 * w / 3f, h, mGridPaint);
+			canvas.drawLine(0, h / 3f, w, h / 3f, mGridPaint);
+			canvas.drawLine(0, 2 * h / 3f, w, 2 * h / 3f, mGridPaint);
+			
+			// Рамка
+			canvas.drawRect(1f, 1f, w - 1f, h - 1f, mBorderPaint);
+			
+			// Уголки (более жирные акценты)
+			float corner = w * 0.12f;
+			mBorderPaint.setStrokeWidth(3f);
+			canvas.drawLine(1f, 1f, corner, 1f, mBorderPaint);
+			canvas.drawLine(1f, 1f, 1f, corner, mBorderPaint);
+			canvas.drawLine(w - corner, 1f, w - 1f, 1f, mBorderPaint);
+			canvas.drawLine(w - 1f, 1f, w - 1f, corner, mBorderPaint);
+			canvas.drawLine(1f, h - corner, 1f, h - 1f, mBorderPaint);
+			canvas.drawLine(1f, h - 1f, corner, h - 1f, mBorderPaint);
+			canvas.drawLine(w - 1f, h - corner, w - 1f, h - 1f, mBorderPaint);
+			canvas.drawLine(w - corner, h - 1f, w - 1f, h - 1f, mBorderPaint);
+			mBorderPaint.setStrokeWidth(2f);
+			
+			// Подпись
+			canvas.drawText("FOCUS ×" + ZOOM, w / 2f, h - 4f, mLabelPaint);
+		}
+	}
+	
+	// ─── Барабан фокуса (как кольцо на настоящей камере) ────────────────────
+	// Свайп вниз = фокус вдаль (∞), свайп вверх = макро.
+	// Визуально: риски на цилиндре с перспективным сжатием.
+	
+	static class FocusDrumView extends View {
+		interface OnFocusChangeListener {
+			void onFocusChanged(float value); // 0=∞, 1=macro
+		}
+		
+		/** Коллбэк начала/остановки прокрутки барабана */
+		interface OnDrumScrollListener {
+			void onScrollStart();
+			void onScrollStop();
+		}
+		
+		private OnFocusChangeListener mListener;
+		private OnDrumScrollListener mScrollListener;
+		private float mValue = 0f; // 0..1
+		private float mLastY;
+		private boolean mDragging;
+		
+		// Визуальный «угол» барабана — непрерывный для анимации рисок
+		private float mAngle = 0f;
+		private static final float FULL_RANGE_PX_PER_UNIT = 800f;
+		
+		private final Paint mDrumPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mRiskPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mShadowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mCenterLinePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		
+		FocusDrumView(Context c) {
+			super(c);
+			float density = c.getResources().getDisplayMetrics().density;
+			mDrumPaint.setColor(0xFF2A2A2A);
+			mRiskPaint.setStrokeWidth(1.5f * density);
+			mRiskPaint.setStyle(Paint.Style.STROKE);
+			mShadowPaint.setStyle(Paint.Style.FILL);
+			mCenterLinePaint.setColor(0xFFDDCC00);
+			mCenterLinePaint.setStrokeWidth(2f * density);
+			mCenterLinePaint.setStyle(Paint.Style.STROKE);
+		}
+		
+		void setOnFocusChangeListener(OnFocusChangeListener l) {
+			mListener = l;
+		}
+		
+		void setOnDrumScrollListener(OnDrumScrollListener l) {
+			mScrollListener = l;
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			final float cx = w / 2f;
+			final float drumW = w * 0.72f;
+			final float drumLeft = cx - drumW / 2f;
+			final float drumRight = cx + drumW / 2f;
+			
+			// Фон барабана
+			RectF drumRect = new RectF(drumLeft, 0, drumRight, h);
+			mDrumPaint.setColor(0xFF222222);
+			canvas.drawRoundRect(drumRect, drumW * 0.12f, drumW * 0.12f, mDrumPaint);
+			
+			// Риски барабана с перспективным сжатием
+			final float riskStep = h * 0.07f;
+			float offset = mAngle % riskStep;
+			if (offset < 0) offset += riskStep;
+			
+			final int totalRisks = (int) (h / riskStep) + 2;
+			for (int i = -1; i <= totalRisks; i++) {
+				float ry = offset + i * riskStep;
+				if (ry < 0 || ry > h) continue;
+				
+				float distFromCenter = Math.abs(ry - h / 2f) / (h / 2f);
+				float squeeze = 1f - 0.55f * distFromCenter * distFromCenter;
+				float riskLen = drumW * 0.8f * squeeze;
+				int alpha = (int) (200 * (1f - distFromCenter * 0.7f));
+				
+				boolean isMajor = (Math.abs(Math.round((ry - offset) / riskStep)) % 5 == 0);
+				if (isMajor) { riskLen *= 1.25f; alpha = Math.min(255, alpha + 40); }
+				
+				mRiskPaint.setColor(0xFFFFFFFF);
+				mRiskPaint.setAlpha(alpha);
+				mRiskPaint.setStrokeWidth(isMajor ? 2f : 1.2f);
+				canvas.drawLine(cx - riskLen / 2f, ry, cx + riskLen / 2f, ry, mRiskPaint);
+			}
+			
+			// Градиентные тени сверху/снизу (имитация цилиндра)
+			int[] colorsTop = { 0xCC000000, 0x00000000 };
+			int[] colorsBot = { 0x00000000, 0xCC000000 };
+			android.graphics.LinearGradient shadTop = new android.graphics.LinearGradient(
+			0, 0, 0, h * 0.28f, colorsTop, null, android.graphics.Shader.TileMode.CLAMP);
+			android.graphics.LinearGradient shadBot = new android.graphics.LinearGradient(
+			0, h * 0.72f, 0, h, colorsBot, null, android.graphics.Shader.TileMode.CLAMP);
+			mShadowPaint.setShader(shadTop);
+			canvas.drawRoundRect(drumRect, drumW * 0.12f, drumW * 0.12f, mShadowPaint);
+			mShadowPaint.setShader(shadBot);
+			canvas.drawRoundRect(drumRect, drumW * 0.12f, drumW * 0.12f, mShadowPaint);
+			mShadowPaint.setShader(null);
+			
+			// Центральная риска-указатель (жёлтая)
+			canvas.drawLine(drumLeft - 4f, h / 2f, drumRight + 4f, h / 2f, mCenterLinePaint);
+		}
+		
+		@Override
+		public boolean onTouchEvent(MotionEvent e) {
+			switch (e.getAction()) {
+				case MotionEvent.ACTION_DOWN:
+				mLastY = e.getY();
+				mDragging = true;
+				if (mScrollListener != null) mScrollListener.onScrollStart();
+				return true;
+				case MotionEvent.ACTION_MOVE: {
+					if (!mDragging) return true;
+					float dy = e.getY() - mLastY;
+					mLastY = e.getY();
+					// Свайп вниз → фокус на ∞ (value уменьшается)
+					// Свайп вверх → макро (value увеличивается)
+					mAngle += dy;
+					float newVal = mValue - dy / FULL_RANGE_PX_PER_UNIT;
+					newVal = Math.max(0f, Math.min(1f, newVal));
+					// Фиксируем барабан у упора
+					if (newVal == 0f && mValue == 0f) mAngle = Math.min(mAngle, 0f);
+					if (newVal == 1f && mValue == 1f) mAngle = Math.max(mAngle, 0f);
+					if (newVal != mValue) {
+						mValue = newVal;
+						if (mListener != null) mListener.onFocusChanged(mValue);
+					}
+					invalidate();
+					return true;
+				}
+				case MotionEvent.ACTION_UP:
+				case MotionEvent.ACTION_CANCEL:
+				mDragging = false;
+				if (mScrollListener != null) mScrollListener.onScrollStop();
+				return true;
+			}
+			return false;
+		}
+	}
+
+	// ─── Осциллограф с триггером ─────────────────────────────────────────────
+	// Прозрачный фон, наложен поверх изображения камеры.
+	// Триггер: фронт нарастания (rising edge) при пересечении порога.
+	// Окно отображения — 2048 выборок (~46 мс при 44100 Гц).
+	
+	static class OscilloscopeView extends View {
+		private static final int DISP_SAMPLES = 2048;
+		private static final int BUF_SIZE = DISP_SAMPLES * 4; // кольцевой буфер
+		
+		private final float[] mRingBuf = new float[BUF_SIZE];
+		private int mWritePos = 0;
+		private final float[] mFrame = new float[DISP_SAMPLES];
+		private volatile boolean mNewFrame = false;
+		private final Object mLock = new Object();
+		
+		// Триггер
+		private static final float TRIG_LEVEL = 0.05f; // нормализованный уровень
+		private static final int TRIG_HYSTERESIS = 64; // выборок предыстории
+		
+		private final Paint mWavePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mGridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Path mPath = new Path();
+		
+		OscilloscopeView(Context c) {
+			super(c);
+			setBackgroundColor(0x00000000); // прозрачный
+			mWavePaint.setColor(0xFF00FF88);
+			mWavePaint.setStrokeWidth(1.8f * c.getResources().getDisplayMetrics().density);
+			mWavePaint.setStyle(Paint.Style.STROKE);
+			mGridPaint.setColor(0x33FFFFFF);
+			mGridPaint.setStrokeWidth(0.8f);
+			mGridPaint.setStyle(Paint.Style.STROKE);
+			mLabelPaint.setColor(0xAAFFFFFF);
+			mLabelPaint.setTextSize(9 * c.getResources().getDisplayMetrics().density);
+			mLabelPaint.setAntiAlias(true);
+		}
+		
+		/** Принимает буфер PCM-16, конвертирует в mono float и кладёт в кольцевой буфер */
+		void pushSamples(short[] buf, int len, int channels) {
+			synchronized (mLock) {
+				for (int i = 0; i < len; i += channels) {
+					float mono = buf[i] / 32768f;
+					if (channels == 2 && i + 1 < len)
+						mono = (mono + buf[i + 1] / 32768f) * 0.5f;
+					mRingBuf[mWritePos] = mono;
+					mWritePos = (mWritePos + 1) % BUF_SIZE;
+				}
+				// Поиск триггера: восходящий фронт >= TRIG_LEVEL
+				// Ищем в последних BUF_SIZE выборках
+				int trigPos = -1;
+				int searchStart = (mWritePos - BUF_SIZE + BUF_SIZE) % BUF_SIZE;
+				for (int k = TRIG_HYSTERESIS; k < BUF_SIZE - DISP_SAMPLES; k++) {
+					int p = (searchStart + k) % BUF_SIZE;
+					int pp = (p - 1 + BUF_SIZE) % BUF_SIZE;
+					if (mRingBuf[pp] < TRIG_LEVEL && mRingBuf[p] >= TRIG_LEVEL) {
+						trigPos = p;
+						break;
+					}
+				}
+				if (trigPos < 0) {
+					// Триггер не найден — показываем последние DISP_SAMPLES
+					trigPos = (mWritePos - DISP_SAMPLES + BUF_SIZE) % BUF_SIZE;
+				}
+				for (int k = 0; k < DISP_SAMPLES; k++) {
+					mFrame[k] = mRingBuf[(trigPos + k) % BUF_SIZE];
+				}
+				mNewFrame = true;
+			}
+			postInvalidate();
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			if (w == 0 || h == 0) return;
+			
+			// Полупрозрачный фон осциллографа
+			canvas.drawARGB(90, 0, 0, 0);
+			
+			// Сетка
+			for (int gx = 1; gx < 4; gx++)
+				canvas.drawLine(w * gx / 4f, 0, w * gx / 4f, h, mGridPaint);
+			for (int gy = 1; gy < 4; gy++)
+				canvas.drawLine(0, h * gy / 4f, w, h * gy / 4f, mGridPaint);
+			// Ось Y = 0
+			Paint zeroPaint = new Paint(mGridPaint);
+			zeroPaint.setColor(0x55FFFFFF);
+			zeroPaint.setStrokeWidth(1.4f);
+			canvas.drawLine(0, h / 2f, w, h / 2f, zeroPaint);
+			
+			// Линия уровня триггера
+			Paint trigPaint = new Paint();
+			trigPaint.setColor(0x88FFFF00);
+			trigPaint.setStrokeWidth(1f);
+			trigPaint.setStyle(Paint.Style.STROKE);
+			trigPaint.setPathEffect(new android.graphics.DashPathEffect(new float[]{6f, 4f}, 0));
+			float trigY = h / 2f - TRIG_LEVEL * h / 2f;
+			canvas.drawLine(0, trigY, w, trigY, trigPaint);
+			
+			// Волна
+			float[] frame;
+			synchronized (mLock) {
+				frame = mFrame.clone();
+			}
+			mPath.reset();
+			boolean first = true;
+			for (int i = 0; i < DISP_SAMPLES; i++) {
+				float x = i * w / (DISP_SAMPLES - 1f);
+				float y = h / 2f - frame[i] * h / 2f * 0.92f;
+				if (first) { mPath.moveTo(x, y); first = false; }
+				else mPath.lineTo(x, y);
+			}
+			canvas.drawPath(mPath, mWavePaint);
+			
+			// Подпись
+			canvas.drawText("OSC  T↑", 4, h - 3f, mLabelPaint);
+		}
+	}
+	
+	// ─── Спектр-анализатор: FFT 2048 точек ───────────────────────────────────
+	// Компактный вид в нижней панели. Логарифмическая шкала частот.
+	// Накопительный буфер: когда накоплено >= FFT_SIZE выборок — считаем FFT.
+	
+	static class SpectrumView extends View {
+		private static final int FFT_SIZE = 2048;
+		private static final int HALF = FFT_SIZE / 2;
+		
+		private final float[] mAccBuf = new float[FFT_SIZE];
+		private int mAccPos = 0;
+		
+		private final float[] mMagnitude = new float[HALF]; // последний спектр
+		private final float[] mSmooth = new float[HALF];    // сглаженный
+		private final float[] mPeaks = new float[HALF];     // пик-холд для спектра
+		private final Object mLock = new Object();
+		
+		// FFT рабочие массивы (переиспользуются)
+		private final float[] mFftRe = new float[FFT_SIZE];
+		private final float[] mFftIm = new float[FFT_SIZE];
+		// Окно Ханна
+		private final float[] mWindow = new float[FFT_SIZE];
+		
+		private final Paint mBarPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mPeakPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mLblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mBgPaint = new Paint();
+		
+		private static final int DISPLAY_BINS = 120; // количество отображаемых полос
+		private static final float SAMPLE_RATE = 44100f;
+		private static final float DECAY = 0.82f;    // коэффициент спада сглаженного
+		private static final float PEAK_DECAY = 0.996f;
+		
+		SpectrumView(Context c) {
+			super(c);
+			// Окно Ханна
+			for (int i = 0; i < FFT_SIZE; i++)
+				mWindow[i] = 0.5f * (1f - (float) Math.cos(2.0 * Math.PI * i / (FFT_SIZE - 1)));
+			mBarPaint.setStyle(Paint.Style.FILL);
+			mPeakPaint.setStyle(Paint.Style.STROKE);
+			mPeakPaint.setColor(0xFFFFFFFF);
+			mPeakPaint.setStrokeWidth(1.5f);
+			mLblPaint.setColor(0xAAFFFFFF);
+			mLblPaint.setTextSize(8 * c.getResources().getDisplayMetrics().density);
+			mLblPaint.setAntiAlias(true);
+			mBgPaint.setColor(0xCC0A0A14);
+		}
+		
+		/** Получает новый блок PCM-16, микширует в моно, накапливает до FFT_SIZE */
+		void pushSamples(short[] buf, int len, int channels) {
+			for (int i = 0; i < len; i += channels) {
+				float mono = buf[i] / 32768f;
+				if (channels == 2 && i + 1 < len)
+					mono = (mono + buf[i + 1] / 32768f) * 0.5f;
+				mAccBuf[mAccPos++] = mono;
+				if (mAccPos >= FFT_SIZE) {
+					computeFFT();
+					// Перекрытие 50% — сдвигаем буфер
+					System.arraycopy(mAccBuf, FFT_SIZE / 2, mAccBuf, 0, FFT_SIZE / 2);
+					mAccPos = FFT_SIZE / 2;
+				}
+			}
+		}
+		
+		private void computeFFT() {
+			// Применяем окно Ханна
+			for (int i = 0; i < FFT_SIZE; i++) {
+				mFftRe[i] = mAccBuf[i] * mWindow[i];
+				mFftIm[i] = 0f;
+			}
+			// Cooley-Tukey in-place radix-2 DIT FFT
+			int n = FFT_SIZE;
+			for (int i = 1, j = 0; i < n; i++) {
+				int bit = n >> 1;
+				for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+				j ^= bit;
+				if (i < j) {
+					float tr = mFftRe[i]; mFftRe[i] = mFftRe[j]; mFftRe[j] = tr;
+					float ti = mFftIm[i]; mFftIm[i] = mFftIm[j]; mFftIm[j] = ti;
+				}
+			}
+			for (int len = 2; len <= n; len <<= 1) {
+				double ang = -2.0 * Math.PI / len;
+				float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
+				for (int i = 0; i < n; i += len) {
+					float curRe = 1f, curIm = 0f;
+					for (int k = 0; k < len / 2; k++) {
+						float uRe = mFftRe[i + k], uIm = mFftIm[i + k];
+						float vRe = mFftRe[i + k + len/2] * curRe - mFftIm[i + k + len/2] * curIm;
+						float vIm = mFftRe[i + k + len/2] * curIm + mFftIm[i + k + len/2] * curRe;
+						mFftRe[i + k]         = uRe + vRe;
+						mFftIm[i + k]         = uIm + vIm;
+						mFftRe[i + k + len/2] = uRe - vRe;
+						mFftIm[i + k + len/2] = uIm - vIm;
+						float nRe = curRe * wRe - curIm * wIm;
+						curIm = curRe * wIm + curIm * wRe;
+						curRe = nRe;
+					}
+				}
+			}
+			// Вычисляем амплитуду в дБ
+			synchronized (mLock) {
+				for (int i = 0; i < HALF; i++) {
+					float mag = (float) Math.sqrt(mFftRe[i]*mFftRe[i] + mFftIm[i]*mFftIm[i]) / (FFT_SIZE / 2f);
+					float db = mag > 1e-9f ? Math.max(-90f, (float)(20.0 * Math.log10(mag))) : -90f;
+					// Нормализуем 0..1 (от -90dB до 0dB)
+					float norm = (db + 90f) / 90f;
+					mMagnitude[i] = norm;
+					mSmooth[i] = Math.max(norm, mSmooth[i] * DECAY);
+					mPeaks[i] = Math.max(mSmooth[i], mPeaks[i] * PEAK_DECAY);
+				}
+			}
+			postInvalidate();
+		}
+		
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			if (w == 0 || h == 0) return;
+			
+			// Тёмный полупрозрачный фон
+			canvas.drawRect(0, 0, w, h, mBgPaint);
+			
+			// Логарифмическая сетка по частоте
+			Paint gridPaint = new Paint();
+			gridPaint.setColor(0x33FFFFFF);
+			gridPaint.setStrokeWidth(0.8f);
+			float[] freqMarks = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
+			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
+			float fMin = (float) Math.log10(20.0);
+			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
+			for (int fi = 0; fi < freqMarks.length; fi++) {
+				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
+				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
+				canvas.drawLine(xf, 0, xf, h - mLblPaint.getTextSize() - 1f, gridPaint);
+				canvas.drawText(freqLabels[fi], xf, h - 1f, mLblPaint);
+			}
+			
+			// Полосы спектра: логарифмическое разбиение DISP_BINS полос
+			float[] smooth;
+			float[] peaks;
+			synchronized (mLock) {
+				smooth = mSmooth.clone();
+				peaks = mPeaks.clone();
+			}
+			
+			float lblH = mLblPaint.getTextSize() + 2f;
+			float barAreaH = h - lblH;
+			
+			float logFMin = (float) Math.log10(Math.max(1f, 20f));
+			float logFMaxV = (float) Math.log10(SAMPLE_RATE / 2f);
+			
+			for (int b = 0; b < DISPLAY_BINS; b++) {
+				// Логарифмические границы полосы
+				float logF0 = logFMin + (float) b / DISPLAY_BINS * (logFMaxV - logFMin);
+				float logF1 = logFMin + (float)(b + 1) / DISPLAY_BINS * (logFMaxV - logFMin);
+				float f0 = (float) Math.pow(10.0, logF0);
+				float f1 = (float) Math.pow(10.0, logF1);
+				
+				// Соответствующие индексы FFT-бинов
+				int bin0 = Math.max(0, Math.round(f0 / SAMPLE_RATE * FFT_SIZE));
+				int bin1 = Math.min(HALF - 1, Math.round(f1 / SAMPLE_RATE * FFT_SIZE));
+				
+				// Максимум в полосе
+				float val = 0f, pk = 0f;
+				for (int i = bin0; i <= bin1; i++) {
+					if (smooth[i] > val) val = smooth[i];
+					if (peaks[i] > pk) pk = peaks[i];
+				}
+				
+				float x0 = (float) b / DISPLAY_BINS * w;
+				float x1 = (float)(b + 1) / DISPLAY_BINS * w - 1f;
+				if (x1 < x0 + 0.5f) x1 = x0 + 0.5f;
+				
+				// Цвет: зелёный → жёлтый → красный
+				int red = Math.min(255, (int)(val * 510f));
+				int green = Math.min(255, (int)((1f - val) * 510f));
+				mBarPaint.setColor(0xCC000000 | (red << 16) | (green << 8) | 0x22);
+				float barH = val * barAreaH;
+				canvas.drawRect(x0, barAreaH - barH, x1, barAreaH, mBarPaint);
+				
+				// Пик-маркер
+				if (pk > 0.02f) {
+					float peakY = barAreaH - pk * barAreaH;
+					canvas.drawLine(x0, peakY, x1, peakY, mPeakPaint);
+				}
+			}
+		}
+	}
+
+}
