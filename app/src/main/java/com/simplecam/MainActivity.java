@@ -154,6 +154,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mFocusAssistHandler = new Handler(Looper.getMainLooper());
 		setContentView(buildLayout());
 		mCamMgr = (CameraManager) getSystemService(CAMERA_SERVICE);
+		showAirplaneModeReminder();
 		checkPerms();
 	}
 	
@@ -192,10 +193,30 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		FrameLayout root = new FrameLayout(this);
 		root.setBackgroundColor(Color.BLACK);
 		
-		// Превью
-		mSv = new SurfaceView(this);
+		// Превью — сохраняем пропорции 16:9, центрируем в root
+		mSv = new SurfaceView(this) {
+			@Override
+			protected void onMeasure(int wMs, int hMs) {
+				int w = MeasureSpec.getSize(wMs);
+				int h = MeasureSpec.getSize(hMs);
+				int targetH = w * 9 / 16;
+				if (targetH > h) {
+					int targetW = h * 16 / 9;
+					super.onMeasure(
+						MeasureSpec.makeMeasureSpec(targetW, MeasureSpec.EXACTLY),
+						MeasureSpec.makeMeasureSpec(h, MeasureSpec.EXACTLY));
+				} else {
+					super.onMeasure(
+						MeasureSpec.makeMeasureSpec(w, MeasureSpec.EXACTLY),
+						MeasureSpec.makeMeasureSpec(targetH, MeasureSpec.EXACTLY));
+				}
+			}
+		};
 		mSv.getHolder().addCallback(this);
-		root.addView(mSv, mp_mp());
+		FrameLayout.LayoutParams svLP = new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
+		svLP.gravity = Gravity.CENTER;
+		root.addView(mSv, svLP);
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -253,10 +274,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		FrameLayout.LayoutParams gainValLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
 		ViewGroup.LayoutParams.WRAP_CONTENT);
 		gainValLP.gravity = Gravity.LEFT | Gravity.BOTTOM;
-		gainValLP.leftMargin = dp(6);
-		gainValLP.bottomMargin = dp(4);
+		gainValLP.leftMargin = dp(3);
+		// Отступ снизу = высота нижней панели (~165dp) + запас 4dp
+		gainValLP.bottomMargin = dp(169);
 		root.addView(mTvGain, gainValLP);
 		
+		// ── Вертикальный VU-метр (справа от Gain-слайдера, полная высота) ──────
+		mVu = new VuMeterView(this);
+		FrameLayout.LayoutParams vuVertLP = new FrameLayout.LayoutParams(dp(14), ViewGroup.LayoutParams.MATCH_PARENT);
+		vuVertLP.gravity = Gravity.LEFT;
+		vuVertLP.leftMargin = dp(44);
+		root.addView(mVu, vuVertLP);
+
 		// ── Правая колонка: Focus-слайдер + Zoom-рычаг ───────────────────────
 		// Добавляем в root (полная высота экрана), а не в content —
 		// иначе при открытии панели настроек content сжимается и рычаги «схлопываются»
@@ -281,9 +310,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout panel = new LinearLayout(this);
 		panel.setOrientation(LinearLayout.VERTICAL);
 		panel.setBackgroundColor(0x00000000);
-		// Левый паддинг = ширина слайдера Gain (44dp) + зазор 8dp = 52dp.
-		// Правый такой же — контент строго по центру экрана.
-		panel.setPadding(dp(52), dp(2), dp(52), dp(3));
+		// Левый паддинг = gain(44) + VU(14) + зазор(4) = 62dp
+		panel.setPadding(dp(62), dp(2), dp(8), dp(3));
 		outer.addView(panel, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
 		ViewGroup.LayoutParams.WRAP_CONTENT));
 		
@@ -380,6 +408,32 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow.addView(mCbSoftClip);
 		cbRow.addView(mCbManualFocus);
 		mAudioSrcPanel.addView(cbRow);
+
+		// Чекбоксы видимости анализаторов
+		CheckBox mCbOsc = new CheckBox(this);
+		mCbOsc.setText("Oscilloscope");
+		mCbOsc.setTextColor(0xCCCCCCCC);
+		mCbOsc.setTextSize(12);
+		mCbOsc.setChecked(true);
+		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
+			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
+		});
+
+		CheckBox mCbSpec = new CheckBox(this);
+		mCbSpec.setText("Spectrum analyzer");
+		mCbSpec.setTextColor(0xCCCCCCCC);
+		mCbSpec.setTextSize(12);
+		mCbSpec.setChecked(true);
+		mCbSpec.setOnCheckedChangeListener((cb, checked) -> {
+			if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE);
+		});
+
+		LinearLayout cbRow2 = new LinearLayout(this);
+		cbRow2.setOrientation(LinearLayout.HORIZONTAL);
+		cbRow2.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow2.addView(mCbOsc);
+		cbRow2.addView(mCbSpec);
+		mAudioSrcPanel.addView(cbRow2);
 		
 		// Focus Assist — появляется только при ручной фокусировке
 		mCbFocusAssist = new CheckBox(this);
@@ -390,38 +444,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mAudioSrcPanel.addView(mCbFocusAssist);
 		
 		panel.addView(mAudioSrcPanel);
-		
-		// Кнопка REC
+
+		// ── Строка: спектр-анализатор (слева, weight=1) + кнопка REC (справа) ──
+		// REC справа, с отступом rightMargin=58dp чтобы не перекрыть рычаг зума (54dp)
 		mBtn = new Button(this);
 		mBtn.setText("REC");
 		mBtn.setTextColor(Color.WHITE);
-		mBtn.setTextSize(12);
+		mBtn.setTextSize(11);
 		mBtn.setBackground(mBtnBgIdle);
-		LinearLayout.LayoutParams btnLP = new LinearLayout.LayoutParams(dp(52), dp(52));
-		btnLP.gravity = Gravity.CENTER_HORIZONTAL;
-		btnLP.topMargin = dp(2);
-		btnLP.bottomMargin = dp(2);
-		mBtn.setLayoutParams(btnLP);
 		mBtn.setOnClickListener(v -> onRecordClick());
-		LinearLayout recRow = new LinearLayout(this);
-		recRow.setOrientation(LinearLayout.HORIZONTAL);
-		recRow.setGravity(Gravity.CENTER);
-		recRow.addView(mBtn);
-		panel.addView(recRow, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-		ViewGroup.LayoutParams.WRAP_CONTENT));
-		
-		// VU-метр
-		mVu = new VuMeterView(this);
-		LinearLayout.LayoutParams vuLP = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(28));
-		vuLP.topMargin = dp(2);
-		panel.addView(mVu, vuLP);
 
-		// ── Спектр-анализатор (компактный, не закрывает камеру) ────────────
 		mSpectrum = new SpectrumView(this);
-		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
-				ViewGroup.LayoutParams.MATCH_PARENT, dp(68));
-		specLP.topMargin = dp(2);
-		panel.addView(mSpectrum, specLP);
+
+		LinearLayout specRecRow = new LinearLayout(this);
+		specRecRow.setOrientation(LinearLayout.HORIZONTAL);
+		specRecRow.setGravity(Gravity.CENTER_VERTICAL);
+
+		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(0, dp(72), 1f);
+		specRecRow.addView(mSpectrum, specLP);
+
+		LinearLayout.LayoutParams btnLP = new LinearLayout.LayoutParams(dp(52), dp(52));
+		btnLP.rightMargin = dp(58); // clearance for zoom lever (54dp) + 4dp gap
+		btnLP.leftMargin = dp(4);
+		mBtn.setLayoutParams(btnLP);
+		specRecRow.addView(mBtn);
+
+		panel.addView(specRecRow, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
 		return root;
 	}
@@ -541,6 +590,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		return Math.round(x * getResources().getDisplayMetrics().density);
 	}
 	
+	// =========================================================================
+	// Напоминание — авиарежим
+	// =========================================================================
+
+	private void showAirplaneModeReminder() {
+		new android.app.AlertDialog.Builder(this)
+			.setTitle("\u2708  Airplane Mode recommended")
+			.setMessage(
+				"For distraction-free recording:\n\n" +
+				"  \u2022  Turn on Airplane Mode\n\n" +
+				"This prevents calls, notifications\n" +
+				"and Wi-Fi interruptions during recording.\n\n" +
+				"(Screen will stay on while the app is open.)")
+			.setPositiveButton("Got it", null)
+			.setNeutralButton("Open Settings", (d, w) -> {
+				try {
+					startActivity(new android.content.Intent(
+						android.provider.Settings.ACTION_AIRPLANE_MODE_SETTINGS));
+				} catch (Exception ignored) {}
+			})
+			.show();
+	}
+
 	// =========================================================================
 	// Разрешения
 	// =========================================================================
@@ -1306,10 +1378,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-	// ─── Вертикальный SeekBar ─────────────────────────────────────────────────
-	// Полностью кастомная отрисовка — без ротации стандартного SeekBar.
-	// Верх = max, низ = 0. Нет расхождения между треком и бегунком.
-	
 	static class VerticalSeekBar extends View {
 		private int mMax = 100;
 		private int mProgress = 0;
@@ -1317,195 +1385,185 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final Paint mTrackPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mFillPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mThumbPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mRidgePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		
 		private SeekBar.OnSeekBarChangeListener mListener;
 		
 		VerticalSeekBar(Context c) {
 			super(c);
 			mTrackPaint.setColor(0x44FFFFFF);
-			mFillPaint.setColor(0xFFDDCC00); // жёлтый, как кнопка REC
-			mThumbPaint.setColor(0xFFFFFFFF);
+			mFillPaint.setColor(0xFFDDCC00);
+			mThumbPaint.setColor(0xFFEEEEEE);
+			mRidgePaint.setColor(0xFF888866);
+			mRidgePaint.setStyle(Paint.Style.STROKE);
+			mRidgePaint.setStrokeWidth(1.2f * c.getResources().getDisplayMetrics().density);
 			setClickable(true);
 		}
 		
-		void setMax(int max) {
-			mMax = max;
-			invalidate();
-		}
-		
-		void setProgress(int p) {
-			mProgress = Math.max(0, Math.min(mMax, p));
-			invalidate();
-		}
-		
-		int getMax() {
-			return mMax;
-		}
-		
-		int getProgress() {
-			return mProgress;
-		}
-		
-		void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l) {
-			mListener = l;
+		void setMax(int max) { mMax = max; invalidate(); }
+		void setProgress(int p) { mProgress = Math.max(0, Math.min(mMax, p)); invalidate(); }
+		int getMax() { return mMax; }
+		int getProgress() { return mProgress; }
+		void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l) { mListener = l; }
+
+		// Высота ручки микшера в px
+		private float faderH(float w) { return Math.round(w * 0.7f) + dp(20); }
+
+		private int dp(int x) {
+			return Math.round(x * getResources().getDisplayMetrics().density);
 		}
 		
 		@Override
 		protected void onDraw(Canvas canvas) {
 			final float w = getWidth(), h = getHeight();
-			final float trackW = w * 0.35f;
+			final float trackW = w * 0.3f;
 			final float cx = w / 2f;
 			final float trkX1 = cx - trackW / 2f;
 			final float trkX2 = cx + trackW / 2f;
-			final float thumbR = w * 0.42f;
-			final float padV = thumbR + 2f; // минимальный отступ — только чтобы бегунок не обрезался
+			final float halfFader = faderH(w) / 2f;
+			final float padV = halfFader + 2f;
 			final float trkT = padV;
 			final float trkB = h - padV;
 			final float trkH = trkB - trkT;
-			
-			// Позиция бегунка: progress=max → top, progress=0 → bottom
+
 			float frac = mMax > 0 ? (float) mProgress / mMax : 0f;
 			float thumbY = trkB - frac * trkH;
-			
-			// Трек (фон)
-			RectF track = new RectF(trkX1, trkT, trkX2, trkB);
-			canvas.drawRoundRect(track, trackW / 2f, trackW / 2f, mTrackPaint);
-			
-			// Заполненная часть (от thumbY до низа)
-			RectF fill = new RectF(trkX1, thumbY, trkX2, trkB);
-			canvas.drawRoundRect(fill, trackW / 2f, trackW / 2f, mFillPaint);
-			
-			// Метка нуля — горизонтальная черта посередине трека
-			float zeroY = trkB - 0.5f * trkH; // 0 dB = середина (p=400/800)
-			Paint zeroPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-			zeroPaint.setColor(0x88FFFFFF);
-			zeroPaint.setStrokeWidth(1.5f);
-			canvas.drawLine(trkX1 - 4f, zeroY, trkX2 + 4f, zeroY, zeroPaint);
-			
-			// Бегунок
-			canvas.drawCircle(cx, thumbY, thumbR, mThumbPaint);
+
+			// Трек
+			canvas.drawRoundRect(new RectF(trkX1, trkT, trkX2, trkB),
+				trackW / 2f, trackW / 2f, mTrackPaint);
+			// Заполненная часть
+			canvas.drawRoundRect(new RectF(trkX1, thumbY, trkX2, trkB),
+				trackW / 2f, trackW / 2f, mFillPaint);
+			// Метка 0 dB
+			Paint z = new Paint(Paint.ANTI_ALIAS_FLAG);
+			z.setColor(0x88FFFFFF); z.setStrokeWidth(1.5f);
+			canvas.drawLine(trkX1 - 3f, trkB - 0.5f * trkH, trkX2 + 3f, trkB - 0.5f * trkH, z);
+
+			// ── Ручка (fader cap) — широкий прямоугольник во всю ширину ──────
+			float fH = faderH(w);
+			float fW = w - 2f;
+			RectF fader = new RectF(1f, thumbY - fH/2f, 1f + fW, thumbY + fH/2f);
+			// Тень
+			Paint shadow = new Paint(Paint.ANTI_ALIAS_FLAG);
+			shadow.setColor(0x66000000);
+			shadow.setStyle(Paint.Style.FILL);
+			canvas.drawRoundRect(new RectF(fader.left+2, fader.top+3, fader.right+2, fader.bottom+3),
+				dp(4), dp(4), shadow);
+			// Тело ручки
+			canvas.drawRoundRect(fader, dp(4), dp(4), mThumbPaint);
+			// Горизонтальные риски (3 штуки по центру)
+			float rInset = fW * 0.18f;
+			for (int ri = -1; ri <= 1; ri++) {
+				float ry = thumbY + ri * dp(4);
+				canvas.drawLine(1f + rInset, ry, 1f + fW - rInset, ry, mRidgePaint);
+			}
+			// Центральная риска чуть длиннее и ярче
+			Paint cLine = new Paint(Paint.ANTI_ALIAS_FLAG);
+			cLine.setColor(0xFFDDCC00); cLine.setStrokeWidth(1.5f);
+			canvas.drawLine(1f + rInset * 0.6f, thumbY, 1f + fW - rInset * 0.6f, thumbY, cLine);
 		}
 		
 		@Override
 		public boolean onTouchEvent(MotionEvent e) {
-			if (!isEnabled())
-			return false;
-			final float h = getHeight();
-			final float w = getWidth();
-			final float thumbR = w * 0.42f;
-			final float padV = thumbR + 2f;
+			if (!isEnabled()) return false;
+			final float h = getHeight(), w = getWidth();
+			final float halfFader = faderH(w) / 2f;
+			final float padV = halfFader + 2f;
 			final float trkT = padV;
 			final float trkB = h - padV;
 			final float trkH = trkB - trkT;
 			
 			switch (e.getAction()) {
 				case MotionEvent.ACTION_DOWN:
-				if (mListener != null)
-				mListener.onStartTrackingTouch(null);
+				if (mListener != null) mListener.onStartTrackingTouch(null);
 				// fall through
 				case MotionEvent.ACTION_MOVE: {
 					float frac = 1f - (e.getY() - trkT) / trkH;
 					int p = Math.max(0, Math.min(mMax, Math.round(frac * mMax)));
 					mProgress = p;
 					invalidate();
-					if (mListener != null)
-					mListener.onProgressChanged(null, p, true);
+					if (mListener != null) mListener.onProgressChanged(null, p, true);
 					return true;
 				}
 				case MotionEvent.ACTION_UP:
 				case MotionEvent.ACTION_CANCEL:
-				if (mListener != null)
-				mListener.onStopTrackingTouch(null);
+				if (mListener != null) mListener.onStopTrackingTouch(null);
 				return true;
 			}
 			return false;
 		}
 	}
 	
-	// ─── VU-метр dBFS ────────────────────────────────────────────────────────
-	
+	// ─── Вертикальный VU-метр dBFS ───────────────────────────────────────────
+	// Сегменты снизу вверх. Пик-маркер — горизонтальная черта с hold 1.8s.
+
 	static class VuMeterView extends View {
 		private static final int N = 30;
 		private static final float MIN_DB = -60f;
 		private static final long PEAK_HOLD_MS = 1800;
-		
-		private final Paint mSegPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		private final Paint mLblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+		private final Paint mSegPaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mPeakPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		private final RectF mRect = new RectF();
-		private float mLevelDb = MIN_DB;
-		private float mPeakDb = MIN_DB;
-		private long mPeakHoldUntil = 0;
-		
+		private final RectF mRect      = new RectF();
+		private float mLevelDb  = MIN_DB;
+		private float mPeakDb   = MIN_DB;
+		private long  mPeakHoldUntil = 0;
+
 		VuMeterView(Context c) {
 			super(c);
-			mLblPaint.setColor(0xAAFFFFFF);
-			mLblPaint.setTextAlign(Paint.Align.CENTER);
-			mLblPaint.setTextSize(9 * c.getResources().getDisplayMetrics().density);
 			mPeakPaint.setColor(0xFFFFFFFF);
-			mPeakPaint.setStrokeWidth(2.5f);
+			mPeakPaint.setStrokeWidth(2f);
 			mPeakPaint.setStyle(Paint.Style.STROKE);
 		}
-		
+
 		void setLevel(float rms) {
-			mLevelDb = rms > 1e-6f ? Math.max(MIN_DB, (float) (20.0 * Math.log10(rms))) : MIN_DB;
+			mLevelDb = rms > 1e-6f ? Math.max(MIN_DB, (float)(20.0 * Math.log10(rms))) : MIN_DB;
 			postInvalidate();
 		}
-		
+
 		void setPeak(float peak) {
-			float db = peak > 1e-6f ? Math.max(MIN_DB, (float) (20.0 * Math.log10(peak))) : MIN_DB;
+			float db = peak > 1e-6f ? Math.max(MIN_DB, (float)(20.0 * Math.log10(peak))) : MIN_DB;
 			if (db >= mPeakDb || System.currentTimeMillis() > mPeakHoldUntil) {
 				mPeakDb = db;
 				mPeakHoldUntil = System.currentTimeMillis() + PEAK_HOLD_MS;
-			} else if (System.currentTimeMillis() > mPeakHoldUntil - 300) {
-				// Decay after hold
-				mPeakDb -= 1.5f;
-				if (mPeakDb < MIN_DB) mPeakDb = MIN_DB;
 			}
 		}
-		
+
 		@Override
 		protected void onDraw(Canvas canvas) {
 			final float w = getWidth(), h = getHeight();
-			final float lblH = mLblPaint.getTextSize() + 2f;
-			final float bw = w / N, gap = bw * 0.15f;
-			final float barB = h - lblH;
+			final float segH = (h - N - 1f) / N;
+			final float segW = w - 2f;
+
 			for (int i = 0; i < N; i++) {
 				float segDb = MIN_DB + (float) i / N * (-MIN_DB);
 				boolean lit = mLevelDb >= segDb;
 				int color;
-				if (!lit)
-				color = 0xFF181818;
-				else if (segDb < -12f)
-				color = 0xFF00CC55;
-				else if (segDb < -6f)
-				color = 0xFFFFBB00;
-				else
-				color = 0xFFFF2200;
+				if (!lit)             color = 0xFF181818;
+				else if (segDb < -12f) color = 0xFF00CC55;
+				else if (segDb <  -6f) color = 0xFFFFBB00;
+				else                   color = 0xFFFF2200;
 				mSegPaint.setColor(color);
-				float x = i * bw + gap * 0.5f;
-				mRect.set(x, 2f, x + bw - gap, barB);
-				canvas.drawRoundRect(mRect, 3f, 3f, mSegPaint);
+				float y = h - 1f - i * (segH + 1f) - segH;
+				mRect.set(1f, y, 1f + segW, y + segH);
+				canvas.drawRoundRect(mRect, 2f, 2f, mSegPaint);
 			}
-			// Peak hold маркер
+
+			// Пик-маркер
 			if (mPeakDb > MIN_DB) {
-				float px = (mPeakDb - MIN_DB) / (-MIN_DB) * w;
+				float frac = (mPeakDb - MIN_DB) / (-MIN_DB);
+				float py = h - 1f - frac * (h - 2f);
 				long now = System.currentTimeMillis();
-				// Цвет: зелёный / жёлтый / красный + мигание при decay
 				int peakColor;
-				if (mPeakDb >= -3f) peakColor = 0xFFFF2200;
+				if      (mPeakDb >= -3f)  peakColor = 0xFFFF2200;
 				else if (mPeakDb >= -12f) peakColor = 0xFFFFBB00;
-				else peakColor = 0xFF00FF88;
+				else                      peakColor = 0xFF00FF88;
 				boolean fading = now > mPeakHoldUntil - 400;
 				if (!fading || (now / 150) % 2 == 0) {
 					mPeakPaint.setColor(peakColor);
-					canvas.drawLine(px, 2f, px, barB, mPeakPaint);
+					canvas.drawLine(0, py, w, py, mPeakPaint);
 				}
-			}
-			int[] marks = { -40, -20, -10, -6, -3, 0 };
-			for (int db : marks) {
-				float xPos = (db - MIN_DB) / (-MIN_DB) * w;
-				canvas.drawText(db == 0 ? "0" : String.valueOf(db), xPos, h - 1f, mLblPaint);
 			}
 		}
 	}
@@ -1967,9 +2025,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		protected void onDraw(Canvas canvas) {
 			final float w = getWidth(), h = getHeight();
 			if (w == 0 || h == 0) return;
-			
-			// Полупрозрачный фон осциллографа
-			canvas.drawARGB(90, 0, 0, 0);
+
+			// Полностью прозрачный фон — не рисуем ничего
+			// canvas.drawARGB(90, 0, 0, 0);
 			
 			// Сетка
 			for (int gx = 1; gx < 4; gx++)
@@ -2038,7 +2096,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final Paint mLblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mBgPaint = new Paint();
 		
-		private static final int DISPLAY_BINS = 120; // количество отображаемых полос
+		private static final int DISPLAY_BINS = 60; // уменьшено вдвое
 		private static final float SAMPLE_RATE = 44100f;
 		private static final float DECAY = 0.82f;    // коэффициент спада сглаженного
 		private static final float PEAK_DECAY = 0.996f;
@@ -2052,10 +2110,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mPeakPaint.setStyle(Paint.Style.STROKE);
 			mPeakPaint.setColor(0xFFFFFFFF);
 			mPeakPaint.setStrokeWidth(1.5f);
-			mLblPaint.setColor(0xAAFFFFFF);
-			mLblPaint.setTextSize(8 * c.getResources().getDisplayMetrics().density);
+			mLblPaint.setColor(0xCCFFFFFF);
+			mLblPaint.setTextSize(7.5f * c.getResources().getDisplayMetrics().density);
 			mLblPaint.setAntiAlias(true);
-			mBgPaint.setColor(0xCC0A0A14);
+			mBgPaint.setColor(0x00000000); // полностью прозрачный фон
 		}
 		
 		/** Получает новый блок PCM-16, микширует в моно, накапливает до FFT_SIZE */
@@ -2129,69 +2187,70 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		protected void onDraw(Canvas canvas) {
 			final float w = getWidth(), h = getHeight();
 			if (w == 0 || h == 0) return;
-			
-			// Тёмный полупрозрачный фон
-			canvas.drawRect(0, 0, w, h, mBgPaint);
-			
-			// Логарифмическая сетка по частоте
+
+			// Фон полностью прозрачный — не рисуем ничего
+			// canvas.drawRect(0, 0, w, h, mBgPaint);
+
+			final float lblH = mLblPaint.getTextSize() + 2f;
+			final float barAreaH = h - lblH;
+
+			// Логарифмическая сетка + подписи частот
 			Paint gridPaint = new Paint();
-			gridPaint.setColor(0x33FFFFFF);
+			gridPaint.setColor(0x44FFFFFF);
 			gridPaint.setStrokeWidth(0.8f);
-			float[] freqMarks = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
+			float[] freqMarks  = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
 			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
 			float fMin = (float) Math.log10(20.0);
 			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
+			float prevLblRight = -1f;
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
-				canvas.drawLine(xf, 0, xf, h - mLblPaint.getTextSize() - 1f, gridPaint);
-				canvas.drawText(freqLabels[fi], xf, h - 1f, mLblPaint);
+				canvas.drawLine(xf, 0, xf, barAreaH, gridPaint);
+				// Метка: рисуем только если не выходит за правый край и не перекрывает предыдущую
+				float lblW = mLblPaint.measureText(freqLabels[fi]);
+				float lblX = xf - lblW / 2f;
+				if (lblX > prevLblRight && lblX + lblW < w - 2f) {
+					canvas.drawText(freqLabels[fi], xf, h - 1f, mLblPaint);
+					prevLblRight = lblX + lblW + 3f;
+				}
 			}
-			
-			// Полосы спектра: логарифмическое разбиение DISP_BINS полос
-			float[] smooth;
-			float[] peaks;
+
+			// Полосы спектра
+			float[] smooth, peaks;
 			synchronized (mLock) {
 				smooth = mSmooth.clone();
-				peaks = mPeaks.clone();
+				peaks  = mPeaks.clone();
 			}
-			
-			float lblH = mLblPaint.getTextSize() + 2f;
-			float barAreaH = h - lblH;
-			
-			float logFMin = (float) Math.log10(Math.max(1f, 20f));
+
+			float logFMin  = (float) Math.log10(Math.max(1f, 20f));
 			float logFMaxV = (float) Math.log10(SAMPLE_RATE / 2f);
-			
+
 			for (int b = 0; b < DISPLAY_BINS; b++) {
-				// Логарифмические границы полосы
-				float logF0 = logFMin + (float) b / DISPLAY_BINS * (logFMaxV - logFMin);
-				float logF1 = logFMin + (float)(b + 1) / DISPLAY_BINS * (logFMaxV - logFMin);
+				float logF0 = logFMin + (float) b       / DISPLAY_BINS * (logFMaxV - logFMin);
+				float logF1 = logFMin + (float)(b + 1)  / DISPLAY_BINS * (logFMaxV - logFMin);
 				float f0 = (float) Math.pow(10.0, logF0);
 				float f1 = (float) Math.pow(10.0, logF1);
-				
-				// Соответствующие индексы FFT-бинов
-				int bin0 = Math.max(0, Math.round(f0 / SAMPLE_RATE * FFT_SIZE));
+
+				int bin0 = Math.max(0,        Math.round(f0 / SAMPLE_RATE * FFT_SIZE));
 				int bin1 = Math.min(HALF - 1, Math.round(f1 / SAMPLE_RATE * FFT_SIZE));
-				
-				// Максимум в полосе
+
 				float val = 0f, pk = 0f;
 				for (int i = bin0; i <= bin1; i++) {
 					if (smooth[i] > val) val = smooth[i];
-					if (peaks[i] > pk) pk = peaks[i];
+					if (peaks[i]  > pk)  pk  = peaks[i];
 				}
-				
-				float x0 = (float) b / DISPLAY_BINS * w;
-				float x1 = (float)(b + 1) / DISPLAY_BINS * w - 1f;
+
+				float x0 = (float) b       / DISPLAY_BINS * w;
+				float x1 = (float)(b + 1)  / DISPLAY_BINS * w - 1f;
 				if (x1 < x0 + 0.5f) x1 = x0 + 0.5f;
-				
-				// Цвет: зелёный → жёлтый → красный
-				int red = Math.min(255, (int)(val * 510f));
+
+				int red   = Math.min(255, (int)(val * 510f));
 				int green = Math.min(255, (int)((1f - val) * 510f));
-				mBarPaint.setColor(0xCC000000 | (red << 16) | (green << 8) | 0x22);
+				mBarPaint.setColor(0xDD000000 | (red << 16) | (green << 8) | 0x22);
 				float barH = val * barAreaH;
 				canvas.drawRect(x0, barAreaH - barH, x1, barAreaH, mBarPaint);
-				
-				// Пик-маркер
+
 				if (pk > 0.02f) {
 					float peakY = barAreaH - pk * barAreaH;
 					canvas.drawLine(x0, peakY, x1, peakY, mPeakPaint);
