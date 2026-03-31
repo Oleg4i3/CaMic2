@@ -2220,8 +2220,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// Фон полностью прозрачный — не рисуем ничего
 			// canvas.drawRect(0, 0, w, h, mBgPaint);
 
-			final float lblH = mLblPaint.getTextSize() + 2f;
-			final float barAreaH = h; // bars fill full height; labels overlap on top
+			final float lblH = mLblPaint.getTextSize() + 4f;
+			final float barAreaH = h - lblH; // reserve bottom strip for frequency labels
 
 			// Логарифмическая сетка (только линии — без подписей, они нарисуются после полос)
 			Paint gridPaint = new Paint();
@@ -2278,20 +2278,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 
-			// ── Подписи частот поверх полос (на переднем плане) ──────────────
-			float labelY = barAreaH - 3f; // у нижнего края, внутри области полос
+			// ── Подписи частот в зарезервированной полосе под спектром ──────
+			float labelY = h - 3f; // базовая линия в нижней полосе, всегда видима
 			float prevLblRight = -1f;
-			Paint lblBgPaint = new Paint();
-			lblBgPaint.setColor(0xAA000000);
+			mLblPaint.setTextAlign(Paint.Align.CENTER);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
 				float lblW = mLblPaint.measureText(freqLabels[fi]);
 				float lblX = xf - lblW / 2f;
 				if (lblX > prevLblRight && lblX + lblW < w - 2f) {
-					// Полупрозрачная подложка чтобы текст читался поверх любого сигнала
-					canvas.drawRect(lblX - 1f, labelY - mLblPaint.getTextSize() - 1f,
-						lblX + lblW + 1f, labelY + 2f, lblBgPaint);
 					canvas.drawText(freqLabels[fi], xf, labelY, mLblPaint);
 					prevLblRight = lblX + lblW + 3f;
 				}
