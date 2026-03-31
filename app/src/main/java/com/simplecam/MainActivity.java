@@ -2221,20 +2221,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// canvas.drawRect(0, 0, w, h, mBgPaint);
 
 			final float lblH = mLblPaint.getTextSize() + 4f;
-			final float barAreaH = h - lblH; // reserve bottom strip for frequency labels
+			// Метки — в верхней полосе (всегда видна).
+			// Полосы спектра — от lblH до h.
+			final float barTop = lblH;
+			final float barAreaH = h - barTop;
 
-			// Логарифмическая сетка (только линии — без подписей, они нарисуются после полос)
-			Paint gridPaint = new Paint();
-			gridPaint.setColor(0x44FFFFFF);
-			gridPaint.setStrokeWidth(0.8f);
 			float[] freqMarks  = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
 			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
 			float fMin = (float) Math.log10(20.0);
 			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
+
+			// Логарифмическая сетка (в зоне баров)
+			Paint gridPaint = new Paint();
+			gridPaint.setColor(0x44FFFFFF);
+			gridPaint.setStrokeWidth(0.8f);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
-				canvas.drawLine(xf, 0, xf, barAreaH, gridPaint);
+				canvas.drawLine(xf, barTop, xf, h, gridPaint);
 			}
 
 			// Полосы спектра
@@ -2270,16 +2274,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int green = Math.min(255, (int)((1f - val) * 510f));
 				mBarPaint.setColor(0xDD000000 | (red << 16) | (green << 8) | 0x22);
 				float barH = val * barAreaH;
-				canvas.drawRect(x0, barAreaH - barH, x1, barAreaH, mBarPaint);
+				canvas.drawRect(x0, h - barH, x1, h, mBarPaint);
 
 				if (pk > 0.02f) {
-					float peakY = barAreaH - pk * barAreaH;
+					float peakY = h - pk * barAreaH;
 					canvas.drawLine(x0, peakY, x1, peakY, mPeakPaint);
 				}
 			}
 
-			// ── Подписи частот в зарезервированной полосе под спектром ──────
-			float labelY = h - 3f; // базовая линия в нижней полосе, всегда видима
+			// ── Подписи частот в верхней полосе (всегда видны) ──────────────
+			float labelY = lblH - 4f; // базовая линия текста в верхней полосе
 			float prevLblRight = -1f;
 			mLblPaint.setTextAlign(Paint.Align.CENTER);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
