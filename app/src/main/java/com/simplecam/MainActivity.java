@@ -2351,21 +2351,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// Фон полностью прозрачный — не рисуем ничего
 			// canvas.drawRect(0, 0, w, h, mBgPaint);
 
-			final float lblH = mLblPaint.getTextSize() + 2f;
-			final float barAreaH = h; // bars fill full height; labels overlap on top
+			final float lblH = mLblPaint.getTextSize() + 4f;
+			final float barTop   = lblH;            // верхняя полоса зарезервирована под метки
+			final float barAreaH = h - barTop;      // высота зоны баров
 
-			// Логарифмическая сетка (только линии — без подписей, они нарисуются после полос)
-			Paint gridPaint = new Paint();
-			gridPaint.setColor(0x44FFFFFF);
-			gridPaint.setStrokeWidth(0.8f);
 			float[] freqMarks  = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
 			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
 			float fMin = (float) Math.log10(20.0);
 			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
+
+			// Сетка только в зоне баров (ниже полосы меток)
+			Paint gridPaint = new Paint();
+			gridPaint.setColor(0x44FFFFFF);
+			gridPaint.setStrokeWidth(0.8f);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
-				canvas.drawLine(xf, 0, xf, barAreaH, gridPaint);
+				canvas.drawLine(xf, barTop, xf, h, gridPaint);
 			}
 
 			// Полосы спектра
@@ -2401,28 +2403,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int green = Math.min(255, (int)((1f - val) * 510f));
 				mBarPaint.setColor(0xDD000000 | (red << 16) | (green << 8) | 0x22);
 				float barH = val * barAreaH;
-				canvas.drawRect(x0, barAreaH - barH, x1, barAreaH, mBarPaint);
+				canvas.drawRect(x0, h - barH, x1, h, mBarPaint);
 
 				if (pk > 0.02f) {
-					float peakY = barAreaH - pk * barAreaH;
+					float peakY = h - pk * barAreaH;
 					canvas.drawLine(x0, peakY, x1, peakY, mPeakPaint);
 				}
 			}
 
-			// ── Подписи частот поверх полос (на переднем плане) ──────────────
-			float labelY = barAreaH - 3f; // у нижнего края, внутри области полос
+			// ── Метки частот в верхней полосе (всегда видны) ───────────────
+			float labelY = lblH - 4f;
 			float prevLblRight = -1f;
-			Paint lblBgPaint = new Paint();
-			lblBgPaint.setColor(0xAA000000);
+			mLblPaint.setTextAlign(Paint.Align.CENTER);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
 				float lblW = mLblPaint.measureText(freqLabels[fi]);
 				float lblX = xf - lblW / 2f;
 				if (lblX > prevLblRight && lblX + lblW < w - 2f) {
-					// Полупрозрачная подложка чтобы текст читался поверх любого сигнала
-					canvas.drawRect(lblX - 1f, labelY - mLblPaint.getTextSize() - 1f,
-						lblX + lblW + 1f, labelY + 2f, lblBgPaint);
 					canvas.drawText(freqLabels[fi], xf, labelY, mLblPaint);
 					prevLblRight = lblX + lblW + 3f;
 				}
