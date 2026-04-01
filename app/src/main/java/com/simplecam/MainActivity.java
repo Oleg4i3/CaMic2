@@ -61,6 +61,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private Button mBtn, mSrcToggleBtn;
 	private VuMeterView mVu;
 	private OscilloscopeView mOscilloscope;
+	private EnvelopeView mEnvelope;
 	private SpectrumView mSpectrum;
 	private ZoomLeverView mZoomLever;
 	private LinearLayout mAudioSrcPanel;
@@ -227,6 +228,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		oscLP.rightMargin = dp(60);
 		oscLP.topMargin = dp(6);
 		root.addView(mOscilloscope, oscLP);
+
+		// ── Огибающая (бегущий 10-секундный осциллограф) — тот же оверлей ──────
+		mEnvelope = new EnvelopeView(this);
+		FrameLayout.LayoutParams envLP = new FrameLayout.LayoutParams(
+				ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
+		envLP.gravity = Gravity.TOP | Gravity.LEFT;
+		envLP.leftMargin = dp(50);
+		envLP.rightMargin = dp(60);
+		envLP.topMargin = dp(6);
+		mEnvelope.setVisibility(View.GONE);
+		root.addView(mEnvelope, envLP);
 		
 		mBtnBgIdle = makeOval(0xFFDDCC00);
 		mBtnBgRec = makeOval(0xFFCC1100);
@@ -425,6 +437,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbOsc.setChecked(true);
 		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
 			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
 		});
 
 		CheckBox mCbSpec = new CheckBox(this);
@@ -1099,6 +1112,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mVu.setPeak(peakAmp);
 		mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
 		if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
+		if (mEnvelope != null) mEnvelope.pushSamples(buf, r, ch);
 		if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
 			
 			if (!mEncoding) {
@@ -1522,7 +1536,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		VuMeterView(Context c) {
 			super(c);
 			mPeakPaint.setColor(0xFFFFFFFF);
-			mPeakPaint.setStrokeWidth(2f);
+			float vuDensity = c.getResources().getDisplayMetrics().density;
+			mPeakPaint.setStrokeWidth(4f * vuDensity);
 			mPeakPaint.setStyle(Paint.Style.STROKE);
 			float density = c.getResources().getDisplayMetrics().density;
 			mDbLblPaint.setTextSize(5.5f * density);
@@ -2000,14 +2015,19 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final Paint mWavePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mGridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		private final Path mPath = new Path();
-		
+		/** Цвет по амплитуде 0..1 — как сегменты VU-метра */
+		static int levelColor(float amp) {
+			if (amp >= 0.7f) return 0xFFFF2200;
+			if (amp >= 0.3f) return 0xFFFFBB00;
+			return 0xFF00CC55;
+		}
+
 		OscilloscopeView(Context c) {
 			super(c);
 			setBackgroundColor(0x00000000); // прозрачный
-			mWavePaint.setColor(0xFF00FF88);
 			mWavePaint.setStrokeWidth(1.8f * c.getResources().getDisplayMetrics().density);
 			mWavePaint.setStyle(Paint.Style.STROKE);
+			mWavePaint.setStrokeCap(Paint.Cap.ROUND);
 			mGridPaint.setColor(0x33FFFFFF);
 			mGridPaint.setStrokeWidth(0.8f);
 			mGridPaint.setStyle(Paint.Style.STROKE);
@@ -2078,26 +2098,137 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			float trigY = h / 2f - TRIG_LEVEL * h / 2f;
 			canvas.drawLine(0, trigY, w, trigY, trigPaint);
 			
-			// Волна
+			// Волна — цветные сегменты (зелёный→оранжевый→красный)
 			float[] frame;
 			synchronized (mLock) {
 				frame = mFrame.clone();
 			}
-			mPath.reset();
-			boolean first = true;
-			for (int i = 0; i < DISP_SAMPLES; i++) {
-				float x = i * w / (DISP_SAMPLES - 1f);
-				float y = h / 2f - frame[i] * h / 2f * 0.92f;
-				if (first) { mPath.moveTo(x, y); first = false; }
-				else mPath.lineTo(x, y);
+			for (int i = 0; i < DISP_SAMPLES - 1; i++) {
+				float x0 = i       * w / (DISP_SAMPLES - 1f);
+				float x1 = (i + 1) * w / (DISP_SAMPLES - 1f);
+				float y0 = h / 2f - frame[i]     * h / 2f * 0.92f;
+				float y1 = h / 2f - frame[i + 1] * h / 2f * 0.92f;
+				mWavePaint.setColor(levelColor(Math.abs(frame[i])));
+				canvas.drawLine(x0, y0, x1, y1, mWavePaint);
 			}
-			canvas.drawPath(mPath, mWavePaint);
 			
 			// Подпись
 			canvas.drawText("OSC  T↑", 4, h - 3f, mLabelPaint);
 		}
 	}
 	
+
+	// ─── Огибающая: бегущий 10-секундный осциллограф ────────────────────────────
+	// Хранит пиковые значения с шагом ~10 мс (CHUNK выборок).
+	// Показывается когда осциллограф выключен; вертикальный масштаб совпадает.
+
+	static class EnvelopeView extends View {
+		private static final int HIST  = 1000; // 10 с × 100 точек/с
+		private static final int CHUNK = 441;  // ~10 мс при 44100 Гц
+
+		private final float[] mEnv    = new float[HIST];
+		private int   mWritePos = 0;
+		private int   mFilled   = 0;
+		private float mAccPeak  = 0f;
+		private int   mAccCount = 0;
+		private final Object mLock = new Object();
+
+		private final Paint mSegPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mGridPaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+		EnvelopeView(Context c) {
+			super(c);
+			setBackgroundColor(0x00000000);
+			float d = c.getResources().getDisplayMetrics().density;
+			mSegPaint.setStyle(Paint.Style.STROKE);
+			mSegPaint.setStrokeWidth(1.6f * d);
+			mSegPaint.setStrokeCap(Paint.Cap.ROUND);
+			mGridPaint.setColor(0x33FFFFFF);
+			mGridPaint.setStrokeWidth(0.8f);
+			mGridPaint.setStyle(Paint.Style.STROKE);
+			mLabelPaint.setColor(0xAAFFFFFF);
+			mLabelPaint.setTextSize(9 * d);
+			mLabelPaint.setAntiAlias(true);
+		}
+
+		void pushSamples(short[] buf, int len, int channels) {
+			synchronized (mLock) {
+				for (int i = 0; i < len; i += channels) {
+					float s = Math.abs(buf[i] / 32768f);
+					if (channels == 2 && i + 1 < len)
+						s = Math.max(s, Math.abs(buf[i + 1] / 32768f));
+					if (s > mAccPeak) mAccPeak = s;
+					mAccCount++;
+					if (mAccCount >= CHUNK) {
+						mEnv[mWritePos] = mAccPeak;
+						mWritePos = (mWritePos + 1) % HIST;
+						if (mFilled < HIST) mFilled++;
+						mAccPeak  = 0f;
+						mAccCount = 0;
+					}
+				}
+			}
+			postInvalidate();
+		}
+
+		@Override
+		protected void onDraw(Canvas canvas) {
+			final float w = getWidth(), h = getHeight();
+			if (w == 0 || h == 0) return;
+
+			// Сетка (как у осциллографа)
+			for (int gx = 1; gx < 4; gx++)
+				canvas.drawLine(w * gx / 4f, 0, w * gx / 4f, h, mGridPaint);
+			for (int gy = 1; gy < 4; gy++)
+				canvas.drawLine(0, h * gy / 4f, w, h * gy / 4f, mGridPaint);
+			Paint zeroPaint = new Paint(mGridPaint);
+			zeroPaint.setColor(0x55FFFFFF);
+			zeroPaint.setStrokeWidth(1.4f);
+			canvas.drawLine(0, h / 2f, w, h / 2f, zeroPaint);
+
+			float[] snap;
+			int filled, writePos;
+			synchronized (mLock) {
+				snap     = mEnv.clone();
+				filled   = mFilled;
+				writePos = mWritePos;
+			}
+			if (filled < 2) {
+				mLabelPaint.setColor(0xAAFFFFFF);
+				canvas.drawText("ENV  10s", 4, h - 3f, mLabelPaint);
+				return;
+			}
+
+			int count = Math.min(filled, HIST);
+			int start = (filled < HIST) ? 0 : writePos;
+
+			// Рисуем симметричную огибающую цветными сегментами
+			for (int i = 0; i < count - 1; i++) {
+				float a0 = snap[(start + i)     % HIST];
+				float a1 = snap[(start + i + 1) % HIST];
+				float x0 = i       * w / (count - 1f);
+				float x1 = (i + 1) * w / (count - 1f);
+				float yT0 = h / 2f - a0 * h / 2f * 0.92f;
+				float yT1 = h / 2f - a1 * h / 2f * 0.92f;
+				float yB0 = h / 2f + a0 * h / 2f * 0.92f;
+				float yB1 = h / 2f + a1 * h / 2f * 0.92f;
+				mSegPaint.setColor(OscilloscopeView.levelColor((a0 + a1) * 0.5f));
+				canvas.drawLine(x0, yT0, x1, yT1, mSegPaint);
+				canvas.drawLine(x0, yB0, x1, yB1, mSegPaint);
+			}
+
+			// Вертикальная черта «сейчас» (правый край)
+			Paint curPaint = new Paint();
+			curPaint.setColor(0x66FFFFFF);
+			curPaint.setStrokeWidth(1f);
+			canvas.drawLine(w - 1f, 0, w - 1f, h, curPaint);
+
+			mLabelPaint.setColor(0xAAFFFFFF);
+			canvas.drawText("ENV  10s", 4, h - 3f, mLabelPaint);
+		}
+	}
+
 	// ─── Спектр-анализатор: FFT 2048 точек ───────────────────────────────────
 	// Компактный вид в нижней панели. Логарифмическая шкала частот.
 	// Накопительный буфер: когда накоплено >= FFT_SIZE выборок — считаем FFT.
@@ -2220,25 +2351,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// Фон полностью прозрачный — не рисуем ничего
 			// canvas.drawRect(0, 0, w, h, mBgPaint);
 
-			final float lblH = mLblPaint.getTextSize() + 4f;
-			// Метки — в верхней полосе (всегда видна).
-			// Полосы спектра — от lblH до h.
-			final float barTop = lblH;
-			final float barAreaH = h - barTop;
+			final float lblH = mLblPaint.getTextSize() + 2f;
+			final float barAreaH = h; // bars fill full height; labels overlap on top
 
+			// Логарифмическая сетка (только линии — без подписей, они нарисуются после полос)
+			Paint gridPaint = new Paint();
+			gridPaint.setColor(0x44FFFFFF);
+			gridPaint.setStrokeWidth(0.8f);
 			float[] freqMarks  = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
 			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
 			float fMin = (float) Math.log10(20.0);
 			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
-
-			// Логарифмическая сетка (в зоне баров)
-			Paint gridPaint = new Paint();
-			gridPaint.setColor(0x44FFFFFF);
-			gridPaint.setStrokeWidth(0.8f);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
-				canvas.drawLine(xf, barTop, xf, h, gridPaint);
+				canvas.drawLine(xf, 0, xf, barAreaH, gridPaint);
 			}
 
 			// Полосы спектра
@@ -2274,24 +2401,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int green = Math.min(255, (int)((1f - val) * 510f));
 				mBarPaint.setColor(0xDD000000 | (red << 16) | (green << 8) | 0x22);
 				float barH = val * barAreaH;
-				canvas.drawRect(x0, h - barH, x1, h, mBarPaint);
+				canvas.drawRect(x0, barAreaH - barH, x1, barAreaH, mBarPaint);
 
 				if (pk > 0.02f) {
-					float peakY = h - pk * barAreaH;
+					float peakY = barAreaH - pk * barAreaH;
 					canvas.drawLine(x0, peakY, x1, peakY, mPeakPaint);
 				}
 			}
 
-			// ── Подписи частот в верхней полосе (всегда видны) ──────────────
-			float labelY = lblH - 4f; // базовая линия текста в верхней полосе
+			// ── Подписи частот поверх полос (на переднем плане) ──────────────
+			float labelY = barAreaH - 3f; // у нижнего края, внутри области полос
 			float prevLblRight = -1f;
-			mLblPaint.setTextAlign(Paint.Align.CENTER);
+			Paint lblBgPaint = new Paint();
+			lblBgPaint.setColor(0xAA000000);
 			for (int fi = 0; fi < freqMarks.length; fi++) {
 				if (freqMarks[fi] > SAMPLE_RATE / 2f) break;
 				float xf = ((float) Math.log10(freqMarks[fi]) - fMin) / (fMax - fMin) * w;
 				float lblW = mLblPaint.measureText(freqLabels[fi]);
 				float lblX = xf - lblW / 2f;
 				if (lblX > prevLblRight && lblX + lblW < w - 2f) {
+					// Полупрозрачная подложка чтобы текст читался поверх любого сигнала
+					canvas.drawRect(lblX - 1f, labelY - mLblPaint.getTextSize() - 1f,
+						lblX + lblW + 1f, labelY + 2f, lblBgPaint);
 					canvas.drawText(freqLabels[fi], xf, labelY, mLblPaint);
 					prevLblRight = lblX + lblW + 3f;
 				}
