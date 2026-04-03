@@ -934,13 +934,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			
 			mAudDoneLatch = new CountDownLatch(1);
 			mRecording = true;
-			startAudioThread(true);
+			
 			
 			mSessionLatch = new CountDownLatch(1);
 			runOnUiThread(this::startPreview);
 			if (!mSessionLatch.await(4, TimeUnit.SECONDS))
 			throw new Exception("Camera session timeout");
 			Thread.sleep(100);
+			startAudioThread(true);
 			
 			final String fp = displayPath;
 			mVidThread = new Thread(() -> videoLoop(fp), "vid");
@@ -1071,20 +1072,23 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
+		
+		
 		private void audioMainLoop() {
 		final AudioRecord rec = mAudRec;
 		final int ch = mAudChannels;
 		final int chunkSamples = AUDIO_SR * ch / 50;
 		short[] buf = new short[chunkSamples];
-		long pts = 0L;
-		long totalFrames = 0L;          // ← КУМУЛЯТИВНЫЙ счёт фреймов (samples per channel)
+
+		long totalFrames = 0L;   // кумулятивный счёт фреймов (per channel)
+
 		rec.startRecording();
 
 		while (mAudRunning) {
 			int r = rec.read(buf, 0, chunkSamples);
-			if (r <= 0)
-				continue;
+			if (r <= 0) continue;
 
+			// ─── обработка громкости / soft-clip / визуализация (без изменений) ───
 			final float g = mGain;
 			final boolean sc = mSoftClip;
 			long sumSq = 0;
@@ -1097,14 +1101,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					if (abs > T)
 						s = Math.signum(s) * (T + knee * (float) Math.tanh((abs - T) / knee));
 				}
-				if (s > 32767f)
-					s = 32767f;
-				else if (s < -32768f)
-					s = -32768f;
+				if (s > 32767f) s = 32767f;
+				else if (s < -32768f) s = -32768f;
 				buf[i] = (short) s;
 				sumSq += (long) buf[i] * buf[i];
 			}
-			// Истинный пик (после gain/soft-clip)
+
 			float peakAmp = 0f;
 			for (int _pi = 0; _pi < r; _pi++) {
 				float _a = Math.abs(buf[_pi]) / 32768f;
@@ -1112,26 +1114,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 			mVu.setPeak(peakAmp);
 			mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
+
 			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
 			if (mEnvelope != null) mEnvelope.pushSamples(buf, r, ch);
 			if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
 
-			if (!mEncoding) {
-				pts = 0;
-				continue;
-			}
+			if (!mEncoding) continue;
+
 			if (!mRecording) {
 				int idx = mAudEnc.dequeueInputBuffer(50_000);
 				if (idx >= 0)
 					mAudEnc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
 				drainAudioCodec(true);
 				mEncoding = false;
-				pts = 0;
 				CountDownLatch latch = mAudDoneLatch;
-				if (latch != null)
-					latch.countDown();
+				if (latch != null) latch.countDown();
 				continue;
 			}
+
+			// ─── ИДЕАЛЬНЫЙ PTS (кумулятивный, без накопленной ошибки) ─────
+			int numFrames = r / ch;
+			long pts = totalFrames * 1_000_000L / AUDIO_SR;
+			totalFrames += numFrames;
+			// ───────────────────────────────────────────────────────────────
 
 			int idx = mAudEnc.dequeueInputBuffer(10_000);
 			if (idx >= 0) {
@@ -1141,28 +1146,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					bb.put((byte) (buf[i] & 0xFF));
 					bb.put((byte) (buf[i] >> 8 & 0xFF));
 				}
-
-				// ─── ИСПРАВЛЕННЫЙ PTS ─────────────────────────────────────
-				// Используем кумулятивный счёт фреймов → никаких накопленных ошибок округления.
-				// PTS всегда соответствует началу текущего чанка (как было в оригинале для первого чанка).
-				int numFrames = r / ch;
-				if (numFrames > 0) {
-					pts = totalFrames * 1_000_000L / AUDIO_SR;   // timestamp для этого буфера
-					totalFrames += numFrames;
-				}
-				// ────────────────────────────────────────────────────────
-
 				mAudEnc.queueInputBuffer(idx, 0, r * 2, pts, 0);
 			}
+
 			drainAudioCodec(false);
 		}
+
 		mVu.setLevel(0f);
-		try {
-			rec.stop();
-		} catch (Exception ignored) {
-		}
+		try { rec.stop(); } catch (Exception ignored) {}
 	}
-	
+		
 	private void drainAudioCodec(boolean eos) {
 		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 		while (true) {
