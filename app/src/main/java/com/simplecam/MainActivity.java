@@ -1071,19 +1071,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-	private void audioMainLoop() {
+		private void audioMainLoop() {
 		final AudioRecord rec = mAudRec;
 		final int ch = mAudChannels;
 		final int chunkSamples = AUDIO_SR * ch / 50;
 		short[] buf = new short[chunkSamples];
-		long pts = 0;
+		long pts = 0L;
+		long totalFrames = 0L;          // ← КУМУЛЯТИВНЫЙ счёт фреймов (samples per channel)
 		rec.startRecording();
-		
+
 		while (mAudRunning) {
 			int r = rec.read(buf, 0, chunkSamples);
 			if (r <= 0)
-			continue;
-			
+				continue;
+
 			final float g = mGain;
 			final boolean sc = mSoftClip;
 			long sumSq = 0;
@@ -1094,27 +1095,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					final float knee = 32768f - T;
 					float abs = Math.abs(s);
 					if (abs > T)
-					s = Math.signum(s) * (T + knee * (float) Math.tanh((abs - T) / knee));
+						s = Math.signum(s) * (T + knee * (float) Math.tanh((abs - T) / knee));
 				}
 				if (s > 32767f)
-				s = 32767f;
+					s = 32767f;
 				else if (s < -32768f)
-				s = -32768f;
+					s = -32768f;
 				buf[i] = (short) s;
 				sumSq += (long) buf[i] * buf[i];
 			}
 			// Истинный пик (после gain/soft-clip)
-		float peakAmp = 0f;
-		for (int _pi = 0; _pi < r; _pi++) {
-			float _a = Math.abs(buf[_pi]) / 32768f;
-			if (_a > peakAmp) peakAmp = _a;
-		}
-		mVu.setPeak(peakAmp);
-		mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
-		if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
-		if (mEnvelope != null) mEnvelope.pushSamples(buf, r, ch);
-		if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
-			
+			float peakAmp = 0f;
+			for (int _pi = 0; _pi < r; _pi++) {
+				float _a = Math.abs(buf[_pi]) / 32768f;
+				if (_a > peakAmp) peakAmp = _a;
+			}
+			mVu.setPeak(peakAmp);
+			mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
+			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
+			if (mEnvelope != null) mEnvelope.pushSamples(buf, r, ch);
+			if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
+
 			if (!mEncoding) {
 				pts = 0;
 				continue;
@@ -1122,16 +1123,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (!mRecording) {
 				int idx = mAudEnc.dequeueInputBuffer(50_000);
 				if (idx >= 0)
-				mAudEnc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+					mAudEnc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
 				drainAudioCodec(true);
 				mEncoding = false;
 				pts = 0;
 				CountDownLatch latch = mAudDoneLatch;
 				if (latch != null)
-				latch.countDown();
+					latch.countDown();
 				continue;
 			}
-			
+
 			int idx = mAudEnc.dequeueInputBuffer(10_000);
 			if (idx >= 0) {
 				ByteBuffer bb = mAudEnc.getInputBuffer(idx);
@@ -1140,15 +1141,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					bb.put((byte) (buf[i] & 0xFF));
 					bb.put((byte) (buf[i] >> 8 & 0xFF));
 				}
+
+				// ─── ИСПРАВЛЕННЫЙ PTS ─────────────────────────────────────
+				// Используем кумулятивный счёт фреймов → никаких накопленных ошибок округления.
+				// PTS всегда соответствует началу текущего чанка (как было в оригинале для первого чанка).
+				int numFrames = r / ch;
+				if (numFrames > 0) {
+					pts = totalFrames * 1_000_000L / AUDIO_SR;   // timestamp для этого буфера
+					totalFrames += numFrames;
+				}
+				// ────────────────────────────────────────────────────────
+
 				mAudEnc.queueInputBuffer(idx, 0, r * 2, pts, 0);
 			}
-			pts += (long) r * 1_000_000L / AUDIO_SR / ch;
 			drainAudioCodec(false);
 		}
 		mVu.setLevel(0f);
 		try {
 			rec.stop();
-			} catch (Exception ignored) {
+		} catch (Exception ignored) {
 		}
 	}
 	
