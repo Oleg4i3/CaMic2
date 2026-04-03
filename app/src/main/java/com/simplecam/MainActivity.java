@@ -1132,12 +1132,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				continue;
 			}
 
-			// ─── ИДЕАЛЬНЫЙ PTS (кумулятивный, без накопленной ошибки) ─────
+			// ─── PTS с компенсацией реальной задержки камеры ─────
 			int numFrames = r / ch;
-			long pts = totalFrames * 1_000_000L / AUDIO_SR;
+			long audioTimeUs = totalFrames * 1_000_000L / AUDIO_SR;
+			long pts = Math.max(0L, audioTimeUs - 215_000L);   // ← сюда  число в микросекундах
 			totalFrames += numFrames;
-			// ───────────────────────────────────────────────────────────────
-
+			
+			
 			int idx = mAudEnc.dequeueInputBuffer(10_000);
 			if (idx >= 0) {
 				ByteBuffer bb = mAudEnc.getInputBuffer(idx);
