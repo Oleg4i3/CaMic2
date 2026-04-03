@@ -89,6 +89,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private float mMaxZoom = 1f;
 	private volatile float mZoomLevel = 1f;
 	private volatile float mZoomLeverPos = 0f;
+		private volatile long mVideoStartNano = 0L;   // момент первого реального видеокадра
 	
 	// Фокус
 	private volatile boolean mManualFocus = false;
@@ -1072,8 +1073,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-		
-		
 		private void audioMainLoop() {
 		final AudioRecord rec = mAudRec;
 		final int ch = mAudChannels;
@@ -1132,13 +1131,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				continue;
 			}
 
-			// ─── PTS с компенсацией реальной задержки камеры ─────
+			// ─── PTS относительно первого видеокадра (видео — мастер-клок) ─────
 			int numFrames = r / ch;
 			long audioTimeUs = totalFrames * 1_000_000L / AUDIO_SR;
-			long pts = Math.max(0L, audioTimeUs - 215_000L);   // ← сюда  число в микросекундах
+
+			long pts;
+			if (mVideoStartNano == 0) {
+				pts = 0;                    // видео ещё не выдало первый кадр
+			} else {
+				long videoAgeUs = (System.nanoTime() - mVideoStartNano) / 1000L;
+				pts = Math.max(0L, audioTimeUs - videoAgeUs);
+			}
 			totalFrames += numFrames;
-			
-			
+			// ───────────────────────────────────────────────────────────────
+
 			int idx = mAudEnc.dequeueInputBuffer(10_000);
 			if (idx >= 0) {
 				ByteBuffer bb = mAudEnc.getInputBuffer(idx);
@@ -1155,7 +1161,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		mVu.setLevel(0f);
 		try { rec.stop(); } catch (Exception ignored) {}
-	}
+	}	
+	
+
 		
 	private void drainAudioCodec(boolean eos) {
 		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -1187,49 +1195,61 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// Видео-поток
 	// =========================================================================
 	
-	private void videoLoop(String path) {
+		private void videoLoop(String path) {
 		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 		boolean eosSent = false;
 		long baseTs = -1;
+
 		while (true) {
 			if (!mRecording && !eosSent) {
 				try {
 					mVidEnc.signalEndOfInputStream();
-					} catch (Exception ignored) {
+				} catch (Exception ignored) {
 				}
 				eosSent = true;
 			}
+
 			int out = mVidEnc.dequeueOutputBuffer(info, 20_000);
+
 			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
 				synchronized (mMuxLock) {
 					mVidTrack = mMuxer.addTrack(mVidEnc.getOutputFormat());
 					tryStartMuxer();
 				}
-				} else if (out >= 0) {
+			} else if (out >= 0) {
+
+				// ─── ЗАПОМИНАЕМ ТОЧНЫЙ МОМЕНТ ПЕРВОГО ВИДЕО-КАДРА ───
+				if (mVideoStartNano == 0 && info.presentationTimeUs > 0) {
+					mVideoStartNano = System.nanoTime();
+				}
+				// ───────────────────────────────────────────────────────
+
 				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
 				if (mMuxReady && !cfg && info.size > 0) {
 					if (baseTs < 0)
-					baseTs = info.presentationTimeUs;
+						baseTs = info.presentationTimeUs;
 					ByteBuffer data = mVidEnc.getOutputBuffer(out);
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
 					n.set(info.offset, info.size, info.presentationTimeUs - baseTs, info.flags);
 					synchronized (mMuxLock) {
 						if (mMuxReady)
-						mMuxer.writeSampleData(mVidTrack, data, n);
+							mMuxer.writeSampleData(mVidTrack, data, n);
 					}
 				}
 				mVidEnc.releaseOutputBuffer(out, false);
 				if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0)
-				break;
+					break;
 			}
 		}
+
 		try {
 			if (mAudDoneLatch != null)
-			mAudDoneLatch.await(5000, TimeUnit.MILLISECONDS);
-			} catch (InterruptedException ignored) {
+				mAudDoneLatch.await(5000, TimeUnit.MILLISECONDS);
+		} catch (InterruptedException ignored) {
 		}
 		cleanup(path);
 	}
+	
 	
 	private void tryStartMuxer() {
 		if (!mMuxReady && mVidTrack >= 0 && mAudTrack >= 0) {
