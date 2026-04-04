@@ -48,7 +48,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private static final int VIDEO_H = 720;
 	private static final int VIDEO_BPS = 6_000_000;
 	private static final int VIDEO_FPS = 30;
-	private static final int AUDIO_SR = 44100;
+	private static final int AUDIO_SR = 48000;
 	private static final int REQ_PERMS = 1;
 	private static final float MAX_ZOOM_SPEED = 0.08f;
 	
@@ -923,7 +923,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			disableAudioEffects(mAudRec.getAudioSessionId());
 			
 			MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SR, mAudChannels);
-			af.setInteger(MediaFormat.KEY_BIT_RATE, mAudChannels == 1 ? 96_000 : 192_000);
+			af.setInteger(MediaFormat.KEY_BIT_RATE, mAudChannels == 1 ? 192_000 : 320_000);
 			af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
 			mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
 			mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
