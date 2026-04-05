@@ -46,12 +46,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// ─── Константы ────────────────────────────────────────────────────────────
 	private static final int VIDEO_W = 1280;
 	private static final int VIDEO_H = 720;
-	private static final int VIDEO_BPS = 6_000_000;
+	private static final int VIDEO_BPS_DEFAULT = 6_000_000;
 	private static final int VIDEO_FPS = 30;
 	private static final int AUDIO_SR = 48000;
 	private static final int REQ_PERMS = 1;
 	private static final float MAX_ZOOM_SPEED = 0.08f;
-	private static final int PRE_BUFFER_SECS = 1;
 	
 	// ─── UI ───────────────────────────────────────────────────────────────────
 	private SurfaceView mSv;
@@ -92,23 +91,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile float mZoomLeverPos = 0f;
 		private volatile long mVideoStartNano = 0L;   // момент первого реального видеокадра
 
-	// Экспозиция
+	// ─── Экспозиция ──────────────────────────────────────────────────────────
 	private volatile int mEvComp = 0;
 	private int mEvMin = -6, mEvMax = 6;
 	private SeekBar mSeekEv;
 	private TextView mTvEv;
 
-	// Битрейт видео
-	private volatile int mVideoBps = VIDEO_BPS;
+	// ─── Битрейт видео ────────────────────────────────────────────────────────
+	private volatile int mVideoBps = VIDEO_BPS_DEFAULT;
 
-	// Пре-буфер аудио
+	// ─── Пре-буфер аудио ─────────────────────────────────────────────────────
+	// mPreBufOffsetUs — длина пре-буфера в мкс; аудио PTS 0..offset, видео offset..∞
 	private volatile boolean mPreBufferEnabled = false;
-	private final Object mPreBufLock = new Object();
+	private volatile int     mPreBufSecs = 1;          // 1..5 секунд
+	private final Object     mPreBufLock = new Object();
 	private final java.util.ArrayDeque<short[]> mPreBufDeque = new java.util.ArrayDeque<>();
-	// mPendingPreBuf — снимок деки, передаётся в audio-поток при старте записи
 	private volatile List<short[]> mPendingPreBuf = null;
-	// Смещение всех PTS (аудио + видео) на длину пре-буфера
-	// пре-буфер: 0..mPreBufOffsetUs, видео/живое аудио: mPreBufOffsetUs..∞
 	private volatile long mPreBufOffsetUs = 0L;
 	
 	// Фокус
@@ -259,7 +257,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		envLP.leftMargin = dp(50);
 		envLP.rightMargin = dp(60);
 		envLP.topMargin = dp(6);
-		root.addView(mEnvelope, envLP);
+		root.addView(mEnvelope, envLP); // envelope видим по умолчанию
 		
 		mBtnBgIdle = makeOval(0xFFDDCC00);
 		mBtnBgRec = makeOval(0xFFCC1100);
@@ -455,7 +453,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbOsc.setText("Oscilloscope");
 		mCbOsc.setTextColor(0xCCCCCCCC);
 		mCbOsc.setTextSize(12);
-		mCbOsc.setChecked(false); // по умолчанию envelope видим
+		mCbOsc.setChecked(false); // по умолчанию envelope
 		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
 			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
 			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
@@ -489,7 +487,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mTvEv = smallLabel("EV  0");
 		mSeekEv = new SeekBar(this);
 		mSeekEv.setMax(mEvMax - mEvMin);
-		mSeekEv.setProgress(-mEvMin);   // центр = EV 0
+		mSeekEv.setProgress(-mEvMin); // центр = EV 0
 		mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
 				mEvComp = mEvMin + p;
@@ -507,32 +505,54 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		evRow.addView(mSeekEv);
 		mAudioSrcPanel.addView(evRow);
 
-		// ── Пре-буфер 1 с до нажатия REC ────────────────────────────────────
-		CheckBox mCbPreBuffer = new CheckBox(this);
-		mCbPreBuffer.setText("Pre-buffer 1s (audio before REC)");
-		mCbPreBuffer.setTextColor(0xCCCCCCCC);
-		mCbPreBuffer.setTextSize(12);
-		mCbPreBuffer.setChecked(false);
-		mCbPreBuffer.setOnCheckedChangeListener((cb, checked) -> {
-			mPreBufferEnabled = checked;
-			if (!checked) { synchronized (mPreBufLock) { mPreBufDeque.clear(); } }
+		// ── Пре-буфер: вкл/выкл + длина 1..5 с ──────────────────────────────
+		CheckBox mCbPreBuf = new CheckBox(this);
+		mCbPreBuf.setText("Pre-buffer (audio before REC)");
+		mCbPreBuf.setTextColor(0xCCCCCCCC);
+		mCbPreBuf.setTextSize(12);
+		mCbPreBuf.setChecked(false);
+		mCbPreBuf.setOnCheckedChangeListener((cb, on) -> {
+			mPreBufferEnabled = on;
+			if (!on) { synchronized (mPreBufLock) { mPreBufDeque.clear(); } }
 		});
-		mAudioSrcPanel.addView(mCbPreBuffer);
+
+		// Слайдер длины буфера 1..5 с
+		final TextView tvPreBufLen = smallLabel("1 s");
+		SeekBar sbPreBuf = new SeekBar(this);
+		sbPreBuf.setMax(4); // 0..4 → 1..5 секунд
+		sbPreBuf.setProgress(0);
+		sbPreBuf.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+			public void onProgressChanged(SeekBar s, int p, boolean u) {
+				mPreBufSecs = p + 1;
+				tvPreBufLen.setText(mPreBufSecs + " s");
+				// Обрезаем деку под новый лимит
+				synchronized (mPreBufLock) { trimPreBuf(mAudChannels); }
+			}
+			public void onStartTrackingTouch(SeekBar s) {}
+			public void onStopTrackingTouch(SeekBar s) {}
+		});
+		sbPreBuf.setLayoutParams(new LinearLayout.LayoutParams(dp(140), ViewGroup.LayoutParams.WRAP_CONTENT));
+
+		LinearLayout preBufRow = new LinearLayout(this);
+		preBufRow.setOrientation(LinearLayout.HORIZONTAL);
+		preBufRow.setGravity(Gravity.CENTER_VERTICAL);
+		preBufRow.addView(mCbPreBuf);
+		preBufRow.addView(sbPreBuf);
+		preBufRow.addView(tvPreBufLen);
+		mAudioSrcPanel.addView(preBufRow);
 
 		// ── Битрейт видео ────────────────────────────────────────────────────
 		String[] bpsLabels = {"3 Mbps", "4 Mbps", "6 Mbps (default)", "8 Mbps", "12 Mbps"};
 		int[]    bpsValues = {3_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000};
 		Spinner spBps = new Spinner(this);
 		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this,
-			android.R.layout.simple_spinner_item, bpsLabels);
+				android.R.layout.simple_spinner_item, bpsLabels);
 		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
 		spBps.setAdapter(bpsAd);
-		spBps.setSelection(2); // 6 Mbps по умолчанию
+		spBps.setSelection(2); // 6 Mbps
 		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
 		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
-				mVideoBps = bpsValues[pos];
-			}
+			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsValues[pos]; }
 			public void onNothingSelected(AdapterView<?> p) {}
 		});
 		LinearLayout bpsRow = new LinearLayout(this);
@@ -648,6 +668,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private void updateEvLabel(int ev) {
 		if (mTvEv == null) return;
 		runOnUiThread(() -> mTvEv.setText(ev == 0 ? "EV  0" : String.format("EV %+d", ev)));
+	}
+
+	// Вызывать внутри synchronized(mPreBufLock)
+	private void trimPreBuf(int channels) {
+		int maxSamples = AUDIO_SR * channels * mPreBufSecs;
+		int total = 0;
+		for (short[] c : mPreBufDeque) total += c.length;
+		while (total > maxSamples && !mPreBufDeque.isEmpty())
+			total -= mPreBufDeque.removeFirst().length;
 	}
 	
 	// ── Helpers ───────────────────────────────────────────────────────────────
@@ -799,7 +828,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					if (minFocus != null)
 					mMinFocusDist = minFocus;
 					android.util.Range<Integer> evRange =
-						ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+							ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
 					if (evRange != null) { mEvMin = evRange.getLower(); mEvMax = evRange.getUpper(); }
 					break;
 				}
@@ -1029,28 +1058,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mAudDoneLatch = new CountDownLatch(1);
 			mRecording = true;
 
-			// ─── Снимок пре-буфера (если включён) ────────────────────────────
-			// mPreBufOffsetUs — на сколько нужно сдвинуть PTS видео и живого аудио,
-			// чтобы пре-буфер (0..offset) предшествовал им в файле.
+			// ─── Захватываем снимок пре-буфера ────────────────────────────────
+			// Делаем это ДО stopAudio(), пока monitor-поток ещё жив и наполняет деку.
+			// mPreBufOffsetUs = длина пре-буфера в мкс; аудио начнётся с 0,
+			// видео и живое аудио — с mPreBufOffsetUs. Бесшовная склейка.
 			mPendingPreBuf = null;
 			mPreBufOffsetUs = 0L;
 			if (mPreBufferEnabled) {
 				List<short[]> snapshot;
 				synchronized (mPreBufLock) {
 					snapshot = new ArrayList<>(mPreBufDeque);
+					mPreBufDeque.clear(); // начинаем следующий цикл чисто
 				}
 				if (!snapshot.isEmpty()) {
-					int totalSamples = 0; // raw shorts (не per-channel)
-					for (short[] c : snapshot) totalSamples += c.length;
-					// делим на каналы → фреймы на канал → секунды
-					mPreBufOffsetUs = (long) totalSamples * 1_000_000L / (AUDIO_SR * mAudChannels);
+					// Суммируем кол-во фреймов (short-отсчётов / каналы)
+					long preBufFrames = 0;
+					for (short[] c : snapshot) preBufFrames += c.length;
+					preBufFrames /= mAudChannels;
+					mPreBufOffsetUs = preBufFrames * 1_000_000L / AUDIO_SR;
 					mPendingPreBuf = snapshot;
-					synchronized (mPreBufLock) { mPreBufDeque.clear(); }
 				}
 			}
-			// ─────────────────────────────────────────────────────────────────
-			
-			
+			// ──────────────────────────────────────────────────────────────────
+
 			mSessionLatch = new CountDownLatch(1);
 			runOnUiThread(this::startPreview);
 			if (!mSessionLatch.await(4, TimeUnit.SECONDS))
@@ -1197,18 +1227,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		rec.startRecording();
 
-		// ─── Дренаж пре-буфера ────────────────────────────────────────────────
-		// Пре-буфер кодируется с PTS 0..mPreBufOffsetUs.
-		// totalFrames сбрасывается в 0 после дренажа — живое аудио независимо
-		// рассчитывает свои метки и получает сдвиг mPreBufOffsetUs сверху.
-		// Видео тоже сдвигается на mPreBufOffsetUs в videoLoop().
+		// ─── Дренаж пре-буфера ───────────────────────────────────────────────
+		// totalFrames НЕ сбрасывается после дренажа: живое аудио продолжает
+		// считать фреймы с того места, где закончился пре-буфер.
+		// Итог: PTS пре-буфер = 0..mPreBufOffsetUs,
+		//        PTS живого аудио = mPreBufOffsetUs..∞  → бесшовная склейка.
 		if (mEncoding) {
 			List<short[]> preChunks = mPendingPreBuf;
 			mPendingPreBuf = null;
-			if (preChunks != null && !preChunks.isEmpty()) {
+			if (preChunks != null) {
 				for (short[] chunk : preChunks) {
 					int pr = chunk.length;
-					// gain / soft-clip
+					// применяем текущий gain / soft-clip
 					final float g2 = mGain;
 					final boolean sc2 = mSoftClip;
 					for (int i = 0; i < pr; i++) {
@@ -1216,12 +1246,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						if (sc2) {
 							final float T = 32768f * 0.7f, knee = 32768f - T;
 							float ab = Math.abs(s);
-							if (ab > T) s = Math.signum(s) * (T + knee * (float) Math.tanh((ab - T) / knee));
+							if (ab > T) s = Math.signum(s) * (T + knee * (float)Math.tanh((ab-T)/knee));
 						}
 						if (s > 32767f) s = 32767f; else if (s < -32768f) s = -32768f;
 						chunk[i] = (short) s;
 					}
-					// PTS строго по счётчику, начиная с 0
+					// PTS строго по счётчику — продолжит с того же места в живом аудио
 					long pts = totalFrames * 1_000_000L / AUDIO_SR;
 					totalFrames += pr / ch;
 					int idx = mAudEnc.dequeueInputBuffer(20_000);
@@ -1229,16 +1259,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						ByteBuffer bb = mAudEnc.getInputBuffer(idx);
 						bb.clear();
 						for (int i = 0; i < pr; i++) {
-							bb.put((byte) (chunk[i] & 0xFF));
-							bb.put((byte) (chunk[i] >> 8 & 0xFF));
+							bb.put((byte)(chunk[i] & 0xFF));
+							bb.put((byte)(chunk[i] >> 8 & 0xFF));
 						}
 						mAudEnc.queueInputBuffer(idx, 0, pr * 2, pts, 0);
 					}
 					drainAudioCodec(false);
 				}
-				// Сбрасываем счётчик — живое аудио снова с 0,
-				// сдвиг mPreBufOffsetUs добавляется в формуле PTS ниже
-				totalFrames = 0L;
 			}
 		}
 		// ─────────────────────────────────────────────────────────────────────
@@ -1283,15 +1310,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				short[] copy = Arrays.copyOf(buf, r);
 				synchronized (mPreBufLock) {
 					mPreBufDeque.addLast(copy);
-					// Обрезаем до PRE_BUFFER_SECS × каналы × частота дискретизации
-					int maxSamples = AUDIO_SR * ch * PRE_BUFFER_SECS;
-					int total = 0;
-					for (short[] c : mPreBufDeque) total += c.length;
-					while (total > maxSamples && !mPreBufDeque.isEmpty())
-						total -= mPreBufDeque.removeFirst().length;
+					trimPreBuf(ch);
 				}
 			}
-			// ───────────────────────────────────────────────────────────────────
+			// ────────────────────────────────────────────────────────────────────
 
 			if (!mEncoding) continue;
 
@@ -1306,19 +1328,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				continue;
 			}
 
-			// ─── PTS относительно первого видеокадра (видео — мастер-клок) ─────
+			// ─── PTS: монотонный счётчик фреймов — точная, бесшовная склейка ───
+			// totalFrames непрерывен: пре-буфер (0..N) + живое аудио (N..∞).
+			// Видео сдвинуто на mPreBufOffsetUs в videoLoop → A/V синхронизированы.
 			int numFrames = r / ch;
-			long audioTimeUs = totalFrames * 1_000_000L / AUDIO_SR;
-
-			long pts;
-			if (mVideoStartNano == 0) {
-				pts = mPreBufOffsetUs;      // видео ещё не выдало первый кадр
-			} else {
-				long videoAgeUs = (System.nanoTime() - mVideoStartNano) / 1000L;
-				pts = Math.max(mPreBufOffsetUs, audioTimeUs - videoAgeUs + mPreBufOffsetUs);
-			}
+			long pts = totalFrames * 1_000_000L / AUDIO_SR;
 			totalFrames += numFrames;
-			// ───────────────────────────────────────────────────────────────
+			// ─────────────────────────────────────────────────────────────────
 
 			int idx = mAudEnc.dequeueInputBuffer(10_000);
 			if (idx >= 0) {
@@ -1405,7 +1421,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						baseTs = info.presentationTimeUs;
 					ByteBuffer data = mVidEnc.getOutputBuffer(out);
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-					n.set(info.offset, info.size, info.presentationTimeUs - baseTs + mPreBufOffsetUs, info.flags);
+					// Сдвиг на mPreBufOffsetUs: видео стартует после пре-буфера аудио
+					n.set(info.offset, info.size,
+							info.presentationTimeUs - baseTs + mPreBufOffsetUs, info.flags);
 					synchronized (mMuxLock) {
 						if (mMuxReady)
 							mMuxer.writeSampleData(mVidTrack, data, n);
