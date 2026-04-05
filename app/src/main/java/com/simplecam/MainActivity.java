@@ -46,11 +46,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// ─── Константы ────────────────────────────────────────────────────────────
 	private static final int VIDEO_W = 1280;
 	private static final int VIDEO_H = 720;
-	private static final int VIDEO_BPS = 6_000_000;
+	private static final int VIDEO_BPS = 6_000_000;   // дефолт (переопределяется mVideoBps)
 	private static final int VIDEO_FPS = 30;
 	private static final int AUDIO_SR = 48000;
 	private static final int REQ_PERMS = 1;
 	private static final float MAX_ZOOM_SPEED = 0.08f;
+	private static final int PRE_BUFFER_SECS = 1;     // длина аудио-пре-буфера
 	
 	// ─── UI ───────────────────────────────────────────────────────────────────
 	private SurfaceView mSv;
@@ -90,6 +91,22 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile float mZoomLevel = 1f;
 	private volatile float mZoomLeverPos = 0f;
 		private volatile long mVideoStartNano = 0L;   // момент первого реального видеокадра
+
+	// Экспозиция
+	private volatile int mEvComp = 0;          // текущая EV-компенсация (шаги)
+	private int mEvMin = -6, mEvMax = 6;       // диапазон (обновляется из характеристик камеры)
+	private SeekBar mSeekEv;
+	private TextView mTvEv;
+
+	// Видео — битрейт (выбирается в настройках)
+	private volatile int mVideoBps = VIDEO_BPS;
+
+	// Пре-буфер аудио
+	private volatile boolean mPreBufferEnabled = false;
+	private final Object mPreBufLock = new Object();
+	private final java.util.ArrayDeque<short[]> mPreBufDeque = new java.util.ArrayDeque<>();
+	private volatile List<short[]> mPendingPreBuf = null;  // передаётся в audio-поток при старте
+	private volatile long mPreBufDurationNanos = 0L;        // длительность пере-буфера в нано
 	
 	// Фокус
 	private volatile boolean mManualFocus = false;
@@ -229,6 +246,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		oscLP.rightMargin = dp(60);
 		oscLP.topMargin = dp(6);
 		root.addView(mOscilloscope, oscLP);
+		mOscilloscope.setVisibility(View.GONE); // по умолчанию скрыт (показывается envelope)
 
 		// ── Огибающая (бегущий 10-секундный осциллограф) — тот же оверлей ──────
 		mEnvelope = new EnvelopeView(this);
@@ -238,7 +256,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		envLP.leftMargin = dp(50);
 		envLP.rightMargin = dp(60);
 		envLP.topMargin = dp(6);
-		mEnvelope.setVisibility(View.GONE);
+		// envelope видим по умолчанию (oscilloscope скрыт)
 		root.addView(mEnvelope, envLP);
 		
 		mBtnBgIdle = makeOval(0xFFDDCC00);
@@ -435,7 +453,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbOsc.setText("Oscilloscope");
 		mCbOsc.setTextColor(0xCCCCCCCC);
 		mCbOsc.setTextSize(12);
-		mCbOsc.setChecked(true);
+		mCbOsc.setChecked(false); // по умолчанию — envelope, не осциллограф
 		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
 			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
 			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
@@ -464,7 +482,61 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbFocusAssist.setTextSize(12);
 		mCbFocusAssist.setVisibility(View.GONE); // скрыт до включения Manual focus
 		mAudioSrcPanel.addView(mCbFocusAssist);
-		
+
+		// ── EV-компенсация ────────────────────────────────────────────────────
+		mTvEv = smallLabel("EV  0");
+		mSeekEv = new SeekBar(this);
+		mSeekEv.setMax(mEvMax - mEvMin);     // обновится когда откроется камера
+		mSeekEv.setProgress(-mEvMin);        // центр = EV 0
+		mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+			public void onProgressChanged(SeekBar s, int p, boolean u) {
+				mEvComp = mEvMin + p;
+				updateEvLabel(mEvComp);
+				if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
+			}
+			public void onStartTrackingTouch(SeekBar s) {}
+			public void onStopTrackingTouch(SeekBar s) {}
+		});
+		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
+		LinearLayout evRow = new LinearLayout(this);
+		evRow.setOrientation(LinearLayout.HORIZONTAL);
+		evRow.setGravity(Gravity.CENTER_VERTICAL);
+		evRow.addView(mTvEv);
+		evRow.addView(mSeekEv);
+		mAudioSrcPanel.addView(evRow);
+
+		// ── Пре-буфер аудио (1 с до нажатия REC) ─────────────────────────────
+		CheckBox mCbPreBuffer = new CheckBox(this);
+		mCbPreBuffer.setText("Pre-buffer 1s (audio before REC)");
+		mCbPreBuffer.setTextColor(0xCCCCCCCC);
+		mCbPreBuffer.setTextSize(12);
+		mCbPreBuffer.setChecked(false);
+		mCbPreBuffer.setOnCheckedChangeListener((cb, checked) -> mPreBufferEnabled = checked);
+		mAudioSrcPanel.addView(mCbPreBuffer);
+
+		// ── Битрейт видео ────────────────────────────────────────────────────
+		String[] bpsLabels = {"3 Mbps", "4 Mbps", "6 Mbps (default)", "8 Mbps", "12 Mbps"};
+		int[]    bpsValues = {3_000_000, 4_000_000, 6_000_000, 8_000_000, 12_000_000};
+		Spinner spBps = new Spinner(this);
+		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this,
+			android.R.layout.simple_spinner_item, bpsLabels);
+		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+		spBps.setAdapter(bpsAd);
+		spBps.setSelection(2); // 6 Mbps по умолчанию
+		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
+		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+				mVideoBps = bpsValues[pos];
+			}
+			public void onNothingSelected(AdapterView<?> p) {}
+		});
+		LinearLayout bpsRow = new LinearLayout(this);
+		bpsRow.setOrientation(LinearLayout.HORIZONTAL);
+		bpsRow.setGravity(Gravity.CENTER_VERTICAL);
+		bpsRow.addView(smallLabel("Video bps: "));
+		bpsRow.addView(spBps);
+		mAudioSrcPanel.addView(bpsRow);
+
 		panel.addView(mAudioSrcPanel);
 
 		// ── Строка: спектр-анализатор (слева, weight=1) + кнопка REC (справа) ──
@@ -566,6 +638,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		return;
 		String txt = value < 0.005f ? "∞" : String.format("%.1f", value * mMinFocusDist) + "m⁻¹";
 		mTvFocus.setText(txt);
+	}
+
+	private void updateEvLabel(int ev) {
+		if (mTvEv == null) return;
+		runOnUiThread(() -> mTvEv.setText(ev == 0 ? "EV  0" : String.format("EV %+d", ev)));
 	}
 	
 	// ── Helpers ───────────────────────────────────────────────────────────────
@@ -716,6 +793,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					Float minFocus = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
 					if (minFocus != null)
 					mMinFocusDist = minFocus;
+					// Диапазон EV-компенсации
+					android.util.Range<Integer> evRange = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
+					if (evRange != null) {
+						mEvMin = evRange.getLower();
+						mEvMax = evRange.getUpper();
+					}
 					break;
 				}
 			}
@@ -729,6 +812,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					startPreview();
 					buildAudioSources();
 					mCamHandler.post(mZoomRunnable);
+					// Применяем реальный диапазон EV к ползунку
+					runOnUiThread(() -> {
+						if (mSeekEv != null) {
+							mSeekEv.setMax(mEvMax - mEvMin);
+							mSeekEv.setProgress(-mEvMin); // прогресс = 0 → EV=mEvMin; центр → EV=0
+							updateEvLabel(0);
+						}
+					});
 				}
 				
 				@Override
@@ -812,6 +903,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 			
 			rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
+			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
 				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
@@ -874,7 +966,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
 			
 			MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
-			vf.setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BPS);
+			vf.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBps);
 			vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
 			vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
 			vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface);
@@ -935,6 +1027,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			
 			mAudDoneLatch = new CountDownLatch(1);
 			mRecording = true;
+
+			// ─── Захватываем пре-буфер аудио (если включён) ──────────────────
+			mPendingPreBuf = null;
+			mPreBufDurationNanos = 0L;
+			if (mPreBufferEnabled) {
+				List<short[]> snapshot;
+				synchronized (mPreBufLock) {
+					snapshot = new ArrayList<>(mPreBufDeque);
+				}
+				if (!snapshot.isEmpty()) {
+					int frames = 0;
+					for (short[] c : snapshot) frames += c.length;
+					// frames — число выборок (не per-channel); делим на каналы
+					// (каналы для пре-буфера = mAudChannels текущего monitor-потока)
+					mPreBufDurationNanos = (long) frames * 1_000_000_000L / (AUDIO_SR * mAudChannels);
+					mPendingPreBuf = snapshot;
+				}
+			}
+			// ─────────────────────────────────────────────────────────────────
 			
 			
 			mSessionLatch = new CountDownLatch(1);
@@ -1083,6 +1194,52 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		rec.startRecording();
 
+		// ─── Дренаж пре-буфера аудио (если пришёл) ──────────────────────────────
+		if (mEncoding) {
+			List<short[]> preChunks = mPendingPreBuf;
+			mPendingPreBuf = null;
+			if (preChunks != null && !preChunks.isEmpty()) {
+				// Смещаем «старт видео» назад на длительность пре-буфера,
+				// чтобы PTS живого аудио после пре-буфера совпал с PTS видео.
+				// Видео-петля проверяет mVideoStartNano == 0 → не перезапишет.
+				mVideoStartNano = System.nanoTime() - mPreBufDurationNanos;
+
+				for (short[] chunk : preChunks) {
+					int pr = chunk.length;
+					// Применяем gain / soft-clip
+					final float g2 = mGain;
+					final boolean sc2 = mSoftClip;
+					for (int i = 0; i < pr; i++) {
+						float s = chunk[i] * g2;
+						if (sc2) {
+							final float T = 32768f * 0.7f;
+							final float knee = 32768f - T;
+							float abs = Math.abs(s);
+							if (abs > T)
+								s = Math.signum(s) * (T + knee * (float) Math.tanh((abs - T) / knee));
+						}
+						if (s > 32767f) s = 32767f;
+						else if (s < -32768f) s = -32768f;
+						chunk[i] = (short) s;
+					}
+					long pts = totalFrames * 1_000_000L / AUDIO_SR;
+					totalFrames += pr / ch;
+					int idx = mAudEnc.dequeueInputBuffer(20_000);
+					if (idx >= 0) {
+						ByteBuffer bb = mAudEnc.getInputBuffer(idx);
+						bb.clear();
+						for (int i = 0; i < pr; i++) {
+							bb.put((byte) (chunk[i] & 0xFF));
+							bb.put((byte) (chunk[i] >> 8 & 0xFF));
+						}
+						mAudEnc.queueInputBuffer(idx, 0, pr * 2, pts, 0);
+					}
+					drainAudioCodec(false);
+				}
+			}
+		}
+		// ─────────────────────────────────────────────────────────────────────────
+
 		while (mAudRunning) {
 			int r = rec.read(buf, 0, chunkSamples);
 			if (r <= 0) continue;
@@ -1117,6 +1274,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
 			if (mEnvelope != null) mEnvelope.pushSamples(buf, r, ch);
 			if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
+
+			// ─── Пополняем пре-буфер во время мониторинга ──────────────────────
+			if (!mEncoding && mPreBufferEnabled) {
+				short[] copy = Arrays.copyOf(buf, r);
+				synchronized (mPreBufLock) {
+					mPreBufDeque.addLast(copy);
+					int maxSamples = AUDIO_SR * ch * PRE_BUFFER_SECS;
+					int total = 0;
+					for (short[] c : mPreBufDeque) total += c.length;
+					while (total > maxSamples && !mPreBufDeque.isEmpty())
+						total -= mPreBufDeque.removeFirst().length;
+				}
+			}
+			// ───────────────────────────────────────────────────────────────────
 
 			if (!mEncoding) continue;
 
