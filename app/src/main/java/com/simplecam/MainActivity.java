@@ -58,7 +58,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private VerticalSeekBar mSeekGain;
 	private FocusDrumView mFocusDrum; // барабан ручного фокуса
 	private TextView mTvGain, mTvStatus, mTvFocus;
-	private Button mBtn, mSrcToggleBtn;
+	private Button mBtn, mSrcToggleBtn, mBtnPause;
+	private volatile boolean mPaused = false;
+	private long mPauseStartNano = 0L, mPauseEndNano = 0L;
+	private GradientDrawable mBtnBgPause;
 	private VuMeterView mVu;
 	private OscilloscopeView mOscilloscope;
 	private EnvelopeView mEnvelope;
@@ -157,7 +160,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// ─── Настройки ───────────────────────────────────────────────────────────
 	private volatile int  mVideoBps = VIDEO_BPS_DEFAULT;
 	private volatile int  mPreBufSecs = 1;          // 1..5 секунд
-	private volatile boolean mPreBufferEnabled = false;
+	private volatile boolean mPreBufferEnabled = true;
 	private volatile int  mEvComp = 0;
 	private int mEvMin = -6, mEvMax = 6;
 	private SeekBar mSeekEv;
@@ -281,8 +284,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		envLP.topMargin = dp(6);
 		root.addView(mEnvelope, envLP);
 		
-		mBtnBgIdle = makeOval(0xFFDDCC00);
-		mBtnBgRec = makeOval(0xFFCC1100);
+		mBtnBgIdle  = makeOval(0xFFDDCC00);
+		mBtnBgRec   = makeOval(0xFFCC1100);
+		mBtnBgPause = makeOval(0xFF1155CC);
 		
 		// Внешний вертикальный контейнер: рабочая зона + нижняя панель
 		LinearLayout outer = new LinearLayout(this);
@@ -445,13 +449,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mManualFocus = checked;
 			mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
 			// Сдвигаем кнопку REC влево на полширины когда барабан виден
-			if (mBtn != null) {
-				LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) mBtn.getLayoutParams();
-				// drum=44dp + lever=54dp + 4dp gap → 102dp; без барабана = 58dp
-				// сдвиг = половина ширины кнопки (52dp/2 = 26dp) → 84dp
-				lp.rightMargin = checked ? dp(84) : dp(58);
-				mBtn.requestLayout();
-			}
+			// mBtn теперь в root FrameLayout с фиксированным rightMargin — не трогаем
 			// Чекбокс Focus Assist — только при ручной фокусировке
 			if (mCbFocusAssist != null)
 			mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
@@ -527,6 +525,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		CheckBox cbPB = new CheckBox(this);
 		cbPB.setText("Pre-buffer");
 		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12);
+		cbPB.setChecked(true); // включён по умолчанию
 		cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
 		final TextView tvPBLen = smallLabel("1 s");
 		SeekBar sbPB = new SeekBar(this);
@@ -545,12 +544,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mAudioSrcPanel.addView(pbRow);
 
 		// ── Битрейт видео ────────────────────────────────────────────────────
-		String[] bpsL={"3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
-		int[] bpsV={3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
+		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
+		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
 		Spinner spBps = new Spinner(this);
 		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
 		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-		spBps.setAdapter(bpsAd); spBps.setSelection(2);
+		spBps.setAdapter(bpsAd); spBps.setSelection(5); // 6 Mbps
 		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(190), ViewGroup.LayoutParams.WRAP_CONTENT));
 		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsV[pos]; }
@@ -565,30 +564,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		// ── Строка: спектр-анализатор (слева, weight=1) + кнопка REC (справа) ──
 		// REC справа, с отступом rightMargin=58dp чтобы не перекрыть рычаг зума (54dp)
+		// Спектр — только анализатор, занимает всю ширину нижней панели
+		mSpectrum = new SpectrumView(this);
+		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
+		specLP.rightMargin = dp(120); // не заходить под кнопки REC+PAUSE
+		panel.addView(mSpectrum, specLP);
+
+		// ── REC и PAUSE фиксированы в root (FrameLayout), не сдвигаются ──────
+		// REC — большая круглая кнопка, прикреплена к правому нижнему углу
+		int recSize = dp(68);
+		int recRight = dp(62); // 54dp зум-рычаг + 8dp зазор
+		int recBottom = dp(8);
+
 		mBtn = new Button(this);
 		mBtn.setText("REC");
 		mBtn.setTextColor(Color.WHITE);
-		mBtn.setTextSize(11);
+		mBtn.setTextSize(13);
 		mBtn.setBackground(mBtnBgIdle);
 		mBtn.setOnClickListener(v -> onRecordClick());
+		FrameLayout.LayoutParams recLP = new FrameLayout.LayoutParams(recSize, recSize);
+		recLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
+		recLP.rightMargin = recRight;
+		recLP.bottomMargin = recBottom;
+		root.addView(mBtn, recLP);
 
-		mSpectrum = new SpectrumView(this);
-
-		LinearLayout specRecRow = new LinearLayout(this);
-		specRecRow.setOrientation(LinearLayout.HORIZONTAL);
-		specRecRow.setGravity(Gravity.CENTER_VERTICAL);
-
-		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(0, dp(72), 1f);
-		specRecRow.addView(mSpectrum, specLP);
-
-		LinearLayout.LayoutParams btnLP = new LinearLayout.LayoutParams(dp(52), dp(52));
-		btnLP.rightMargin = dp(58); // clearance for zoom lever (54dp) + 4dp gap
-		btnLP.leftMargin = dp(4);
-		mBtn.setLayoutParams(btnLP);
-		specRecRow.addView(mBtn);
-
-		panel.addView(specRecRow, new LinearLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+		// PAUSE — маленькая кнопка над REC, видна только во время записи
+		mBtnPause = new Button(this);
+		mBtnPause.setText("⏸");
+		mBtnPause.setTextColor(Color.WHITE);
+		mBtnPause.setTextSize(16);
+		mBtnPause.setBackground(mBtnBgPause);
+		mBtnPause.setVisibility(View.GONE);
+		mBtnPause.setOnClickListener(v -> onPauseClick());
+		FrameLayout.LayoutParams pauseLP = new FrameLayout.LayoutParams(dp(44), dp(44));
+		pauseLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
+		pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2; // центр над REC
+		pauseLP.bottomMargin = recBottom + recSize + dp(6);
+		root.addView(mBtnPause, pauseLP);
 
 		return root;
 	}
@@ -928,6 +941,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// REC / STOP
 	// =========================================================================
 	
+	private void onPauseClick() {
+		mPaused = !mPaused;
+		if (mPaused) {
+			// Пауза: переводим в RING, кольца очищаем
+			mPauseStartNano = System.nanoTime();
+			mVidWriteMode = 0;
+			mAudWriteMode = 0;
+			synchronized(mVidRingLock) { mVidRing.clear(); }
+			synchronized(mAudRingLock) { mAudRing.clear(); }
+			mBtnPause.setText("▶");
+			mBtnPause.setBackground(makeOval(0xFF228833));
+			status("⏸ Paused");
+		} else {
+			// Снятие с паузы: LIVE сразу, без пре-буфера
+			// mMuxBasePts сдвигаем: следующий фрейм будет записан с текущим PTS минус BasePts
+			// Корректируем BasePts так, чтобы не было прыжка PTS в файле.
+			// Самый простой способ: выставить mVidWriteMode=2 и mAudWriteMode=2 напрямую.
+			// PTS коррекция: запоминаем момент паузы и момент возобновления,
+			// сдвигаем BasePts на длину паузы.
+			mPauseEndNano = System.nanoTime();
+			long pauseDurUs = (mPauseEndNano - mPauseStartNano) / 1000L;
+			mMuxBasePts += pauseDurUs; // вычитаем паузу из всех будущих PTS
+			mVidWriteMode = 2; // LIVE
+			mAudWriteMode = 2;
+			mBtnPause.setText("⏸");
+			mBtnPause.setBackground(mBtnBgPause);
+			status("● REC (resumed)");
+		}
+	}
+
 	private void onRecordClick() {
 		if (mRecording) {
 			mRecording = false;
@@ -1317,6 +1360,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			final String fp = displayPath;
 			runOnUiThread(() -> {
 				mBtn.setText("⏹ STOP"); mBtn.setBackground(mBtnBgRec); mBtn.setEnabled(true);
+				mBtnPause.setVisibility(View.VISIBLE);
+				mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause);
+				mPaused = false;
 				status("● REC  →  " + fp);
 			});
 		} catch (Exception e) {
@@ -1324,6 +1370,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			finalizeMuxer();
 			runOnUiThread(() -> {
 				mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true);
+				mBtnPause.setVisibility(View.GONE);
 				status("Error: " + e.getMessage());
 			});
 		}
@@ -1351,6 +1398,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 		runOnUiThread(() -> {
 			mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true);
+			mBtnPause.setVisibility(View.GONE);
+			mPaused = false;
 			status("Saved");
 		});
 	}
