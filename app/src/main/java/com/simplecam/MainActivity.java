@@ -911,45 +911,33 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				if (mDigitalStab && mZoomLevel > 1.05f) {
-					float stabZoom = mZoomLevel * (1f + STAB_MARGIN);
-					int cropW = Math.max(1, (int)(mSensorRect.width()  / stabZoom));
-					int cropH = Math.max(1, (int)(mSensorRect.height() / stabZoom));
-
+				int cropW, cropH, cropX, cropY;
+				if (mDigitalStab) {
+					// Всегда снимаем с запасом для стабилизации — независимо от уровня зума
+					float stabZoom = mZoomLevel / (1f - STAB_MARGIN);
+					cropW = Math.max(1, (int)(mSensorRect.width()  / stabZoom));
+					cropH = Math.max(1, (int)(mSensorRect.height() / stabZoom));
+					// Масштаб: пикселей сенсора на пиксель уменьшенного STAB-кадра
 					float scaleX = (float) mSensorRect.width()  / (stabZoom * STAB_W);
 					float scaleY = (float) mSensorRect.height() / (stabZoom * STAB_H);
-
-					float accumX = mStabAccumX;
-					float accumY = mStabAccumY;
-
-					int shiftX = (int)(-accumX * scaleX);
-					int shiftY = (int)(-accumY * scaleY);
-
+					int shiftX = (int)(-mStabAccumX * mStabAggressiveness * scaleX);
+					int shiftY = (int)(-mStabAccumY * mStabAggressiveness * scaleY);
 					int centerX = mSensorRect.left + mSensorRect.width()  / 2;
 					int centerY = mSensorRect.top  + mSensorRect.height() / 2;
-					int cropX   = centerX - cropW / 2 + shiftX;
-					int cropY   = centerY - cropH / 2 + shiftY;
-					cropX = Math.max(mSensorRect.left,   Math.min(mSensorRect.right  - cropW, cropX));
-					cropY = Math.max(mSensorRect.top,    Math.min(mSensorRect.bottom - cropH, cropY));
-					rb.set(CaptureRequest.SCALER_CROP_REGION,
-						new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+					cropX = centerX - cropW / 2 + shiftX;
+					cropY = centerY - cropH / 2 + shiftY;
 				} else {
-					int cropW = Math.max(1, (int)(mSensorRect.width()  / mZoomLevel));
-					int cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
-					int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
-					int cropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2;
-					rb.set(CaptureRequest.SCALER_CROP_REGION,
-						new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+					cropW = Math.max(1, (int)(mSensorRect.width()  / mZoomLevel));
+					cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
+					cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
+					cropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2;
 				}
+				cropX = Math.max(mSensorRect.left,   Math.min(mSensorRect.right  - cropW, cropX));
+				cropY = Math.max(mSensorRect.top,    Math.min(mSensorRect.bottom - cropH, cropY));
+				rb.set(CaptureRequest.SCALER_CROP_REGION,
+					new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
-			
-			// ← ИСПРАВЛЕНИЕ: помечаем следующий кадр как переходный
-			if (mDigitalStab) {
-				synchronized (mStabLock) {
-					mStabSkipNext = true;
-				}
-			}
 			} catch (Exception ignored) {
 		}
 	}
@@ -1076,12 +1064,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mVidLoopRunning = false;
 	}
 
-	private float computeStabilFactor() {
-		if (!mDigitalStab) return 0f;
-		float maxZ = Math.max(2f, mMaxZoom);
-		float zoomFactor = Math.min(1f, Math.max(0f, (mZoomLevel - 1f) / (maxZ - 1f)));
-		return mStabAggressiveness * zoomFactor;
-	}
+	// computeStabilFactor() удалён: стабилизация теперь работает при любом zoom.
+	// Агрессивность задаётся слайдером mStabAggressiveness (0..1) напрямую.
 
 	private void ensureStabReader() {
 		if (mStabReader != null) return;
@@ -1092,6 +1076,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				android.media.Image img = reader.acquireLatestImage();
 				if (img != null) {
 					try { processStabFrame(img); } finally { img.close(); }
+					// Применяем накопленное смещение сразу после вычисления
+					if (mDigitalStab) buildAndSendRequest();
 				}
 			}, mCamHandler);
 		} catch (Exception e) {
@@ -1111,69 +1097,80 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	private void processStabFrame(android.media.Image img) {
 		if (!mDigitalStab) return;
-		float sf = computeStabilFactor();
-		if (sf < 0.02f) {
-			mStabAccumX = 0f; mStabAccumY = 0f;
-			synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
-			return;
-		}
 
+		// ── Извлекаем Y-плоскость в компактный массив ──────────────────────────
 		android.media.Image.Plane yPlane = img.getPlanes()[0];
-		java.nio.ByteBuffer yBuf = yPlane.getBuffer();
+		java.nio.ByteBuffer yBuf  = yPlane.getBuffer();
 		int rowStride = yPlane.getRowStride();
 		int pixStride = yPlane.getPixelStride();
 
-		byte[] currLuma = new byte[STAB_W * STAB_H];
+		byte[] curr = new byte[STAB_W * STAB_H];
 		for (int row = 0; row < STAB_H; row++) {
-			yBuf.position(row * rowStride);
 			if (pixStride == 1) {
-				yBuf.get(currLuma, row * STAB_W, STAB_W);
+				yBuf.position(row * rowStride);
+				yBuf.get(curr, row * STAB_W, STAB_W);
 			} else {
 				for (int col = 0; col < STAB_W; col++)
-					currLuma[row * STAB_W + col] = yBuf.get(row * rowStride + col * pixStride);
+					curr[row * STAB_W + col] = yBuf.get(row * rowStride + col * pixStride);
 			}
 		}
 
 		synchronized (mStabLock) {
-			if (mStabSkipNext) {
-				mStabPrevLuma = currLuma;
+			// Первый кадр после сброса — просто запоминаем, смещение не считаем
+			if (mStabSkipNext || mStabPrevLuma == null) {
+				mStabPrevLuma = curr;
 				mStabSkipNext = false;
 				return;
 			}
 
-			if (mStabPrevLuma != null) {
-				int searchR = Math.max(1, (int)(sf * STAB_MAX_RADIUS));
-
-				int bestDx = 0, bestDy = 0;
-				long bestSad = Long.MAX_VALUE;
-				for (int dy = -searchR; dy <= searchR; dy++) {
-					for (int dx = -searchR; dx <= searchR; dx++) {
-						long sad = computeSAD(mStabPrevLuma, currLuma, dx, dy, searchR);
-						if (sad < bestSad) { bestSad = sad; bestDx = dx; bestDy = dy; }
-					}
+			// ── Поиск сдвига перебором SAD (Sum of Absolute Differences) ────────
+			// Ищем (bestDx, bestDy) такой, что curr[y+dy][x+dx] ≈ prev[y][x]
+			// т.е. bestDx > 0 означает: камера сдвинулась вправо
+			final int R = STAB_MAX_RADIUS;
+			int bestDx = 0, bestDy = 0;
+			long bestSad = Long.MAX_VALUE;
+			for (int dy = -R; dy <= R; dy++) {
+				for (int dx = -R; dx <= R; dx++) {
+					long sad = computeSAD(mStabPrevLuma, curr, dx, dy, R);
+					if (sad < bestSad) { bestSad = sad; bestDx = dx; bestDy = dy; }
 				}
-
-				mStabAccumX = (mStabAccumX - bestDx * sf) * STAB_DECAY;
-				mStabAccumY = (mStabAccumY - bestDy * sf) * STAB_DECAY;
-
-				float maxAccum = STAB_MARGIN * STAB_W * 0.45f;
-				mStabAccumX = Math.max(-maxAccum, Math.min(maxAccum, mStabAccumX));
-				mStabAccumY = Math.max(-maxAccum, Math.min(maxAccum, mStabAccumY));
 			}
-			mStabPrevLuma = currLuma;
+
+			// ── Накапливаем движение + затухание (не даёт уплыть при панораме) ──
+			// После затухания accum стремится к 0 — crop возвращается в центр.
+			// STAB_DECAY близко к 1 → медленный дрейф; меньше → быстрее возврат.
+			mStabAccumX = (mStabAccumX + bestDx) * STAB_DECAY;
+			mStabAccumY = (mStabAccumY + bestDy) * STAB_DECAY;
+
+			// Не выходим за полезный запас кадра
+			float maxA = STAB_MARGIN * STAB_W * 0.48f;
+			mStabAccumX = Math.max(-maxA, Math.min(maxA, mStabAccumX));
+			mStabAccumY = Math.max(-maxA, Math.min(maxA, mStabAccumY));
+
+			mStabPrevLuma = curr;
 		}
 	}
 
+	/**
+	 * SAD между центральной областью prev и curr сдвинутой на (dx, dy).
+	 * border — граница, которую не трогаем (равна R, чтобы prev не выходил за края).
+	 */
 	private long computeSAD(byte[] prev, byte[] curr, int dx, int dy, int border) {
 		long sad = 0;
-		final int step = 3;
+		final int step = 2; // шаг субдискретизации — ускоряет в 4×, точность достаточна
 		for (int y = border; y < STAB_H - border; y += step) {
-			int py = y + dy;
-			if (py < 0 || py >= STAB_H) { sad += 255L * ((STAB_W - 2 * border) / step + 1); continue; }
+			int cy = y + dy;
+			if (cy < 0 || cy >= STAB_H) {
+				// Строка вышла за край — штрафуем максимумом
+				sad += 255L * ((STAB_W - 2 * border + step - 1) / step);
+				continue;
+			}
+			int prevRowOff = y  * STAB_W;
+			int currRowOff = cy * STAB_W;
 			for (int x = border; x < STAB_W - border; x += step) {
-				int px = x + dx;
-				if (px < 0 || px >= STAB_W) { sad += 255L; continue; }
-				sad += Math.abs((prev[y * STAB_W + x] & 0xFF) - (curr[py * STAB_W + px] & 0xFF));
+				int cx = x + dx;
+				if (cx < 0 || cx >= STAB_W) { sad += 255L; continue; }
+				sad += Math.abs((prev[prevRowOff + x] & 0xFF) - (curr[currRowOff + cx] & 0xFF));
 			}
 		}
 		return sad;
