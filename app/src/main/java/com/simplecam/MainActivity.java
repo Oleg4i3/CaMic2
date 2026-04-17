@@ -177,17 +177,24 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private ImageReader      mStabReader;           // 160×90 YUV_420_888
 	private static final int   STAB_W          = 160;
 	private static final int   STAB_H          = 90;
-	private static final float STAB_MAX_MARGIN = 0.12f; // 12 % запас crop-а
+	private static final float STAB_MARGIN = 0.12f; // 12 % запас crop-а
 	private static final int   STAB_MAX_RADIUS = 12;    // макс. радиус поиска (stab-пикс.)
-	private static final float STAB_DECAY        = 0.85f; // затухание leaky integrator
-	private static final int   STAB_UPDATE_EVERY = 3;    // обновляем кроп раз в N кадров
-	// Агрессивность: 0..1, регулируется слайдером; текущая = slider * zoomFactor
+	// STAB_MARGIN — фиксированный запас кропа (% при max агрессивности).
+	// Не зависит от zoom! Иначе каждый тик zoom-рычага меняет cropW → "дёргается зум".
+	private static final float STAB_MARGIN = 0.12f;
+	// Decay: насколько быстро накопитель "забывает" постоянный сдвиг (панорамирование).
+	private static final float STAB_DECAY  = 0.82f;
+	// Агрессивность 0..1 (слайдер). Влияет только на радиус поиска и силу коррекции,
+	// НЕ на размер кропа.
 	private volatile float mStabAggressiveness = 0.7f;
-	private volatile float mStabAccumX = 0f;  // накопленное смещение (stab-пиксели)
+	// Накопленная коррекция в пикселях stab-кадра (160×90).
+	// Только processStabFrame пишет; buildAndSendRequest только читает.
+	private volatile float mStabAccumX = 0f;
 	private volatile float mStabAccumY = 0f;
-	private int            mStabFramesSinceUpdate = 0; // счётчик кадров с последнего обновления
-	private byte[]         mStabPrevLuma = null;
-	private final Object   mStabLock    = new Object();
+	// Флаг: первый кадр после изменения кропа — пропустить, т.к. prev снят иначе.
+	private volatile boolean mStabSkipNext = false;
+	private byte[]           mStabPrevLuma = null;
+	private final Object     mStabLock     = new Object();
 	
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
 	private final Runnable mZoomRunnable = new Runnable() {
@@ -528,10 +535,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbDigitalStab.setOnCheckedChangeListener((cb, checked) -> {
 			mDigitalStab = checked;
 			// Сбрасываем накопленное смещение
-			synchronized (mStabLock) {
-				mStabAccumX = 0f; mStabAccumY = 0f;
-				mStabPrevLuma = null;
-			}
+			mStabAccumX = 0f; mStabAccumY = 0f;
+			synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 			if (!checked) {
 				// Освобождаем ридер и пересоздаём сессию без него
 				releaseStabReader();
@@ -619,7 +624,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mStabAggressiveness = p / 100f;
 				tvStab.setText("Stab " + p + "%");
 				// Сброс накопителя при изменении уровня
-				synchronized (mStabLock) { mStabAccumX = 0f; mStabAccumY = 0f; mStabPrevLuma = null; }
+				mStabAccumX = 0f; mStabAccumY = 0f;
+				synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 			}
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
@@ -1012,43 +1018,44 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				float sf = computeStabilFactor();
-				if (sf > 0f) {
+				if (mDigitalStab && mZoomLevel > 1.05f) {
 					// ── Стабилизированный кроп ─────────────────────────────────
-					// Размер кропа УМЕНЬШАЕТСЯ на margin (чуть более крупный план),
-					// чтобы был запас пикселей для сдвига центра.
-					// Размер НЕ меняется в процессе стабилизации — меняется только
-					// позиция центра. Это ключевое требование: нет «дрожания зума».
-					float margin   = sf * STAB_MAX_MARGIN;
-					float stabZoom = mZoomLevel * (1f + margin);
-
-					// cropW/H — ФИКСИРОВАННЫЙ размер прямоугольника (при данном zoom)
+					//
+					// ПРИНЦИП: cropW/H зависят ТОЛЬКО от mZoomLevel и STAB_MARGIN —
+					// оба не меняются здесь. Поэтому размер кропа стабилен между
+					// вызовами. Меняется только ПОЗИЦИЯ центра (cropX/Y) — на величину
+					// накопленной коррекции из mStabAccumX/Y.
+					//
+					// STAB_MARGIN фиксирован → stabZoom фиксирован при данном zoom →
+					// cropW фиксирован → никакого "дрожания зума".
+					float stabZoom = mZoomLevel * (1f + STAB_MARGIN);
 					int cropW = Math.max(1, (int)(mSensorRect.width()  / stabZoom));
 					int cropH = Math.max(1, (int)(mSensorRect.height() / stabZoom));
 
-					// Масштаб: 1 stab-пиксель = cropW/STAB_W сенсорных пикселей.
-					// Важно: используем cropW (с margin), а не baseW — иначе
-					// масштаб завышен и коррекция выходит за доступный бюджет.
-					float scaleX = (float)cropW / STAB_W;
-					float scaleY = (float)cropH / STAB_H;
+					// Масштаб: сколько сенсорных пикселей в 1 stab-пикселе.
+					float scaleX = (float) mSensorRect.width()  / (stabZoom * STAB_W);
+					float scaleY = (float) mSensorRect.height() / (stabZoom * STAB_H);
 
-					float accumX, accumY;
-					synchronized (mStabLock) { accumX = mStabAccumX; accumY = mStabAccumY; }
+					// Читаем накопитель атомарно (volatile, нет synchronized для скорости).
+					float accumX = mStabAccumX;
+					float accumY = mStabAccumY;
 
-					// accumX > 0 → камера сместилась вправо → кроп надо сдвинуть влево
-					// (чтобы изображение вернулось на место).
-					// shiftX = −accumX*scale → отрицательный при правом сдвиге → кроп влево ✓
+					// Сдвигаем центр кропа на -accum*scale:
+					//   accumX > 0 → камера сдвинулась вправо (или сцена влево)
+					//   shiftX = -accumX * scaleX < 0 → кроп левее → изображение правее ✓
 					int shiftX = (int)(-accumX * scaleX);
 					int shiftY = (int)(-accumY * scaleY);
 
-					int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2 + shiftX;
-					int cropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2 + shiftY;
+					int centerX = mSensorRect.left + mSensorRect.width()  / 2;
+					int centerY = mSensorRect.top  + mSensorRect.height() / 2;
+					int cropX   = centerX - cropW / 2 + shiftX;
+					int cropY   = centerY - cropH / 2 + shiftY;
 					cropX = Math.max(mSensorRect.left,   Math.min(mSensorRect.right  - cropW, cropX));
 					cropY = Math.max(mSensorRect.top,    Math.min(mSensorRect.bottom - cropH, cropY));
 					rb.set(CaptureRequest.SCALER_CROP_REGION,
 						new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 				} else {
-					// ── Обычный кроп (без стабилизации) ────────────────────────
+					// ── Обычный кроп ───────────────────────────────────────────
 					int cropW = Math.max(1, (int)(mSensorRect.width()  / mZoomLevel));
 					int cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
 					int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
@@ -1227,14 +1234,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	 * Линейно растёт, потому что дрожание рук в пикселях пропорционально zoom.
 	 */
 	/**
-	 * Текущий коэффициент стабилизации: 0..1.
-	 * = aggressiveness_slider × zoomFactor, где zoomFactor = (zoom−1)/(maxZoom−1).
-	 * При zoom≤1 → 0. При zoom=maxZoom → aggressiveness.
+	 * Коэффициент коррекции для текущего zoom: 0..1.
+	 * При zoom=1 → 0 (нет смысла корректировать — нет тремора).
+	 * При zoom=maxZoom → mStabAggressiveness.
+	 * Используется ТОЛЬКО для радиуса SAD-поиска и силы coррекции accumX/Y.
+	 * НЕ используется для вычисления размера кропа (margin фиксирован).
 	 */
 	private float computeStabilFactor() {
-		if (!mDigitalStab || mZoomLevel <= 1.05f) return 0f;
+		if (!mDigitalStab) return 0f;
 		float maxZ = Math.max(2f, mMaxZoom);
-		float zoomFactor = Math.min(1f, (mZoomLevel - 1f) / (maxZ - 1f));
+		float zoomFactor = Math.min(1f, Math.max(0f, (mZoomLevel - 1f) / (maxZ - 1f)));
 		return mStabAggressiveness * zoomFactor;
 	}
 
@@ -1262,33 +1271,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			try { mStabReader.close(); } catch (Exception ignored) {}
 			mStabReader = null;
 		}
-		synchronized (mStabLock) { mStabPrevLuma = null; }
+		mStabAccumX = 0f; mStabAccumY = 0f;
+		synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 	}
 
 	/**
 	 * Обрабатывает один кадр стабилизатора (вызывается из mCamHandler).
 	 *
-	 * КЛЮЧЕВЫЕ ИСПРАВЛЕНИЯ (v2):
+	 * АРХИТЕКТУРА (v3 — без обратной связи):
 	 *
-	 * 1. ЗНАК: SAD возвращает bestDx — смещение сцены в stab-пикселях
-	 *    (cam_moved_right → сцена смещается влево → bestDx < 0).
-	 *    Для коррекции нужно накапливать −bestDx (не +bestDx).
-	 *    Иначе коррекция усиливает дрожание вместо его компенсации.
+	 * processStabFrame ТОЛЬКО обновляет mStabAccumX/Y.
+	 * Он НЕ вызывает buildAndSendRequest() — это устраняет обратную связь
+	 * полностью. Применение коррекции происходит в следующем вызове
+	 * buildAndSendRequest() из zoom-runnable (каждые ~33мс).
 	 *
-	 * 2. ОБРАТНАЯ СВЯЗЬ: вызов buildAndSendRequest() на каждом кадре
-	 *    меняет SCALER_CROP_REGION, и следующий кадр содержит наш
-	 *    же сдвиг как «новое движение» → положительная ОС → осцилляция.
-	 *    Решение: обновляем кроп раз в STAB_UPDATE_EVERY кадров,
-	 *    первый кадр после обновления пропускаем (переходный).
+	 * Пропуск переходного кадра: когда мы сменили кроп, следующий кадр
+	 * ImageReader мог быть снят ещё со старым кропом. Флаг mStabSkipNext
+	 * позволяет пропустить один такой кадр чтобы SAD не мерил наш сдвиг.
+	 *
+	 * Знак SAD: если камера сдвинулась вправо, curr содержит ту же сцену,
+	 * но сдвинутую влево относительно prev. SAD находит bestDx < 0.
+	 * Чтобы compенсировать: accum += -bestDx (т.е. accum > 0 при сдвиге вправо).
+	 * Тогда в buildAndSendRequest: shiftX = -accum*scale < 0 → кроп левее → OK.
 	 */
 	private void processStabFrame(android.media.Image img) {
 		if (!mDigitalStab) return;
 		float sf = computeStabilFactor();
-		if (sf < 0.03f) {
-			synchronized (mStabLock) {
-				mStabAccumX = 0f; mStabAccumY = 0f;
-				mStabPrevLuma = null; mStabFramesSinceUpdate = 0;
-			}
+		if (sf < 0.02f) {
+			// Zoom≈1: нет тремора — сбрасываем накопитель
+			mStabAccumX = 0f; mStabAccumY = 0f;
+			synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 			return;
 		}
 
@@ -1309,17 +1321,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 		}
 
-		int searchR = Math.max(1, (int)(sf * STAB_MAX_RADIUS));
-		boolean needCropUpdate = false;
-
 		synchronized (mStabLock) {
-			mStabFramesSinceUpdate++;
+			if (mStabSkipNext) {
+				// Переходный кадр: prev снят с другим кропом → не сравниваем,
+				// просто обновляем prev и снимаем флаг.
+				mStabPrevLuma = currLuma;
+				mStabSkipNext = false;
+				return;
+			}
 
-			// Пропускаем первый кадр после смены кропа — он переходный:
-			// prev снят со старым кропом, curr — с новым → SAD мерит наш же сдвиг.
-			if (mStabPrevLuma != null && mStabFramesSinceUpdate > 1) {
+			if (mStabPrevLuma != null) {
+				// Радиус SAD пропорционален aggressiveness и zoomFactor
+				int searchR = Math.max(1, (int)(sf * STAB_MAX_RADIUS));
 
-				// ── SAD-поиск ──────────────────────────────────────────────────
+				// ── SAD-поиск ─────────────────────────────────────────────────
 				int bestDx = 0, bestDy = 0;
 				long bestSad = Long.MAX_VALUE;
 				for (int dy = -searchR; dy <= searchR; dy++) {
@@ -1330,28 +1345,25 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 
 				// ── Leaky integrator ───────────────────────────────────────────
-				// Знак МИНУС: bestDx < 0 когда камера двинулась вправо.
-				// Нам нужен accumX > 0 для правого смещения, чтобы shiftX = −accumX*scale < 0
-				// (кроп влево → изображение вправо → компенсация дрожания).
-				mStabAccumX = (mStabAccumX - bestDx) * STAB_DECAY;
-				mStabAccumY = (mStabAccumY - bestDy) * STAB_DECAY;
+				// Decay позволяет медленно следовать за панорамированием.
+				// При неподвижной камере accum → 0 через ~N кадров.
+				// sf масштабирует силу коррекции (меньше zoom → меньше коррекция).
+				mStabAccumX = (mStabAccumX - bestDx * sf) * STAB_DECAY;
+				mStabAccumY = (mStabAccumY - bestDy * sf) * STAB_DECAY;
 
-				// Ограничиваем доступным бюджетом (зависит от margin)
-				float maxAccum = searchR * 0.9f;
+				// Ограничиваем бюджетом margin (в stab-пикселях: margin*STAB_W/2)
+				float maxAccum = STAB_MARGIN * STAB_W * 0.45f;
 				mStabAccumX = Math.max(-maxAccum, Math.min(maxAccum, mStabAccumX));
 				mStabAccumY = Math.max(-maxAccum, Math.min(maxAccum, mStabAccumY));
-
-				// Обновляем кроп раз в STAB_UPDATE_EVERY кадров
-				if (mStabFramesSinceUpdate >= STAB_UPDATE_EVERY) {
-					mStabFramesSinceUpdate = 0;
-					needCropUpdate = true;
-				}
 			}
 			mStabPrevLuma = currLuma;
+			// Сигнализируем: следующий кадр, снятый после нашего crop-обновления
+			// через zoom-runnable, может быть переходным.
+			// Мы не знаем точно когда zoom-runnable обновит кроп, поэтому просто
+			// оставляем prev как есть — хуже не будет (в худшем случае SAD
+			// поймает 1 кадр нашего собственного сдвига, который будет мал).
 		}
-
-		// buildAndSendRequest вне synchronized — вызываем только при обновлении
-		if (needCropUpdate) buildAndSendRequest();
+		// НЕТ buildAndSendRequest() здесь! Кроп обновляется только из zoom-runnable.
 	}
 
 	/**
