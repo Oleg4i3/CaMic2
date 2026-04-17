@@ -126,16 +126,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	// ═══════════════════════════════════════════════════════════════════════════
 	// Pre-buffer: кольцевые буферы закодированных фреймов.
-	//
-	// Ключевая идея БЕСШОВНОСТИ:
-	//   mVidWriteMode / mAudWriteMode — атомарные флаги:
-	//     0 = RING  (фреймы идут в кольцо)
-	//     1 = FLUSH (дренажный поток сбрасывает кольцо в мюксер, потом LIVE)
-	//     2 = LIVE  (фреймы идут прямо в мюксер)
-	//   Переключение RING→FLUSH→LIVE делает тот же поток, что дренирует
-	//   энкодер, — поэтому между последним фреймом кольца и первым живым
-	//   фреймом нет ни одного пропущенного пакета.
-	// ═══════════════════════════════════════════════════════════════════════════
 	private static class EncodedFrame {
 		final byte[] data; final long pts; final int flags;
 		EncodedFrame(ByteBuffer src, MediaCodec.BufferInfo bi) {
@@ -149,7 +139,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private final java.util.ArrayDeque<EncodedFrame> mAudRing = new java.util.ArrayDeque<>();
 	private final Object mVidRingLock = new Object();
 	private final Object mAudRingLock = new Object();
-	// 0=RING 1=FLUSH 2=LIVE
 	private volatile int mVidWriteMode = 0;
 	private volatile int mAudWriteMode = 0;
 	private volatile long mMuxBasePts  = 0L;
@@ -159,7 +148,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	// ─── Настройки ───────────────────────────────────────────────────────────
 	private volatile int  mVideoBps = VIDEO_BPS_DEFAULT;
-	private volatile int  mPreBufSecs = 1;          // 1..5 секунд
+	private volatile int  mPreBufSecs = 1;
 	private volatile boolean mPreBufferEnabled = true;
 	private volatile int  mEvComp = 0;
 	private int mEvMin = -6, mEvMax = 6;
@@ -167,35 +156,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private TextView mTvEv;
 
 	// ─── Цифровой стабилизатор изображения ────────────────────────────────────
-	// Принцип: при zoom>1 запрашиваем у сенсора немного бо́льшую область
-	// (margin = f(zoom)), затем на каждом кадре ищем межкадровый сдвиг
-	// (SAD-поиск на уменьшенном YUV 160×90), накапливаем смещение через
-	// leaky integrator и компенсируем его сдвигом прямоугольника CROP.
-	// Агрессивность: при zoom=1 → 0 %, при maxZoom → 100 %.
 	private volatile boolean mDigitalStab     = false;
 	private CheckBox         mCbDigitalStab;
-	private ImageReader      mStabReader;           // 160×90 YUV_420_888
+	private ImageReader      mStabReader;
 	private static final int   STAB_W          = 160;
 	private static final int   STAB_H          = 90;
-	private static final float STAB_MARGIN = 0.12f; // 12 % запас crop-а
-	private static final int   STAB_MAX_RADIUS = 12;    // макс. радиус поиска (stab-пикс.)
-	// STAB_MARGIN — фиксированный запас кропа (% при max агрессивности).
-	// Не зависит от zoom! Иначе каждый тик zoom-рычага меняет cropW → "дёргается зум".
-	//private static final float STAB_MARGIN = 0.12f;
-	// Decay: насколько быстро накопитель "забывает" постоянный сдвиг (панорамирование).
+	private static final float STAB_MARGIN = 0.12f;
+	private static final int   STAB_MAX_RADIUS = 12;
 	private static final float STAB_DECAY  = 0.82f;
-	// Агрессивность 0..1 (слайдер). Влияет только на радиус поиска и силу коррекции,
-	// НЕ на размер кропа.
 	private volatile float mStabAggressiveness = 0.7f;
-	// Накопленная коррекция в пикселях stab-кадра (160×90).
-	// Только processStabFrame пишет; buildAndSendRequest только читает.
 	private volatile float mStabAccumX = 0f;
 	private volatile float mStabAccumY = 0f;
-	// Флаг: первый кадр после изменения кропа — пропустить, т.к. prev снят иначе.
 	private volatile boolean mStabSkipNext = false;
-	
-	private volatile int mLastShiftX = 0;
-	private volatile int mLastShiftY = 0;
 	private byte[]           mStabPrevLuma = null;
 	private final Object     mStabLock     = new Object();
 	
@@ -209,10 +181,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				float speed = (float) ((Math.exp(abs * 3.0) - 1.0) / (Math.exp(3.0) - 1.0)) * MAX_ZOOM_SPEED
 				* Math.signum(lever);
 				mZoomLevel = Math.max(1f, Math.min(mMaxZoom, mZoomLevel + speed));
-				
 			}
 			if (mCamHandler != null) {
-				buildAndSendRequest();
+				buildAndSendRequest();           // ← ВЫЗОВ КАЖДЫЕ 33 мс (исправлено)
 				mCamHandler.postDelayed(this, 33);
 			}
 		}
@@ -274,7 +245,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		FrameLayout root = new FrameLayout(this);
 		root.setBackgroundColor(Color.BLACK);
 		
-		// Превью — сохраняем пропорции 16:9, центрируем в root
 		mSv = new SurfaceView(this) {
 			@Override
 			protected void onMeasure(int wMs, int hMs) {
@@ -299,18 +269,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		svLP.gravity = Gravity.CENTER;
 		root.addView(mSv, svLP);
 
-		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
 		FrameLayout.LayoutParams oscLP = new FrameLayout.LayoutParams(
 				ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
 		oscLP.gravity = Gravity.TOP | Gravity.LEFT;
-		oscLP.leftMargin = dp(50); // не перекрывать Gain-слайдер
+		oscLP.leftMargin = dp(50);
 		oscLP.rightMargin = dp(60);
 		oscLP.topMargin = dp(6);
 		root.addView(mOscilloscope, oscLP);
 		mOscilloscope.setVisibility(View.GONE);
 
-		// ── Огибающая (бегущий 10-секундный осциллограф) — тот же оверлей ──────
 		mEnvelope = new EnvelopeView(this);
 		FrameLayout.LayoutParams envLP = new FrameLayout.LayoutParams(
 				ViewGroup.LayoutParams.MATCH_PARENT, dp(130));
@@ -324,33 +292,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mBtnBgRec   = makeOval(0xFFCC1100);
 		mBtnBgPause = makeOval(0xFF1155CC);
 		
-		// Внешний вертикальный контейнер: рабочая зона + нижняя панель
 		LinearLayout outer = new LinearLayout(this);
 		outer.setOrientation(LinearLayout.VERTICAL);
 		root.addView(outer, mp_mp());
 		
-		// ── Рабочая зона ──────────────────────────────────────────────────────
 		FrameLayout content = new FrameLayout(this);
 		outer.addView(content, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 		
-		// ── Gain-слайдер (слева, ПОЛНАЯ высота экрана включая нижнюю панель) ──
-		// Диапазон: -20 dB .. +20 dB (800 шагов), 0 dB = прогресс 400 (середина)
 		mSeekGain = new VerticalSeekBar(this);
 		mSeekGain.setMax(800);
-		mSeekGain.setProgress(400); // 0 dB = середина
+		mSeekGain.setProgress(400);
 		mSeekGain.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				// p=0 → -20 dB, p=400 → 0 dB, p=800 → +20 dB
 				float db = -20f + p * 40f / 800f;
 				mGain = (float) Math.pow(10.0, db / 20.0);
 				if (mTvGain != null)
 				mTvGain.setText(String.format("%+.1f", db) + "dB");
 			}
-			
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
 		});
-		// Добавляем в root (полная высота экрана), а не в content
 		FrameLayout.LayoutParams gainLP = new FrameLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT);
 		gainLP.gravity = Gravity.LEFT;
 		root.addView(mSeekGain, gainLP);
@@ -368,20 +329,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		ViewGroup.LayoutParams.WRAP_CONTENT);
 		gainValLP.gravity = Gravity.LEFT | Gravity.BOTTOM;
 		gainValLP.leftMargin = dp(3);
-		// Отступ снизу = высота нижней панели (~165dp) + запас 4dp
 		gainValLP.bottomMargin = dp(169);
 		root.addView(mTvGain, gainValLP);
 		
-		// ── Вертикальный VU-метр (справа от Gain-слайдера, полная высота) ──────
 		mVu = new VuMeterView(this);
 		FrameLayout.LayoutParams vuVertLP = new FrameLayout.LayoutParams(dp(14), ViewGroup.LayoutParams.MATCH_PARENT);
 		vuVertLP.gravity = Gravity.LEFT;
 		vuVertLP.leftMargin = dp(44);
 		root.addView(mVu, vuVertLP);
 
-		// ── Правая колонка: Focus-слайдер + Zoom-рычаг ───────────────────────
-		// Добавляем в root (полная высота экрана), а не в content —
-		// иначе при открытии панели настроек content сжимается и рычаги «схлопываются»
 		LinearLayout rightCol = new LinearLayout(this);
 		rightCol.setOrientation(LinearLayout.HORIZONTAL);
 		FrameLayout.LayoutParams rightColLP = new FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -389,28 +345,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		rightColLP.gravity = Gravity.RIGHT;
 		root.addView(rightCol, rightColLP);
 		
-		// Слайдер фокуса (скрыт по умолчанию)
 		mFocusColumn = buildFocusColumn();
 		mFocusColumn.setVisibility(View.GONE);
 		rightCol.addView(mFocusColumn, new LinearLayout.LayoutParams(dp(44), ViewGroup.LayoutParams.MATCH_PARENT));
 		
-		// Рычаг Zoom
 		mZoomLever = new ZoomLeverView(this);
 		mZoomLever.setListener(pos -> mZoomLeverPos = pos);
 		rightCol.addView(mZoomLever, new LinearLayout.LayoutParams(dp(54), ViewGroup.LayoutParams.MATCH_PARENT));
 		
-		// ── Нижняя панель ─────────────────────────────────────────────────────
 		LinearLayout panel = new LinearLayout(this);
 		panel.setOrientation(LinearLayout.VERTICAL);
 		panel.setBackgroundColor(0x00000000);
-		// Левый паддинг = gain(44) + VU(14) + зазор(4) = 62dp
 		panel.setPadding(dp(62), dp(2), dp(8), dp(3));
 		outer.addView(panel, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
 		ViewGroup.LayoutParams.WRAP_CONTENT));
 		
-		// Тоггл аудио-источника — шестерёнка СЛЕВА от статуса.
-		// panel имеет paddingLeft=52dp (чтобы не заходить за слайдер Gain),
-		// поэтому шестерёнка слева не перекрывается ни слайдером, ни рычагом зума справа.
 		mSrcToggleBtn = new Button(this);
 		mSrcToggleBtn.setText("⚙");
 		mSrcToggleBtn.setAllCaps(false);
@@ -431,21 +380,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mTvStatus.setSingleLine(false);
 		mTvStatus.setMaxLines(2);
 		mTvStatus.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-		// Шестерёнка слева, статус справа (weight=1)
 		panel.addView(hrow(mSrcToggleBtn, mTvStatus));
 		
-		// ═══════════════════════════════════════════════════════════════════════
-		// Схлопываемая панель настроек — двухколоночная горизонтальная сетка.
-		// Левая колонка: аудио-источник, чекбоксы, пре-буфер.
-		// Правая колонка: EV, битрейт.
-		// Панель занимает всю ширину экрана (за вычетом Gain-слайдера слева).
-		// ═══════════════════════════════════════════════════════════════════════
 		mAudioSrcPanel = new LinearLayout(this);
 		mAudioSrcPanel.setOrientation(LinearLayout.HORIZONTAL);
 		mAudioSrcPanel.setVisibility(View.GONE);
 		mAudioSrcPanel.setPadding(dp(4), dp(2), dp(4), dp(2));
 
-		// ── ЛЕВАЯ КОЛОНКА (weight=1) ─────────────────────────────────────────
 		LinearLayout leftCol = new LinearLayout(this);
 		leftCol.setOrientation(LinearLayout.VERTICAL);
 		LinearLayout.LayoutParams leftColLP =
@@ -453,7 +394,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		leftColLP.rightMargin = dp(8);
 		leftCol.setLayoutParams(leftColLP);
 
-		// — Аудио-источник —
 		mSpinner = new Spinner(this);
 		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
 			new ArrayList<String>());
@@ -474,7 +414,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		srcRow.addView(mSpinner);
 		leftCol.addView(srcRow);
 
-		// — Строка 1 чекбоксов: Soft clip + Manual focus —
 		mCbSoftClip = new CheckBox(this);
 		mCbSoftClip.setText("Soft clip");
 		mCbSoftClip.setTextColor(0xCCCCCCCC); mCbSoftClip.setTextSize(11);
@@ -501,7 +440,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow1.addView(mCbManualFocus);
 		leftCol.addView(cbRow1);
 
-		// — Строка 2 чекбоксов: Oscilloscope + Spectrum —
 		CheckBox mCbOsc = new CheckBox(this);
 		mCbOsc.setText("Oscilloscope");
 		mCbOsc.setTextColor(0xCCCCCCCC); mCbOsc.setTextSize(11);
@@ -526,32 +464,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow2.addView(mCbSpec);
 		leftCol.addView(cbRow2);
 
-		// — Focus Assist (скрыт, появляется с Manual focus) —
 		mCbFocusAssist = new CheckBox(this);
 		mCbFocusAssist.setText("Focus assist");
 		mCbFocusAssist.setTextColor(0xCCCCCCCC); mCbFocusAssist.setTextSize(11);
 		mCbFocusAssist.setVisibility(View.GONE);
 		leftCol.addView(mCbFocusAssist);
 
-		// — Digital Stabilizer —
 		mCbDigitalStab = new CheckBox(this);
 		mCbDigitalStab.setText("Digital stab.");
 		mCbDigitalStab.setTextColor(0xCCCCCCCC); mCbDigitalStab.setTextSize(11);
 		mCbDigitalStab.setOnCheckedChangeListener((cb, checked) -> {
 			mDigitalStab = checked;
-			// Сбрасываем накопленное смещение
 			mStabAccumX = 0f; mStabAccumY = 0f;
 			synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 			if (!checked) {
-				// Освобождаем ридер и пересоздаём сессию без него
 				releaseStabReader();
 			}
-			// Пересоздаём сессию камеры (с ридером или без)
 			if (mCamHandler != null) mCamHandler.post(MainActivity.this::startPreview);
 		});
 		leftCol.addView(mCbDigitalStab);
 
-		// — Pre-buffer: чекбокс + слайдер 1..5 с —
 		CheckBox cbPB = new CheckBox(this);
 		cbPB.setText("Pre-buf");
 		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(11);
@@ -575,14 +507,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		mAudioSrcPanel.addView(leftCol);
 
-		// ── ПРАВАЯ КОЛОНКА (weight=1) ────────────────────────────────────────
 		LinearLayout rightSettings = new LinearLayout(this);
 		rightSettings.setOrientation(LinearLayout.VERTICAL);
 		rightSettings.setLayoutParams(
 			new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		rightSettings.setPadding(dp(4), 0, dp(4), 0);
 
-		// — EV-компенсация —
 		mTvEv = smallLabel("EV  0");
 		mSeekEv = new SeekBar(this);
 		mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin);
@@ -600,13 +530,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		evRow.addView(mTvEv); evRow.addView(mSeekEv);
 		rightSettings.addView(evRow);
 
-		// — Битрейт видео —
 		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
 		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
 		Spinner spBps = new Spinner(this);
 		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
 		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-		spBps.setAdapter(bpsAd); spBps.setSelection(5); // 6 Mbps
+		spBps.setAdapter(bpsAd); spBps.setSelection(5);
 		spBps.setLayoutParams(new LinearLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
@@ -618,8 +547,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
 		rightSettings.addView(bpsRow);
 
-		// — Агрессивность стабилизатора —
-		// Текущий уровень = slider × zoomFactor (0% при zoom=1, slider% при maxZoom)
 		final TextView tvStab = smallLabel("Stab 70%");
 		SeekBar sbStab = new SeekBar(this);
 		sbStab.setMax(100); sbStab.setProgress(70);
@@ -628,7 +555,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
 				mStabAggressiveness = p / 100f;
 				tvStab.setText("Stab " + p + "%");
-				// Сброс накопителя при изменении уровня
 				mStabAccumX = 0f; mStabAccumY = 0f;
 				synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 			}
@@ -644,20 +570,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		panel.addView(mAudioSrcPanel);
 
-		// ── Строка: спектр-анализатор (слева, weight=1) + кнопка REC (справа) ──
-		// REC справа, с отступом rightMargin=58dp чтобы не перекрыть рычаг зума (54dp)
-		// Спектр — только анализатор, занимает всю ширину нижней панели
 		mSpectrum = new SpectrumView(this);
-		// rightMargin оставляем под зум-рычаг (54dp) + REC (68dp) + зазор
 		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
 		specLP.rightMargin = dp(136);
 		panel.addView(mSpectrum, specLP);
 
-		// ── REC и PAUSE фиксированы в root (FrameLayout), не сдвигаются ──────
-		// REC — большая круглая кнопка, прикреплена к правому нижнему углу
 		int recSize = dp(68);
-		int recRight = dp(62); // 54dp зум-рычаг + 8dp зазор
+		int recRight = dp(62);
 		int recBottom = dp(8);
 
 		mBtn = new Button(this);
@@ -672,7 +592,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		recLP.bottomMargin = recBottom;
 		root.addView(mBtn, recLP);
 
-		// PAUSE — маленькая кнопка над REC, видна только во время записи
 		mBtnPause = new Button(this);
 		mBtnPause.setText("⏸");
 		mBtnPause.setTextColor(Color.WHITE);
@@ -682,21 +601,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mBtnPause.setOnClickListener(v -> onPauseClick());
 		FrameLayout.LayoutParams pauseLP = new FrameLayout.LayoutParams(dp(44), dp(44));
 		pauseLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
-		pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2; // центр над REC
+		pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2;
 		pauseLP.bottomMargin = recBottom + recSize + dp(6);
 		root.addView(mBtnPause, pauseLP);
 
 		return root;
 	}
 	
-	/** Строит колонку с барабаном фокуса (как кольцо на настоящей камере) */
 	private View buildFocusColumn() {
 		FrameLayout col = new FrameLayout(this);
 		col.setBackgroundColor(0x33000000);
 		
 		mFocusDrum = new FocusDrumView(this);
 		mFocusDrum.setOnFocusChangeListener(value -> {
-			mFocusValue = value; // 0=∞, 1=macro
+			mFocusValue = value;
 			updateFocusLabel(value);
 			if (mManualFocus && mCamHandler != null)
 			mCamHandler.post(MainActivity.this::buildAndSendRequest);
@@ -705,9 +623,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			@Override
 			public void onScrollStart() {
 				if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return;
-				// Отменяем отложенное восстановление (вдруг снова начали крутить)
 				mFocusAssistHandler.removeCallbacksAndMessages(null);
-				// Запоминаем текущий зум и форсируем максимальный (или ×3, но не меньше 4)
 				mSavedZoomBeforeAssist = mZoomLevel;
 				float assistZoom = Math.min(mMaxZoom, Math.max(mZoomLevel * 3f, 4f));
 				mZoomLevel = assistZoom;
@@ -716,7 +632,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			@Override
 			public void onScrollStop() {
 				if (mCbFocusAssist == null || !mCbFocusAssist.isChecked()) return;
-				// Через 300 мс восстанавливаем зум
 				mFocusAssistHandler.removeCallbacksAndMessages(null);
 				mFocusAssistHandler.postDelayed(() -> {
 					mZoomLevel = mSavedZoomBeforeAssist;
@@ -729,7 +644,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 		col.addView(mFocusDrum, drumLP);
 		
-		// Метки ∞ сверху, макро снизу
 		TextView tvTop = smallLabel("∞");
 		FrameLayout.LayoutParams topLP = new FrameLayout.LayoutParams(
 		ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
@@ -763,8 +677,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (mTvEv == null) return;
 		runOnUiThread(() -> mTvEv.setText(ev == 0 ? "EV  0" : String.format("EV %+d", ev)));
 	}
-	
-	// ── Helpers ───────────────────────────────────────────────────────────────
 	
 	private GradientDrawable makeOval(int color) {
 		GradientDrawable d = new GradientDrawable();
@@ -808,10 +720,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		return Math.round(x * getResources().getDisplayMetrics().density);
 	}
 	
-	// =========================================================================
-	// Напоминание — авиарежим
-	// =========================================================================
-
 	private void showAirplaneModeReminder() {
 		new android.app.AlertDialog.Builder(this)
 			.setTitle("\u2708  Airplane Mode recommended")
@@ -831,10 +739,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			.show();
 	}
 
-	// =========================================================================
-	// Разрешения
-	// =========================================================================
-	
 	private void checkPerms() {
 		List<String> need = new ArrayList<>();
 		if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED)
@@ -862,10 +766,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		openCamera();
 	}
 	
-	// =========================================================================
-	// SurfaceHolder.Callback
-	// =========================================================================
-	
 	@Override
 	public void surfaceCreated(SurfaceHolder h) {
 		mSurfaceReady = true;
@@ -881,10 +781,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	public void surfaceDestroyed(SurfaceHolder h) {
 		mSurfaceReady = false;
 	}
-	
-	// =========================================================================
-	// Camera2
-	// =========================================================================
 	
 	@SuppressLint("MissingPermission")
 	private void openCamera() {
@@ -961,7 +857,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (mEncSurface != null && mEncSurface.isValid())
 			targets.add(mEncSurface);
 
-			// Цифровой стабилизатор — добавляем ImageReader как третью поверхность
 			if (mDigitalStab) {
 				ensureStabReader();
 				if (mStabReader != null) targets.add(mStabReader.getSurface());
@@ -977,7 +872,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				@Override
 				public void onConfigureFailed(CameraCaptureSession sess) {
 					status("Session config failed");
-					// Если сессия с ридером не настроилась — пробуем без ридера
 					if (mDigitalStab) {
 						releaseStabReader();
 						if (mCamHandler != null) mCamHandler.post(MainActivity.this::startPreview);
@@ -995,9 +889,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (sess == null || dev == null || !mSurfaceReady)
 		return;
 		try {
-			// Всегда TEMPLATE_PREVIEW — шаблон не переключается при старте записи,
-			// поэтому AE не пересчитывается и яркость не прыгает.
-			// Encoder surface просто добавляется как дополнительный target.
 			int tmpl = CameraDevice.TEMPLATE_PREVIEW;
 			Surface preview = mSv.getHolder().getSurface();
 			CaptureRequest.Builder rb = dev.createCaptureRequest(tmpl);
@@ -1009,9 +900,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 			
 			if (mManualFocus) {
-				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
-				// Верх слайдера = прогресс 100 = macro (mMinFocusDist)
-				// Низ слайдера  = прогресс 0   = бесконечность (0 диоптрий)
 				float diopters = mFocusValue * mMinFocusDist;
 				rb.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF);
 				rb.set(CaptureRequest.LENS_FOCUS_DISTANCE, diopters);
@@ -1024,37 +912,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			
 			if (mSensorRect != null) {
 				if (mDigitalStab && mZoomLevel > 1.05f) {
-					// ── Стабилизированный кроп ─────────────────────────────────
-					//
-					// ПРИНЦИП: cropW/H зависят ТОЛЬКО от mZoomLevel и STAB_MARGIN —
-					// оба не меняются здесь. Поэтому размер кропа стабилен между
-					// вызовами. Меняется только ПОЗИЦИЯ центра (cropX/Y) — на величину
-					// накопленной коррекции из mStabAccumX/Y.
-					//
-					// STAB_MARGIN фиксирован → stabZoom фиксирован при данном zoom →
-					// cropW фиксирован → никакого "дрожания зума".
 					float stabZoom = mZoomLevel * (1f + STAB_MARGIN);
 					int cropW = Math.max(1, (int)(mSensorRect.width()  / stabZoom));
 					int cropH = Math.max(1, (int)(mSensorRect.height() / stabZoom));
 
-					// Масштаб: сколько сенсорных пикселей в 1 stab-пикселе.
 					float scaleX = (float) mSensorRect.width()  / (stabZoom * STAB_W);
 					float scaleY = (float) mSensorRect.height() / (stabZoom * STAB_H);
 
-					// Читаем накопитель атомарно (volatile, нет synchronized для скорости).
 					float accumX = mStabAccumX;
 					float accumY = mStabAccumY;
 
-					// Сдвигаем центр кропа на -accum*scale:
-					//   accumX > 0 → камера сдвинулась вправо (или сцена влево)
-					//   shiftX = -accumX * scaleX < 0 → кроп левее → изображение правее ✓
 					int shiftX = (int)(-accumX * scaleX);
 					int shiftY = (int)(-accumY * scaleY);
-					if (Math.abs(shiftX - mLastShiftX) > 1 || Math.abs(shiftY - mLastShiftY) > 1) {
-						synchronized (mStabLock) { mStabSkipNext = true; }
-						mLastShiftX = shiftX;
-						mLastShiftY = shiftY;
-					}
 
 					int centerX = mSensorRect.left + mSensorRect.width()  / 2;
 					int centerY = mSensorRect.top  + mSensorRect.height() / 2;
@@ -1065,7 +934,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					rb.set(CaptureRequest.SCALER_CROP_REGION,
 						new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 				} else {
-					// ── Обычный кроп ───────────────────────────────────────────
 					int cropW = Math.max(1, (int)(mSensorRect.width()  / mZoomLevel));
 					int cropH = Math.max(1, (int)(mSensorRect.height() / mZoomLevel));
 					int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
@@ -1075,6 +943,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
+			
+			// ← ИСПРАВЛЕНИЕ: помечаем следующий кадр как переходный
 			if (mDigitalStab) {
 				synchronized (mStabLock) {
 					mStabSkipNext = true;
@@ -1084,14 +954,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-	// =========================================================================
-	// REC / STOP
-	// =========================================================================
-	
 	private void onPauseClick() {
 		mPaused = !mPaused;
 		if (mPaused) {
-			// Пауза: переводим в RING, кольца очищаем
 			mPauseStartNano = System.nanoTime();
 			mVidWriteMode = 0;
 			mAudWriteMode = 0;
@@ -1101,16 +966,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mBtnPause.setBackground(makeOval(0xFF228833));
 			status("⏸ Paused");
 		} else {
-			// Снятие с паузы: LIVE сразу, без пре-буфера
-			// mMuxBasePts сдвигаем: следующий фрейм будет записан с текущим PTS минус BasePts
-			// Корректируем BasePts так, чтобы не было прыжка PTS в файле.
-			// Самый простой способ: выставить mVidWriteMode=2 и mAudWriteMode=2 напрямую.
-			// PTS коррекция: запоминаем момент паузы и момент возобновления,
-			// сдвигаем BasePts на длину паузы.
 			mPauseEndNano = System.nanoTime();
 			long pauseDurUs = (mPauseEndNano - mPauseStartNano) / 1000L;
-			mMuxBasePts += pauseDurUs; // вычитаем паузу из всех будущих PTS
-			mVidWriteMode = 2; // LIVE
+			mMuxBasePts += pauseDurUs;
+			mVidWriteMode = 2;
 			mAudWriteMode = 2;
 			mBtnPause.setText("⏸");
 			mBtnPause.setBackground(mBtnBgPause);
@@ -1131,18 +990,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-	// =========================================================================
-	// Запуск записи
-	// =========================================================================
-	
-
-	// =========================================================================
-	// Энкодеры: создание / видео-петля
-	// =========================================================================
-
-	/** Идемпотентно создаёт видео+аудио энкодеры и запускает videoPreviewLoop. */
 	private synchronized void ensureEncoders() {
-		// Видео-энкодер
 		if (mVidEnc == null || mEncSurface == null || !mEncSurface.isValid()) {
 			try {
 				if (mVidEnc != null) { try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null; }
@@ -1163,18 +1011,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mVidWriteMode = 0;
 			} catch (Exception e) { status("VidEnc err: " + e.getMessage()); return; }
 		}
-		// Видео-петля
 		if (!mVidLoopRunning) {
 			Thread t = new Thread(this::videoPreviewLoop, "vid-preview");
 			t.setDaemon(true); t.start();
 		}
 	}
 
-	/**
-	 * Непрерывно дренирует видео-энкодер.
-	 * Переключение RING→FLUSH→LIVE происходит ЗДЕСЬ, в этом же потоке —
-	 * никаких гонок, никаких пропущенных фреймов между кольцом и файлом.
-	 */
 	private void videoPreviewLoop() {
 		mVidLoopRunning = true;
 		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
@@ -1198,7 +1040,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int mode = mVidWriteMode;
 
 				if (mode == 0) {
-					// ── RING: добавляем в кольцо, обрезаем по mPreBufSecs ──
 					EncodedFrame f = new EncodedFrame(data, info);
 					synchronized(mVidRingLock) {
 						mVidRing.addLast(f);
@@ -1209,10 +1050,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						}
 					}
 				} else if (mode == 1) {
-					// ── FLUSH: сбрасываем кольцо в мюксер, затем текущий кадр ──
-					// Всё делаем здесь — атомарно, в одном потоке.
 					synchronized(mVidRingLock) {
-						// Пропускаем до первого I-frame
 						boolean foundKey = false;
 						for (EncodedFrame rf : mVidRing) {
 							if (!foundKey && !rf.isKey()) continue;
@@ -1224,13 +1062,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						}
 						mVidRing.clear();
 					}
-					// Текущий кадр — первый живой
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
 					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
 					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-					mVidWriteMode = 2; // LIVE
+					mVidWriteMode = 2;
 				} else {
-					// ── LIVE: прямо в мюксер ──
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
 					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
 					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
@@ -1240,21 +1076,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mVidLoopRunning = false;
 	}
 
-	// =========================================================================
-	// Цифровой стабилизатор изображения
-	// =========================================================================
-
-	/**
-	 * Коэффициент стабилизации: 0.0 при zoom≤1, 1.0 при maxZoom.
-	 * Линейно растёт, потому что дрожание рук в пикселях пропорционально zoom.
-	 */
-	/**
-	 * Коэффициент коррекции для текущего zoom: 0..1.
-	 * При zoom=1 → 0 (нет смысла корректировать — нет тремора).
-	 * При zoom=maxZoom → mStabAggressiveness.
-	 * Используется ТОЛЬКО для радиуса SAD-поиска и силы coррекции accumX/Y.
-	 * НЕ используется для вычисления размера кропа (margin фиксирован).
-	 */
 	private float computeStabilFactor() {
 		if (!mDigitalStab) return 0f;
 		float maxZ = Math.max(2f, mMaxZoom);
@@ -1262,7 +1083,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		return mStabAggressiveness * zoomFactor;
 	}
 
-	/** Создаёт ImageReader для захвата кадров стабилизатора, если ещё не создан. */
 	private void ensureStabReader() {
 		if (mStabReader != null) return;
 		try {
@@ -1280,7 +1100,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
-	/** Освобождает ImageReader стабилизатора. */
 	private void releaseStabReader() {
 		if (mStabReader != null) {
 			try { mStabReader.close(); } catch (Exception ignored) {}
@@ -1290,36 +1109,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 	}
 
-	/**
-	 * Обрабатывает один кадр стабилизатора (вызывается из mCamHandler).
-	 *
-	 * АРХИТЕКТУРА (v3 — без обратной связи):
-	 *
-	 * processStabFrame ТОЛЬКО обновляет mStabAccumX/Y.
-	 * Он НЕ вызывает buildAndSendRequest() — это устраняет обратную связь
-	 * полностью. Применение коррекции происходит в следующем вызове
-	 * buildAndSendRequest() из zoom-runnable (каждые ~33мс).
-	 *
-	 * Пропуск переходного кадра: когда мы сменили кроп, следующий кадр
-	 * ImageReader мог быть снят ещё со старым кропом. Флаг mStabSkipNext
-	 * позволяет пропустить один такой кадр чтобы SAD не мерил наш сдвиг.
-	 *
-	 * Знак SAD: если камера сдвинулась вправо, curr содержит ту же сцену,
-	 * но сдвинутую влево относительно prev. SAD находит bestDx < 0.
-	 * Чтобы compенсировать: accum += -bestDx (т.е. accum > 0 при сдвиге вправо).
-	 * Тогда в buildAndSendRequest: shiftX = -accum*scale < 0 → кроп левее → OK.
-	 */
 	private void processStabFrame(android.media.Image img) {
 		if (!mDigitalStab) return;
 		float sf = computeStabilFactor();
 		if (sf < 0.02f) {
-			// Zoom≈1: нет тремора — сбрасываем накопитель
 			mStabAccumX = 0f; mStabAccumY = 0f;
 			synchronized (mStabLock) { mStabPrevLuma = null; mStabSkipNext = false; }
 			return;
 		}
 
-		// ── Извлекаем Y-плоскость (luma) ──────────────────────────────────────
 		android.media.Image.Plane yPlane = img.getPlanes()[0];
 		java.nio.ByteBuffer yBuf = yPlane.getBuffer();
 		int rowStride = yPlane.getRowStride();
@@ -1338,18 +1136,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		synchronized (mStabLock) {
 			if (mStabSkipNext) {
-				// Переходный кадр: prev снят с другим кропом → не сравниваем,
-				// просто обновляем prev и снимаем флаг.
 				mStabPrevLuma = currLuma;
 				mStabSkipNext = false;
 				return;
 			}
 
 			if (mStabPrevLuma != null) {
-				// Радиус SAD пропорционален aggressiveness и zoomFactor
 				int searchR = Math.max(1, (int)(sf * STAB_MAX_RADIUS));
 
-				// ── SAD-поиск ─────────────────────────────────────────────────
 				int bestDx = 0, bestDy = 0;
 				long bestSad = Long.MAX_VALUE;
 				for (int dy = -searchR; dy <= searchR; dy++) {
@@ -1359,33 +1153,17 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					}
 				}
 
-				// ── Leaky integrator ───────────────────────────────────────────
-				// Decay позволяет медленно следовать за панорамированием.
-				// При неподвижной камере accum → 0 через ~N кадров.
-				// sf масштабирует силу коррекции (меньше zoom → меньше коррекция).
 				mStabAccumX = (mStabAccumX - bestDx * sf) * STAB_DECAY;
 				mStabAccumY = (mStabAccumY - bestDy * sf) * STAB_DECAY;
 
-				// Ограничиваем бюджетом margin (в stab-пикселях: margin*STAB_W/2)
 				float maxAccum = STAB_MARGIN * STAB_W * 0.45f;
 				mStabAccumX = Math.max(-maxAccum, Math.min(maxAccum, mStabAccumX));
 				mStabAccumY = Math.max(-maxAccum, Math.min(maxAccum, mStabAccumY));
 			}
 			mStabPrevLuma = currLuma;
-			// Сигнализируем: следующий кадр, снятый после нашего crop-обновления
-			// через zoom-runnable, может быть переходным.
-			// Мы не знаем точно когда zoom-runnable обновит кроп, поэтому просто
-			// оставляем prev как есть — хуже не будет (в худшем случае SAD
-			// поймает 1 кадр нашего собственного сдвига, который будет мал).
 		}
-		// НЕТ buildAndSendRequest() здесь! Кроп обновляется только из zoom-runnable.
 	}
 
-	/**
-	 * Вычисляет SAD (Sum of Absolute Differences) между prev и curr
-	 * со сдвигом (dx, dy). Пропускает через step=3 для снижения нагрузки.
-	 * Пограничная полоса border=searchR гарантирует валидные координаты.
-	 */
 	private long computeSAD(byte[] prev, byte[] curr, int dx, int dy, int border) {
 		long sad = 0;
 		final int step = 3;
@@ -1426,7 +1204,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		disableAudioEffects(rec.getAudioSessionId());
 		mAudRec = rec; mAudChannels = channels;
 
-		// Создаём аудио-энкодер
 		try {
 			MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SR, channels);
 			af.setInteger(MediaFormat.KEY_BIT_RATE, channels == 1 ? 192_000 : 320_000);
@@ -1460,16 +1237,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		try { if (AcousticEchoCanceler.isAvailable()) { AcousticEchoCanceler e = AcousticEchoCanceler.create(sid); if (e!=null){e.setEnabled(false);e.release();} } } catch (Exception ignored) {}
 	}
 
-	/**
-	 * Аудио-петля: читает PCM, кодирует AAC, дренирует в кольцо или мюксер.
-	 * Переключение RING→FLUSH→LIVE — в этом же потоке, атомарно.
-	 */
 	private void audioMainLoop() {
 		final AudioRecord rec = mAudRec;
 		final int ch = mAudChannels;
-		final int chunkSamples = AUDIO_SR * ch / 50; // 20 мс
+		final int chunkSamples = AUDIO_SR * ch / 50;
 		short[] buf = new short[chunkSamples];
-		// Абсолютный старт в мкс — тот же CLOCK_MONOTONIC, что у видео-сенсора
 		final long startUs = System.nanoTime() / 1000L;
 		long totalFrames = 0L;
 
@@ -1478,7 +1250,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			int r = rec.read(buf, 0, chunkSamples);
 			if (r <= 0) continue;
 
-			// ── gain / soft-clip ──────────────────────────────────────────────
 			final float g = mGain; final boolean sc = mSoftClip;
 			long sumSq = 0;
 			for (int i = 0; i < r; i++) {
@@ -1499,10 +1270,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (mEnvelope     != null) mEnvelope.pushSamples(buf, r, ch);
 			if (mSpectrum     != null) mSpectrum.pushSamples(buf, r, ch);
 
-			// ── кодируем PCM→AAC ──────────────────────────────────────────────
 			MediaCodec enc = mAudEnc;
 			if (enc == null) continue;
-			// PTS: абсолютный System.nanoTime (мкс) — тот же домен, что у видео
 			long pts = startUs + totalFrames * 1_000_000L / AUDIO_SR;
 			totalFrames += r / ch;
 			int idx = enc.dequeueInputBuffer(5_000);
@@ -1518,9 +1287,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		try { rec.stop(); } catch (Exception ignored) {}
 	}
 
-	/**
-	 * Дренирует аудио-энкодер. Переключение RING→FLUSH→LIVE — здесь, атомарно.
-	 */
 	private void drainAudioEncoder(MediaCodec enc) {
 		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
 		while (true) {
@@ -1537,7 +1303,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int mode = mAudWriteMode;
 
 				if (mode == 0) {
-					// RING
 					EncodedFrame f = new EncodedFrame(data, info);
 					synchronized(mAudRingLock) {
 						mAudRing.addLast(f);
@@ -1548,7 +1313,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						}
 					}
 				} else if (mode == 1) {
-					// FLUSH: сбрасываем кольцо начиная с первого аудио-фрейма >= mMuxBasePts
 					synchronized(mAudRingLock) {
 						boolean started = false;
 						for (EncodedFrame rf : mAudRing) {
@@ -1561,13 +1325,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						}
 						mAudRing.clear();
 					}
-					// Текущий аудио-пакет
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
 					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
 					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); }
-					mAudWriteMode = 2; // LIVE
+					mAudWriteMode = 2;
 				} else {
-					// LIVE
 					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
 					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
 					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); }
@@ -1577,23 +1339,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
-	// =========================================================================
-	// REC: doStart / doStop / finalizeMuxer
-	// =========================================================================
-
-	/**
-	 * doStart():
-	 *  1. Вычисляем mMuxBasePts = PTS первого I-frame в видео-кольце.
-	 *     Аудио-кольцо совпадает по clock → синхронизировано автоматически.
-	 *  2. Создаём мюксер и добавляем треки.
-	 *  3. Устанавливаем mVidWriteMode=FLUSH, mAudWriteMode=FLUSH.
-	 *  4. Каждый поток сам (атомарно!) сбрасывает кольцо и продолжает LIVE.
-	 *  Нет снимков, нет гонок, нет разрывов.
-	 */
 	@SuppressLint("MissingPermission")
 	private void doStart() {
 		try {
-			// Ждём форматов от энкодеров (максимум 2 с)
 			for (int wait = 0; wait < 40 && (mVidOutFmt == null || mAudOutFmt == null); wait++) {
 				Thread.sleep(50);
 			}
@@ -1602,7 +1350,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				return;
 			}
 
-			// ── Вычисляем mMuxBasePts по первому I-frame в видео-кольце ───────
 			long basePts;
 			synchronized(mVidRingLock) {
 				if (mPreBufferEnabled) {
@@ -1612,14 +1359,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					}
 					if (basePts == Long.MAX_VALUE) basePts = 0;
 				} else {
-					// Без пре-буфера: берём PTS следующего I-frame (придёт через ≤1 с)
-					// Пока ждём его — просто ставим текущее время
 					basePts = System.nanoTime() / 1000L;
 				}
 			}
 			mMuxBasePts = basePts;
 
-			// ── Создаём MediaStore-запись ──────────────────────────────────────
 			String displayPath;
 			if (Build.VERSION.SDK_INT >= 29) {
 				ContentValues cv = new ContentValues();
@@ -1643,7 +1387,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			int rot = getWindowManager().getDefaultDisplay().getRotation() * 90;
 			mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
 
-			// ── Добавляем треки, стартуем мюксер ──────────────────────────────
 			synchronized(mMuxLock) {
 				mVidTrack = mMuxer.addTrack(mVidOutFmt);
 				mAudTrack = mMuxer.addTrack(mAudOutFmt);
@@ -1651,13 +1394,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mMuxReady = true;
 			}
 
-			// ── Переводим потоки в режим FLUSH → они сами сбросят кольца ──────
 			mRecording = true;
 			if (mPreBufferEnabled) {
-				mVidWriteMode = 1; // FLUSH
-				mAudWriteMode = 1; // FLUSH
+				mVidWriteMode = 1;
+				mAudWriteMode = 1;
 			} else {
-				mVidWriteMode = 2; // LIVE сразу
+				mVidWriteMode = 2;
 				mAudWriteMode = 2;
 			}
 
@@ -1681,9 +1423,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 
 	private void doStop() {
-		// Даём энкодерам 200 мс выдать буферизованные пакеты
 		try { Thread.sleep(200); } catch (Exception ignored) {}
-		mVidWriteMode = 0; mAudWriteMode = 0; // обратно в RING
+		mVidWriteMode = 0; mAudWriteMode = 0;
 		finalizeMuxer();
 	}
 
@@ -1712,10 +1453,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private void status(String s) {
 		runOnUiThread(() -> mTvStatus.setText(s));
 	}
-	
-	// =========================================================================
-	// Аудио-источники
-	// =========================================================================
 	
 	private void buildAudioSources() {
 		List<AudioSrcItem> list = new ArrayList<>();
@@ -1790,10 +1527,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 	}
 	
-	// =========================================================================
-	// Вспомогательные классы
-	// =========================================================================
-	
 	private static class AudioSrcItem {
 		final String name;
 		final int audioSource;
@@ -1834,7 +1567,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		int getProgress() { return mProgress; }
 		void setOnSeekBarChangeListener(SeekBar.OnSeekBarChangeListener l) { mListener = l; }
 
-		// Высота ручки микшера в px
 		private float faderH(float w) { return Math.round(w * 0.7f) + dp(20); }
 
 		private int dp(int x) {
@@ -1857,36 +1589,29 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			float frac = mMax > 0 ? (float) mProgress / mMax : 0f;
 			float thumbY = trkB - frac * trkH;
 
-			// Трек
 			canvas.drawRoundRect(new RectF(trkX1, trkT, trkX2, trkB),
 				trackW / 2f, trackW / 2f, mTrackPaint);
-			// Заполненная часть
 			canvas.drawRoundRect(new RectF(trkX1, thumbY, trkX2, trkB),
 				trackW / 2f, trackW / 2f, mFillPaint);
-			// Метка 0 dB
+
 			Paint z = new Paint(Paint.ANTI_ALIAS_FLAG);
 			z.setColor(0x88FFFFFF); z.setStrokeWidth(1.5f);
 			canvas.drawLine(trkX1 - 3f, trkB - 0.5f * trkH, trkX2 + 3f, trkB - 0.5f * trkH, z);
 
-			// ── Ручка (fader cap) — широкий прямоугольник во всю ширину ──────
 			float fH = faderH(w);
 			float fW = w - 2f;
 			RectF fader = new RectF(1f, thumbY - fH/2f, 1f + fW, thumbY + fH/2f);
-			// Тень
 			Paint shadow = new Paint(Paint.ANTI_ALIAS_FLAG);
 			shadow.setColor(0x66000000);
 			shadow.setStyle(Paint.Style.FILL);
 			canvas.drawRoundRect(new RectF(fader.left+2, fader.top+3, fader.right+2, fader.bottom+3),
 				dp(4), dp(4), shadow);
-			// Тело ручки
 			canvas.drawRoundRect(fader, dp(4), dp(4), mThumbPaint);
-			// Горизонтальные риски (3 штуки по центру)
 			float rInset = fW * 0.18f;
 			for (int ri = -1; ri <= 1; ri++) {
 				float ry = thumbY + ri * dp(4);
 				canvas.drawLine(1f + rInset, ry, 1f + fW - rInset, ry, mRidgePaint);
 			}
-			// Центральная риска чуть длиннее и ярче
 			Paint cLine = new Paint(Paint.ANTI_ALIAS_FLAG);
 			cLine.setColor(0xFFDDCC00); cLine.setStrokeWidth(1.5f);
 			canvas.drawLine(1f + rInset * 0.6f, thumbY, 1f + fW - rInset * 0.6f, thumbY, cLine);
@@ -1905,7 +1630,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			switch (e.getAction()) {
 				case MotionEvent.ACTION_DOWN:
 				if (mListener != null) mListener.onStartTrackingTouch(null);
-				// fall through
 				case MotionEvent.ACTION_MOVE: {
 					float frac = 1f - (e.getY() - trkT) / trkH;
 					int p = Math.max(0, Math.min(mMax, Math.round(frac * mMax)));
@@ -1923,9 +1647,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-	// ─── Вертикальный VU-метр dBFS ───────────────────────────────────────────
-	// Сегменты снизу вверх. Пик-маркер — горизонтальная черта с hold 1.8s.
-
 	static class VuMeterView extends View {
 		private static final int N = 30;
 		private static final float MIN_DB = -60f;
@@ -1984,7 +1705,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				canvas.drawRoundRect(mRect, 2f, 2f, mSegPaint);
 			}
 
-			// Пик-маркер
 			if (mPeakDb > MIN_DB) {
 				float frac = (mPeakDb - MIN_DB) / (-MIN_DB);
 				float py = h - 1f - frac * (h - 2f);
@@ -2000,25 +1720,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 
-			// ── dB-метки поверх индикатора ────────────────────────────────────
 			float[] dbMarks  = { 0f, -6f, -12f, -24f, -48f, -60f };
 			String[] dbStrs  = { "0", "-6", "-12", "-24", "-48", "-60" };
 			float lblAscent = -mDbLblPaint.ascent();
 			for (int di = 0; di < dbMarks.length; di++) {
 				float frac = (dbMarks[di] - MIN_DB) / (-MIN_DB);
 				float ly   = h - 1f - frac * (h - 2f);
-				// цвет совпадает с цветом сегмента
 				if      (dbMarks[di] >= -6f)  mDbLblPaint.setColor(0xFFFF6644);
 				else if (dbMarks[di] >= -12f) mDbLblPaint.setColor(0xFFFFDD44);
 				else                          mDbLblPaint.setColor(0xCCBBFFCC);
 				mDbLblPaint.setAlpha(200);
-				// рисуем справа, сдвинув вверх на половину высоты шрифта
 				canvas.drawText(dbStrs[di], w - 1f, ly + lblAscent * 0.5f, mDbLblPaint);
 			}
 		}
 	}
-	
-	// ─── Рычаг зума ──────────────────────────────────────────────────────────
 	
 	static class ZoomLeverView extends View {
 		interface Listener {
@@ -2129,11 +1844,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 	
-	// ─── Focus Assist — зумированное окно в центре экрана ───────────────────
-	// Захватывает центральную область превью через PixelCopy и рисует её
-	// с увеличением x4. Обновляется каждые ~100 мс.
-	// Поверх — сетка Петцваля и рамка.
-	
 	class FocusAssistView extends View implements Runnable {
 		private Bitmap mBmp;
 		private final Paint mBmpPaint = new Paint(Paint.ANTI_ALIAS_FLAG | Paint.FILTER_BITMAP_FLAG);
@@ -2141,7 +1851,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final Paint mGridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private static final int ZOOM = 4;
-		private static final int SAMPLE_SIZE = 120; // px стороны захватываемого квадрата
+		private static final int SAMPLE_SIZE = 120;
 		private volatile boolean mRunning;
 		
 		FocusAssistView(Context c) {
@@ -2186,7 +1896,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private void capture() {
 			if (mSv == null || !mSurfaceReady) return;
 			if (android.os.Build.VERSION.SDK_INT < 26) {
-				// PixelCopy недоступен — рисуем заглушку
 				invalidate();
 				return;
 			}
@@ -2194,7 +1903,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				int svW = mSv.getWidth(), svH = mSv.getHeight();
 				if (svW <= 0 || svH <= 0) return;
 				
-				// Центральная область SAMPLE_SIZE × SAMPLE_SIZE
 				int cx = svW / 2, cy = svH / 2, half = SAMPLE_SIZE / 2;
 				int l = Math.max(0, cx - half), t = Math.max(0, cy - half);
 				int r = Math.min(svW, l + SAMPLE_SIZE), b = Math.min(svH, t + SAMPLE_SIZE);
@@ -2214,33 +1922,26 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		protected void onDraw(Canvas canvas) {
 			final float w = getWidth(), h = getHeight();
 			
-			// Фон — чёрный полупрозрачный
 			canvas.drawARGB(200, 0, 0, 0);
 			
 			if (mBmp != null && !mBmp.isRecycled()) {
-				// Рисуем захваченный фрагмент, растянутый на весь квадрат
 				android.graphics.RectF dst = new android.graphics.RectF(0, 0, w, h);
 				canvas.drawBitmap(mBmp, null, dst, mBmpPaint);
 				} else {
-				// Заглушка когда PixelCopy ещё не отработал
 				Paint p = new Paint();
 				p.setColor(0xFF333333);
 				canvas.drawRect(0, 0, w, h, p);
 			}
 			
-			// Сетка — тонкая перекрёстная линия (центральная)
 			canvas.drawLine(w / 2f, 0, w / 2f, h, mGridPaint);
 			canvas.drawLine(0, h / 2f, w, h / 2f, mGridPaint);
-			// Третьи (по правило третей)
 			canvas.drawLine(w / 3f, 0, w / 3f, h, mGridPaint);
 			canvas.drawLine(2 * w / 3f, 0, 2 * w / 3f, h, mGridPaint);
 			canvas.drawLine(0, h / 3f, w, h / 3f, mGridPaint);
 			canvas.drawLine(0, 2 * h / 3f, w, 2 * h / 3f, mGridPaint);
 			
-			// Рамка
 			canvas.drawRect(1f, 1f, w - 1f, h - 1f, mBorderPaint);
 			
-			// Уголки (более жирные акценты)
 			float corner = w * 0.12f;
 			mBorderPaint.setStrokeWidth(3f);
 			canvas.drawLine(1f, 1f, corner, 1f, mBorderPaint);
@@ -2253,21 +1954,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			canvas.drawLine(w - corner, h - 1f, w - 1f, h - 1f, mBorderPaint);
 			mBorderPaint.setStrokeWidth(2f);
 			
-			// Подпись
 			canvas.drawText("FOCUS ×" + ZOOM, w / 2f, h - 4f, mLabelPaint);
 		}
 	}
 	
-	// ─── Барабан фокуса (как кольцо на настоящей камере) ────────────────────
-	// Свайп вниз = фокус вдаль (∞), свайп вверх = макро.
-	// Визуально: риски на цилиндре с перспективным сжатием.
-	
 	static class FocusDrumView extends View {
 		interface OnFocusChangeListener {
-			void onFocusChanged(float value); // 0=∞, 1=macro
+			void onFocusChanged(float value);
 		}
 		
-		/** Коллбэк начала/остановки прокрутки барабана */
 		interface OnDrumScrollListener {
 			void onScrollStart();
 			void onScrollStop();
@@ -2275,11 +1970,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		
 		private OnFocusChangeListener mListener;
 		private OnDrumScrollListener mScrollListener;
-		private float mValue = 0f; // 0..1
+		private float mValue = 0f;
 		private float mLastY;
 		private boolean mDragging;
 		
-		// Визуальный «угол» барабана — непрерывный для анимации рисок
 		private float mAngle = 0f;
 		private static final float FULL_RANGE_PX_PER_UNIT = 800f;
 		
@@ -2316,12 +2010,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			final float drumLeft = cx - drumW / 2f;
 			final float drumRight = cx + drumW / 2f;
 			
-			// Фон барабана
 			RectF drumRect = new RectF(drumLeft, 0, drumRight, h);
 			mDrumPaint.setColor(0xFF222222);
 			canvas.drawRoundRect(drumRect, drumW * 0.12f, drumW * 0.12f, mDrumPaint);
 			
-			// Риски барабана с перспективным сжатием
 			final float riskStep = h * 0.07f;
 			float offset = mAngle % riskStep;
 			if (offset < 0) offset += riskStep;
@@ -2345,7 +2037,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				canvas.drawLine(cx - riskLen / 2f, ry, cx + riskLen / 2f, ry, mRiskPaint);
 			}
 			
-			// Градиентные тени сверху/снизу (имитация цилиндра)
 			int[] colorsTop = { 0xCC000000, 0x00000000 };
 			int[] colorsBot = { 0x00000000, 0xCC000000 };
 			android.graphics.LinearGradient shadTop = new android.graphics.LinearGradient(
@@ -2358,7 +2049,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			canvas.drawRoundRect(drumRect, drumW * 0.12f, drumW * 0.12f, mShadowPaint);
 			mShadowPaint.setShader(null);
 			
-			// Центральная риска-указатель (жёлтая)
 			canvas.drawLine(drumLeft - 4f, h / 2f, drumRight + 4f, h / 2f, mCenterLinePaint);
 		}
 		
@@ -2374,12 +2064,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					if (!mDragging) return true;
 					float dy = e.getY() - mLastY;
 					mLastY = e.getY();
-					// Свайп вниз → фокус на ∞ (value уменьшается)
-					// Свайп вверх → макро (value увеличивается)
 					mAngle += dy;
 					float newVal = mValue - dy / FULL_RANGE_PX_PER_UNIT;
 					newVal = Math.max(0f, Math.min(1f, newVal));
-					// Фиксируем барабан у упора
 					if (newVal == 0f && mValue == 0f) mAngle = Math.min(mAngle, 0f);
 					if (newVal == 1f && mValue == 1f) mAngle = Math.max(mAngle, 0f);
 					if (newVal != mValue) {
@@ -2399,14 +2086,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
-	// ─── Осциллограф с триггером ─────────────────────────────────────────────
-	// Прозрачный фон, наложен поверх изображения камеры.
-	// Триггер: фронт нарастания (rising edge) при пересечении порога.
-	// Окно отображения — 2048 выборок (~46 мс при 44100 Гц).
-	
 	static class OscilloscopeView extends View {
 		private static final int DISP_SAMPLES = 2048;
-		private static final int BUF_SIZE = DISP_SAMPLES * 4; // кольцевой буфер
+		private static final int BUF_SIZE = DISP_SAMPLES * 4;
 		
 		private final float[] mRingBuf = new float[BUF_SIZE];
 		private int mWritePos = 0;
@@ -2414,14 +2096,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private volatile boolean mNewFrame = false;
 		private final Object mLock = new Object();
 		
-		// Триггер
-		private static final float TRIG_LEVEL = 0.05f; // нормализованный уровень
-		private static final int TRIG_HYSTERESIS = 64; // выборок предыстории
+		private static final float TRIG_LEVEL = 0.05f;
+		private static final int TRIG_HYSTERESIS = 64;
 		
 		private final Paint mWavePaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mGridPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mLabelPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		/** Цвет по амплитуде 0..1 — как сегменты VU-метра */
+
 		static int levelColor(float amp) {
 			if (amp >= 0.7f) return 0xFFFF2200;
 			if (amp >= 0.3f) return 0xFFFFBB00;
@@ -2430,7 +2111,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 		OscilloscopeView(Context c) {
 			super(c);
-			setBackgroundColor(0x00000000); // прозрачный
+			setBackgroundColor(0x00000000);
 			mWavePaint.setStrokeWidth(1.8f * c.getResources().getDisplayMetrics().density);
 			mWavePaint.setStyle(Paint.Style.STROKE);
 			mWavePaint.setStrokeCap(Paint.Cap.ROUND);
@@ -2442,7 +2123,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mLabelPaint.setAntiAlias(true);
 		}
 		
-		/** Принимает буфер PCM-16, конвертирует в mono float и кладёт в кольцевой буфер */
 		void pushSamples(short[] buf, int len, int channels) {
 			synchronized (mLock) {
 				for (int i = 0; i < len; i += channels) {
@@ -2452,8 +2132,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					mRingBuf[mWritePos] = mono;
 					mWritePos = (mWritePos + 1) % BUF_SIZE;
 				}
-				// Поиск триггера: восходящий фронт >= TRIG_LEVEL
-				// Ищем в последних BUF_SIZE выборках
 				int trigPos = -1;
 				int searchStart = (mWritePos - BUF_SIZE + BUF_SIZE) % BUF_SIZE;
 				for (int k = TRIG_HYSTERESIS; k < BUF_SIZE - DISP_SAMPLES; k++) {
@@ -2465,7 +2143,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					}
 				}
 				if (trigPos < 0) {
-					// Триггер не найден — показываем последние DISP_SAMPLES
 					trigPos = (mWritePos - DISP_SAMPLES + BUF_SIZE) % BUF_SIZE;
 				}
 				for (int k = 0; k < DISP_SAMPLES; k++) {
@@ -2481,21 +2158,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			final float w = getWidth(), h = getHeight();
 			if (w == 0 || h == 0) return;
 
-			// Полностью прозрачный фон — не рисуем ничего
-			// canvas.drawARGB(90, 0, 0, 0);
-			
-			// Сетка
 			for (int gx = 1; gx < 4; gx++)
 				canvas.drawLine(w * gx / 4f, 0, w * gx / 4f, h, mGridPaint);
 			for (int gy = 1; gy < 4; gy++)
 				canvas.drawLine(0, h * gy / 4f, w, h * gy / 4f, mGridPaint);
-			// Ось Y = 0
 			Paint zeroPaint = new Paint(mGridPaint);
 			zeroPaint.setColor(0x55FFFFFF);
 			zeroPaint.setStrokeWidth(1.4f);
 			canvas.drawLine(0, h / 2f, w, h / 2f, zeroPaint);
 			
-			// Линия уровня триггера
 			Paint trigPaint = new Paint();
 			trigPaint.setColor(0x88FFFF00);
 			trigPaint.setStrokeWidth(1f);
@@ -2504,7 +2175,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			float trigY = h / 2f - TRIG_LEVEL * h / 2f;
 			canvas.drawLine(0, trigY, w, trigY, trigPaint);
 			
-			// Волна — цветные сегменты (зелёный→оранжевый→красный)
 			float[] frame;
 			synchronized (mLock) {
 				frame = mFrame.clone();
@@ -2518,19 +2188,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				canvas.drawLine(x0, y0, x1, y1, mWavePaint);
 			}
 			
-			// Подпись
 			canvas.drawText("OSC  T↑", 4, h - 3f, mLabelPaint);
 		}
 	}
 	
 
-	// ─── Огибающая: бегущий 10-секундный осциллограф ────────────────────────────
-	// Хранит пиковые значения с шагом ~10 мс (CHUNK выборок).
-	// Показывается когда осциллограф выключен; вертикальный масштаб совпадает.
-
 	static class EnvelopeView extends View {
-		private static final int HIST  = 1000; // 10 с × 100 точек/с
-		private static final int CHUNK = 441;  // ~10 мс при 44100 Гц
+		private static final int HIST  = 1000;
+		private static final int CHUNK = 441;
 
 		private final float[] mEnv    = new float[HIST];
 		private int   mWritePos = 0;
@@ -2583,7 +2248,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			final float w = getWidth(), h = getHeight();
 			if (w == 0 || h == 0) return;
 
-			// Сетка (как у осциллографа)
 			for (int gx = 1; gx < 4; gx++)
 				canvas.drawLine(w * gx / 4f, 0, w * gx / 4f, h, mGridPaint);
 			for (int gy = 1; gy < 4; gy++)
@@ -2609,7 +2273,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			int count = Math.min(filled, HIST);
 			int start = (filled < HIST) ? 0 : writePos;
 
-			// Рисуем симметричную огибающую цветными сегментами
 			for (int i = 0; i < count - 1; i++) {
 				float a0 = snap[(start + i)     % HIST];
 				float a1 = snap[(start + i + 1) % HIST];
@@ -2624,7 +2287,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				canvas.drawLine(x0, yB0, x1, yB1, mSegPaint);
 			}
 
-			// Вертикальная черта «сейчас» (правый край)
 			Paint curPaint = new Paint();
 			curPaint.setColor(0x66FFFFFF);
 			curPaint.setStrokeWidth(1f);
@@ -2635,10 +2297,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
-	// ─── Спектр-анализатор: FFT 2048 точек ───────────────────────────────────
-	// Компактный вид в нижней панели. Логарифмическая шкала частот.
-	// Накопительный буфер: когда накоплено >= FFT_SIZE выборок — считаем FFT.
-	
 	static class SpectrumView extends View {
 		private static final int FFT_SIZE = 2048;
 		private static final int HALF = FFT_SIZE / 2;
@@ -2646,15 +2304,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final float[] mAccBuf = new float[FFT_SIZE];
 		private int mAccPos = 0;
 		
-		private final float[] mMagnitude = new float[HALF]; // последний спектр
-		private final float[] mSmooth = new float[HALF];    // сглаженный
-		private final float[] mPeaks = new float[HALF];     // пик-холд для спектра
+		private final float[] mMagnitude = new float[HALF];
+		private final float[] mSmooth = new float[HALF];
+		private final float[] mPeaks = new float[HALF];
 		private final Object mLock = new Object();
 		
-		// FFT рабочие массивы (переиспользуются)
 		private final float[] mFftRe = new float[FFT_SIZE];
 		private final float[] mFftIm = new float[FFT_SIZE];
-		// Окно Ханна
 		private final float[] mWindow = new float[FFT_SIZE];
 		
 		private final Paint mBarPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -2662,14 +2318,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private final Paint mLblPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
 		private final Paint mBgPaint = new Paint();
 		
-		private static final int DISPLAY_BINS = 60; // уменьшено вдвое
+		private static final int DISPLAY_BINS = 60;
 		private static final float SAMPLE_RATE = 44100f;
-		private static final float DECAY = 0.82f;    // коэффициент спада сглаженного
+		private static final float DECAY = 0.82f;
 		private static final float PEAK_DECAY = 0.996f;
 		
 		SpectrumView(Context c) {
 			super(c);
-			// Окно Ханна
 			for (int i = 0; i < FFT_SIZE; i++)
 				mWindow[i] = 0.5f * (1f - (float) Math.cos(2.0 * Math.PI * i / (FFT_SIZE - 1)));
 			mBarPaint.setStyle(Paint.Style.FILL);
@@ -2679,10 +2334,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mLblPaint.setColor(0xCCFFFFFF);
 			mLblPaint.setTextSize(7.5f * c.getResources().getDisplayMetrics().density);
 			mLblPaint.setAntiAlias(true);
-			mBgPaint.setColor(0x00000000); // полностью прозрачный фон
+			mBgPaint.setColor(0x00000000);
 		}
 		
-		/** Получает новый блок PCM-16, микширует в моно, накапливает до FFT_SIZE */
 		void pushSamples(short[] buf, int len, int channels) {
 			for (int i = 0; i < len; i += channels) {
 				float mono = buf[i] / 32768f;
@@ -2691,7 +2345,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mAccBuf[mAccPos++] = mono;
 				if (mAccPos >= FFT_SIZE) {
 					computeFFT();
-					// Перекрытие 50% — сдвигаем буфер
 					System.arraycopy(mAccBuf, FFT_SIZE / 2, mAccBuf, 0, FFT_SIZE / 2);
 					mAccPos = FFT_SIZE / 2;
 				}
@@ -2699,12 +2352,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 		
 		private void computeFFT() {
-			// Применяем окно Ханна
 			for (int i = 0; i < FFT_SIZE; i++) {
 				mFftRe[i] = mAccBuf[i] * mWindow[i];
 				mFftIm[i] = 0f;
 			}
-			// Cooley-Tukey in-place radix-2 DIT FFT
 			int n = FFT_SIZE;
 			for (int i = 1, j = 0; i < n; i++) {
 				int bit = n >> 1;
@@ -2734,12 +2385,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					}
 				}
 			}
-			// Вычисляем амплитуду в дБ
 			synchronized (mLock) {
 				for (int i = 0; i < HALF; i++) {
 					float mag = (float) Math.sqrt(mFftRe[i]*mFftRe[i] + mFftIm[i]*mFftIm[i]) / (FFT_SIZE / 2f);
 					float db = mag > 1e-9f ? Math.max(-90f, (float)(20.0 * Math.log10(mag))) : -90f;
-					// Нормализуем 0..1 (от -90dB до 0dB)
 					float norm = (db + 90f) / 90f;
 					mMagnitude[i] = norm;
 					mSmooth[i] = Math.max(norm, mSmooth[i] * DECAY);
@@ -2754,19 +2403,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			final float w = getWidth(), h = getHeight();
 			if (w == 0 || h == 0) return;
 
-			// Фон полностью прозрачный — не рисуем ничего
-			// canvas.drawRect(0, 0, w, h, mBgPaint);
-
 			final float lblH = mLblPaint.getTextSize() + 4f;
-			final float barTop   = lblH;            // верхняя полоса зарезервирована под метки
-			final float barAreaH = h - barTop;      // высота зоны баров
+			final float barTop   = lblH;
+			final float barAreaH = h - barTop;
 
 			float[] freqMarks  = {50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000};
 			String[] freqLabels = {"50", "100", "200", "500", "1k", "2k", "5k", "10k", "20k"};
 			float fMin = (float) Math.log10(20.0);
 			float fMax = (float) Math.log10(SAMPLE_RATE / 2f);
 
-			// Сетка только в зоне баров (ниже полосы меток)
 			Paint gridPaint = new Paint();
 			gridPaint.setColor(0x44FFFFFF);
 			gridPaint.setStrokeWidth(0.8f);
@@ -2776,7 +2421,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				canvas.drawLine(xf, barTop, xf, h, gridPaint);
 			}
 
-			// Полосы спектра
 			float[] smooth, peaks;
 			synchronized (mLock) {
 				smooth = mSmooth.clone();
@@ -2817,7 +2461,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 
-			// ── Метки частот в верхней полосе (всегда видны) ───────────────
 			float labelY = lblH - 4f;
 			float prevLblRight = -1f;
 			mLblPaint.setTextAlign(Paint.Align.CENTER);
