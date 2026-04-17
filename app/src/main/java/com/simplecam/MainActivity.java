@@ -206,10 +206,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				float speed = (float) ((Math.exp(abs * 3.0) - 1.0) / (Math.exp(3.0) - 1.0)) * MAX_ZOOM_SPEED
 				* Math.signum(lever);
 				mZoomLevel = Math.max(1f, Math.min(mMaxZoom, mZoomLevel + speed));
-				buildAndSendRequest();
+				
 			}
-			if (mCamHandler != null)
-			mCamHandler.postDelayed(this, 33);
+			if (mCamHandler != null) {
+				buildAndSendRequest();
+				mCamHandler.postDelayed(this, 33);
+			}
 		}
 	};
 	
