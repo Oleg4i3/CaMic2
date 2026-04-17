@@ -181,7 +181,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private static final int   STAB_MAX_RADIUS = 12;    // макс. радиус поиска (stab-пикс.)
 	// STAB_MARGIN — фиксированный запас кропа (% при max агрессивности).
 	// Не зависит от zoom! Иначе каждый тик zoom-рычага меняет cropW → "дёргается зум".
-	private static final float STAB_MARGIN = 0.12f;
+	//private static final float STAB_MARGIN = 0.12f;
 	// Decay: насколько быстро накопитель "забывает" постоянный сдвиг (панорамирование).
 	private static final float STAB_DECAY  = 0.82f;
 	// Агрессивность 0..1 (слайдер). Влияет только на радиус поиска и силу коррекции,
