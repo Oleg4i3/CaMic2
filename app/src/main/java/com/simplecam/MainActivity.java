@@ -193,6 +193,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile float mStabAccumY = 0f;
 	// Флаг: первый кадр после изменения кропа — пропустить, т.к. prev снят иначе.
 	private volatile boolean mStabSkipNext = false;
+	
+	private volatile int mLastShiftX = 0;
+	private volatile int mLastShiftY = 0;
 	private byte[]           mStabPrevLuma = null;
 	private final Object     mStabLock     = new Object();
 	
@@ -1047,6 +1050,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					//   shiftX = -accumX * scaleX < 0 → кроп левее → изображение правее ✓
 					int shiftX = (int)(-accumX * scaleX);
 					int shiftY = (int)(-accumY * scaleY);
+					if (Math.abs(shiftX - mLastShiftX) > 1 || Math.abs(shiftY - mLastShiftY) > 1) {
+						synchronized (mStabLock) { mStabSkipNext = true; }
+						mLastShiftX = shiftX;
+						mLastShiftY = shiftY;
+					}
 
 					int centerX = mSensorRect.left + mSensorRect.width()  / 2;
 					int centerY = mSensorRect.top  + mSensorRect.height() / 2;
