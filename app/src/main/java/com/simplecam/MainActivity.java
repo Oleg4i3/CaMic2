@@ -1067,6 +1067,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
+			if (mDigitalStab) {
+				synchronized (mStabLock) {
+					mStabSkipNext = true;
+				}
+			}
 			} catch (Exception ignored) {
 		}
 	}
