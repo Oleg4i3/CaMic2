@@ -2649,8 +2649,10 @@ public class MainActivity extends Activity {
 				}
 
 				// ── Фазовая кросс-корреляция по обеим осям ──────────────────────
-				float rawDx = crossCorr1D(mPrevColProj, colProj, AW, FFT_W);
-				float rawDy = crossCorr1D(mPrevRowProj, rowProj, AH, FFT_H);
+				// rawCx — сдвиг вдоль оси столбцов сенсора (X сенсора, len=AW=320)
+				// rawRy — сдвиг вдоль оси строк    сенсора (Y сенсора, len=AH=180)
+				float rawCx = crossCorr1D(mPrevColProj, colProj, AW, FFT_W);
+				float rawRy = crossCorr1D(mPrevRowProj, rowProj, AH, FFT_H);
 
 				// Медленно обновляем опору (drift compensation)
 				for (int i = 0; i < AW; i++)
@@ -2658,15 +2660,40 @@ public class MainActivity extends Activity {
 				for (int i = 0; i < AH; i++)
 					mPrevRowProj[i] = mPrevRowProj[i] * (1f - REF_UPDATE) + rowProj[i] * REF_UPDATE;
 
+				// ── Перевод «сенсорный сдвиг» → «дисплейный сдвиг» ─────────────
+				// ImageReader выдаёт кадры в системе координат сенсора (без поворота).
+				// При mSensorOrientation=90°:  X_сенсора ↔ Y_дисплея, Y_сенсора ↔ X_дисплея
+				// При mSensorOrientation=270°: то же, но с инверсией одной оси
+				// При mSensorOrientation=0/180: оси совпадают (180° = инверсия обеих)
+				float rawDx, rawDy; // сдвиг уже в осях дисплея (единицы: пикс. анализа)
+				int so = mSensorOrientation;
+				if (so == 90) {
+					rawDx =  rawRy;  // sensor Y → display X
+					rawDy = -rawCx;  // sensor X → display Y (инвертируем направление)
+				} else if (so == 270) {
+					rawDx = -rawRy;
+					rawDy =  rawCx;
+				} else if (so == 180) {
+					rawDx = -rawCx;
+					rawDy = -rawRy;
+				} else { // 0°
+					rawDx =  rawCx;
+					rawDy =  rawRy;
+				}
+
 				// ── IIR-фильтр сдвига ────────────────────────────────────────────
 				mAccDx = mAccDx * DECAY + rawDx;
 				mAccDy = mAccDy * DECAY + rawDy;
 
 				// ── Масштабируем в пиксели TextureView и применяем ──────────────
+				// После учёта ориентации rawDx → ось X дисплея, rawDy → ось Y дисплея.
+				// Длины проекций после swap: для X — AH (180 стр.), для Y — AW (320 стлб.)
+				// (при 0/180° наоборот: X←AW, Y←AH)
 				float tvW = mTv != null && mTv.getWidth()  > 0 ? mTv.getWidth()  : VIDEO_W;
 				float tvH = mTv != null && mTv.getHeight() > 0 ? mTv.getHeight() : VIDEO_H;
-				float scaleX = tvW / AW;
-				float scaleY = tvH / AH;
+				boolean swapped = (so == 90 || so == 270);
+				float scaleX = tvW / (swapped ? AH : AW);
+				float scaleY = tvH / (swapped ? AW : AH);
 				float maxDx  = tvW * MAX_SHIFT_FRAC;
 				float maxDy  = tvH * MAX_SHIFT_FRAC;
 
