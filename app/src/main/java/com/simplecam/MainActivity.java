@@ -1935,7 +1935,10 @@ public class MainActivity extends Activity {
 				android.graphics.Rect src = new android.graphics.Rect(l, t, r, b);
 				
 				Bitmap dst = Bitmap.createBitmap(r - l, b - t, Bitmap.Config.ARGB_8888);
-				android.view.PixelCopy.request(mTv, src, dst, result -> {
+				// PixelCopy не принимает TextureView напрямую — используем Surface
+				Surface pvSurf = mPreviewSurface;
+				if (pvSurf == null || !pvSurf.isValid()) return;
+				android.view.PixelCopy.request(pvSurf, src, dst, result -> {
 					if (result == android.view.PixelCopy.SUCCESS) {
 						mBmp = dst;
 						postInvalidate();
