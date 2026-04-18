@@ -60,6 +60,10 @@ public class MainActivity extends Activity {
 	private CheckBox mCbDigiStab;
 	private DigitalStabilizer mStab;
 	private ImageReader mStabReader; // ImageReader для анализа кадров
+	// Смещение кропа сенсора для стабилизации (в пикселях сенсора).
+	// Устанавливается DigitalStabilizer, читается в buildAndSendRequest.
+	private volatile int mStabCropDx = 0;
+	private volatile int mStabCropDy = 0;
 	private final android.os.Handler mUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 	private Spinner mSpinner;
 	private VerticalSeekBar mSeekGain;
@@ -991,11 +995,27 @@ public class MainActivity extends Activity {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
-				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
-				int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
-				int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
-				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+				// При включённой стабилизации зумируем на (1 + 2*MAX_SHIFT_FRAC),
+				// чтобы зарезервировать поле для смещения кропа по ±MAX_SHIFT_FRAC.
+				float stabMargin = mDigiStabEnabled
+					? (1f + 2f * DigitalStabilizer.MAX_SHIFT_FRAC)
+					: 1f;
+				float effectiveZoom = Math.min(mZoomLevel * stabMargin, mMaxZoom);
+				int cropW = Math.max(1, (int) (mSensorRect.width()  / effectiveZoom));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / effectiveZoom));
+				// Базовый центр кропа (без стабилизации)
+				int baseCropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
+				int baseCropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2;
+				// Добавляем смещение стабилизатора
+				int cropX = baseCropX + (mDigiStabEnabled ? mStabCropDx : 0);
+				int cropY = baseCropY + (mDigiStabEnabled ? mStabCropDy : 0);
+				// Ограничиваем сенсорными границами
+				cropX = Math.max(mSensorRect.left,
+					Math.min(mSensorRect.right  - cropW, cropX));
+				cropY = Math.max(mSensorRect.top,
+					Math.min(mSensorRect.bottom - cropH, cropY));
+				rb.set(CaptureRequest.SCALER_CROP_REGION,
+					new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -2591,9 +2611,9 @@ public class MainActivity extends Activity {
 		}
 	}
 
-	// ─── Применение стабилизационного сдвига к SurfaceView ──────────────────
-	// SurfaceView не поддерживает setTransform, поэтому используем setTranslationX/Y.
-	// Чёрные полосы по краям — это фон корневого FrameLayout (Color.BLACK).
+	// ─── Сброс визуального сдвига SurfaceView ───────────────────────────────
+	// Вызывается только при выключении стабилизации (dx=dy=0).
+	// Сама стабилизация работает через SCALER_CROP_REGION, а не через этот метод.
 	private void applyStabTransform(float dx, float dy) {
 		mUiHandler.post(() -> {
 			if (mSv == null) return;
@@ -2696,31 +2716,49 @@ public class MainActivity extends Activity {
 				mSmoothX = SMOOTH * mSmoothX + (1f - SMOOTH) * mCamPosX;
 				mSmoothY = SMOOTH * mSmoothY + (1f - SMOOTH) * mCamPosY;
 
-				// ── Компенсируем высокочастотную составляющую (тряска) ───────────
-				// errX = разница: реальная позиция - желаемая (сглаженная)
+				// ── Компенсация через SCALER_CROP_REGION ───────────────────────────
+				// errX/Y — высокочастотное дрожание в единицах анализ-разрешения (AW×AH).
+				// Переводим в пиксели сенсора с учётом текущего кропа.
 				float errX = mCamPosX - mSmoothX;
 				float errY = mCamPosY - mSmoothY;
 
-				float svW = mSv != null && mSv.getWidth()  > 0 ? mSv.getWidth()  : VIDEO_W;
-				float svH = mSv != null && mSv.getHeight() > 0 ? mSv.getHeight() : VIDEO_H;
-				float maxDx = svW * MAX_SHIFT_FRAC;
-				float maxDy = svH * MAX_SHIFT_FRAC;
+				if (mSensorRect != null) {
+					// Размер кропа при effectiveZoom (с учётом stab margin)
+					float stabZoom = Math.min(
+						mZoomLevel * (1f + 2f * MAX_SHIFT_FRAC), mMaxZoom);
+					float cropW_s = mSensorRect.width()  / stabZoom;
+					float cropH_s = mSensorRect.height() / stabZoom;
 
-				// dispDx = -errX: если камера дёрнулась вправо, сдвигаем вью влево
-				float dispDx = Math.max(-maxDx, Math.min(maxDx, -errX * svW / AW));
-				float dispDy = Math.max(-maxDy, Math.min(maxDy, -errY * svH / AH));
-				applyStabTransform(dispDx, dispDy);
+					// Максимальный сдвиг кропа = MAX_SHIFT_FRAC от его размера
+					int maxOffX = (int)(cropW_s * MAX_SHIFT_FRAC);
+					int maxOffY = (int)(cropH_s * MAX_SHIFT_FRAC);
+
+					// -errX: камера дёрнулась вправо → кроп смещаем влево
+					mStabCropDx = (int) Math.max(-maxOffX,
+						Math.min(maxOffX, -errX * cropW_s / AW));
+					mStabCropDy = (int) Math.max(-maxOffY,
+						Math.min(maxOffY, -errY * cropH_s / AH));
+				}
+
+				// Отправляем обновлённый CaptureRequest на тот же mCamHandler.
+				// post() ставит задачу ПОСЛЕ возврата из onFrame — нет рекурсии.
+				if (mCamHandler != null)
+					mCamHandler.post(MainActivity.this::buildAndSendRequest);
 
 			} finally {
 				img.close();
 			}
 		}
 
-		/** Сбрасывает интегратор и опорный кадр. */
+		/** Сбрасывает интегратор, опорный кадр и смещение кропа. */
 		void reset() {
 			mHasRef  = false;
 			mCamPosX = 0f; mCamPosY = 0f;
 			mSmoothX = 0f; mSmoothY = 0f;
+			mStabCropDx = 0; mStabCropDy = 0;
+			// Возвращаем кроп в нейтральное положение
+			if (mCamHandler != null)
+				mCamHandler.post(MainActivity.this::buildAndSendRequest);
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
