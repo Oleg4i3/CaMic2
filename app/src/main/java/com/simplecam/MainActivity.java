@@ -888,46 +888,46 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				return;
 			}
 			// ── Пересчёт сдвига в пиксели сенсора ───────────────────────────
-			// tauX > 0 → B смещён ВПРАВО → камера пошла вправо → dx > 0.
-			// effZoom учитывает доп. кроп стабилизатора.
-			// При aggr=1.0: extra=3.5 → поле ±36% ширины (очень агрессивно).
-			float extra = mStabCrop ? (1f + mStabAggr * 2.5f) : 1f;
+			// tauX > 0 → контент в B сдвинут влево → камера пошла вправо.
+			// extra: запас для кропа — небольшой (1.10..1.20×), не «зум-актор».
+			float extra = mStabCrop ? (1.10f + mStabAggr * 0.10f) : 1f;
 			float effZoom = mZoomLevel * extra;
 			float cropW = mSensorRect != null ? mSensorRect.width()  / effZoom : iw;
 			float cropH = mSensorRect != null ? mSensorRect.height() / effZoom : ih;
-			// dx = движение камеры в пикселях сенсора; + = вправо
+			// dx = движение камеры в пикселях сенсора (в системе текущего кропа).
 			float dx = tauX * cropW / iw;
 			float dy = tauY * cropH / ih;
 
-			// ── Правильная LPF-стабилизация ────────────────────────────────
-			// cumX = сырая накопленная позиция камеры (куда она фактически смотрит)
-			// smoothedX = LPF(cumX) = куда камера «хочет» смотреть
-			// stabX = smoothed - cum = -(shake) → это и есть нужная коррекция.
-			// При резком прыжке вправо: cum растёт, smooth не успевает
-			// → stabX < 0 → cropX уменьшается → кроп идёт влево → компенсирует ✓
+			// ── Leaky integrator (правильная архитектура для feedback-loop) ─
 			//
-			// alpha зависит от слайдера: 0%→0.80 (мягко), 100%→0.98 (агрессивно).
-			// τ = -1/ln(alpha)/fps: при alpha=0.80 τ≈0.15с, при alpha=0.98 τ≈1.6с.
-			float alpha = 0.80f + mStabAggr * 0.18f;
-			mCumX += dx;
-			mCumY += dy;
-			mSmoothedX = alpha * mSmoothedX + (1f - alpha) * mCumX;
-			mSmoothedY = alpha * mSmoothedY + (1f - alpha) * mCumY;
-			float rawX = mSmoothedX - mCumX;
-			float rawY = mSmoothedY - mCumY;
+			// ПОЧЕМУ накопитель+LPF (старый подход) НЕ РАБОТАЕТ:
+			// ImageReader читает из того же кропа, к которому применена коррекция.
+			// После применения correction кадр K+1 показывает tauX≈0 (мы уже
+			// исправили смещение). Накопитель видит нулевое движение → LPF
+			// догоняет cum → rawX→0 → коррекция откатывается. Эффект нулевой.
+			//
+			// Leaky integrator вместо этого: tauX — это ОСТАТОЧНАЯ ошибка
+			// (сколько кроп не успел исправить). Интегратор с утечкой накапливает
+			// ошибку и автоматически пропускает медленный намеренный паннинг.
+			//
+			// decay: 0%→0.85 (только быстрая дрожь), 100%→0.97 (агрессивно).
+			float decay = 0.85f + mStabAggr * 0.12f;
+			// dx>0: камера вправо → кроп должен идти влево → stabX уменьшается
+			mStabX = mStabX * decay - dx;
+			mStabY = mStabY * decay - dy;
 
-			// ── Клампинг к доступному полю ──────────────────────────────────
+			// ── Клампинг к доступному полю (запас от extra-zoom) ────────────
 			if (mSensorRect != null) {
 				float baseW = mSensorRect.width()  / mZoomLevel;
 				float baseH = mSensorRect.height() / mZoomLevel;
-				float maxDx = mStabCrop ? (baseW - cropW) / 2f : mStabAggr * baseW * 0.08f;
-				float maxDy = mStabCrop ? (baseH - cropH) / 2f : mStabAggr * baseH * 0.08f;
-				mStabX = Math.max(-maxDx, Math.min(maxDx, rawX));
-				mStabY = Math.max(-maxDy, Math.min(maxDy, rawY));
-				// Anti-windup: если зажали клампом, сдвигаем cum чтобы не копить ошибку
-				if (Math.abs(rawX) > maxDx) mCumX = mSmoothedX - Math.signum(rawX)*maxDx;
-				if (Math.abs(rawY) > maxDy) mCumY = mSmoothedY - Math.signum(rawY)*maxDy;
-			} else { mStabX = rawX; mStabY = rawY; }
+				float maxDx = (baseW - cropW) / 2f; // половина разницы = доступный сдвиг
+				float maxDy = (baseH - cropH) / 2f;
+				mStabX = Math.max(-maxDx, Math.min(maxDx, mStabX));
+				mStabY = Math.max(-maxDy, Math.min(maxDy, mStabY));
+			} else {
+				mStabX = Math.max(-50f, Math.min(50f, mStabX));
+				mStabY = Math.max(-50f, Math.min(50f, mStabY));
+			}
 			mStabPrev = patch;
 			if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
 		} catch (Exception e) {
@@ -1250,9 +1250,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				// effZoom: та же формула что в processStabFrame — ОБЯЗАТЕЛЬНО согласованы
+				// extra: тот же запас что в processStabFrame — 1.10..1.20× (не «зум-актор»)
 				float extraZoom = (mStabEnabled && mStabCrop)
-					? 1f + mStabAggr * 2.5f // aggr=0→×1, aggr=0.5→×2.25, aggr=1→×3.5
+					? 1.10f + mStabAggr * 0.10f
 					: 1f;
 				float effZoom = mZoomLevel * extraZoom;
 				int cropW = Math.max(1, (int)(mSensorRect.width()  / effZoom));
