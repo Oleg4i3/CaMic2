@@ -41,7 +41,7 @@ import java.util.concurrent.TimeUnit;
 * Справа — рычаг Zoom + появляющийся слайдер Manual Focus.
 * Снизу — панель управления с круглой кнопкой REC.
 */
-public class MainActivity extends Activity implements SurfaceHolder.Callback {
+public class MainActivity extends Activity {
 	
 	// ─── Константы ────────────────────────────────────────────────────────────
 	private static final int VIDEO_W = 1280;
@@ -53,7 +53,15 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private static final float MAX_ZOOM_SPEED = 0.08f;
 	
 	// ─── UI ───────────────────────────────────────────────────────────────────
-	private SurfaceView mSv;
+	private TextureView mTv;         // TextureView вместо SurfaceView
+	private Surface mPreviewSurface; // создаётся из SurfaceTexture TextureView
+
+	// ─── Digital Stabilization ───────────────────────────────────────────────
+	private volatile boolean mDigiStabEnabled = false;
+	private CheckBox mCbDigiStab;
+	private DigitalStabilizer mStab;
+	private ImageReader mStabReader; // ImageReader для анализа кадров
+	private final android.os.Handler mUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 	private Spinner mSpinner;
 	private VerticalSeekBar mSeekGain;
 	private FocusDrumView mFocusDrum; // барабан ручного фокуса
@@ -165,35 +173,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private int mEvMin = -6, mEvMax = 6;
 	private SeekBar mSeekEv;
 	private TextView mTvEv;
-
-	// ═══════════════════════════════════════════════════════════════════════════
-	// Цифровая стабилизация (фазо-корреляционный метод)
-	// ═══════════════════════════════════════════════════════════════════════════
-	private static final int   STAB_W    = 256;   // ширина патча (степень 2)
-	private static final int   STAB_H    = 256;   // высота патча (степень 2)
-	private static final int   STAB_IW   = 640;   // ширина ImageReader
-	private static final int   STAB_IH   = 480;   // высота ImageReader
-// STAB_ALPHA: коэффициент сглаживания LPF на позиции, τ ≈ 0.5 с при 30 fps
-	private static final float STAB_ALPHA = 0.94f;
-
-	private volatile boolean mStabEnabled = false;
-	private volatile boolean mStabCrop    = true;
-	private volatile float   mStabAggr    = 0.4f;  // 0..1  (40% по умолчанию)
-	// Правильная LPF-стабилизация: накоп. позиция + сглаженная позиция
-	private float mCumX = 0f, mCumY = 0f;           // сырая накопленная позиция камеры
-	private float mSmoothedX = 0f, mSmoothedY = 0f; // LPF(позиция) = куда хочет смотреть камера
-	private volatile float mStabX = 0f, mStabY = 0f;// коррекция = smoothed - cum  ← идёт в crop
-	private float[] mStabPrev = null;    // лума-патч предыдущего кадра
-	private ImageReader mStabReader;
-	private HandlerThread mStabThread;
-	private Handler mStabHandler;
-	private CheckBox mCbStabSpec; // ссылка на чекбокс spectrum, чтобы выключать
-	// Рабочие массивы FFT (без выделения памяти на каждый кадр)
-	private final float[] mFftReA = new float[STAB_W * STAB_H];
-	private final float[] mFftImA = new float[STAB_W * STAB_H];
-	private final float[] mFftReB = new float[STAB_W * STAB_H];
-	private final float[] mFftImB = new float[STAB_W * STAB_H];
-	private final float[] mHann   = new float[STAB_W * STAB_H];
 	
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
 	private final Runnable mZoomRunnable = new Runnable() {
@@ -223,7 +202,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
 		mFocusAssistHandler = new Handler(Looper.getMainLooper());
 		setContentView(buildLayout());
-		initHannWindow();
 		mCamMgr = (CameraManager) getSystemService(CAMERA_SERVICE);
 		showAirplaneModeReminder();
 		checkPerms();
@@ -242,9 +220,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (mCamHandler != null)
 		mCamHandler.removeCallbacks(mZoomRunnable);
 		mVidLoopRunning = false;
-		stopStabReader();
 		stopAudio();
 		finalizeMuxer();
+		if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
@@ -270,7 +248,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		root.setBackgroundColor(Color.BLACK);
 		
 		// Превью — сохраняем пропорции 16:9, центрируем в root
-		mSv = new SurfaceView(this) {
+		mTv = new TextureView(this) {
 			@Override
 			protected void onMeasure(int wMs, int hMs) {
 				int w = MeasureSpec.getSize(wMs);
@@ -288,11 +266,27 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				}
 			}
 		};
-		mSv.getHolder().addCallback(this);
+		mTv.setSurfaceTextureListener(new TextureView.SurfaceTextureListener() {
+			@Override
+			public void onSurfaceTextureAvailable(android.graphics.SurfaceTexture st, int w, int h) {
+				st.setDefaultBufferSize(VIDEO_W, VIDEO_H);
+				mPreviewSurface = new Surface(st);
+				mSurfaceReady = true;
+				if (mPermsOk) openCamera();
+			}
+			@Override public void onSurfaceTextureSizeChanged(android.graphics.SurfaceTexture st, int w, int h) {}
+			@Override
+			public boolean onSurfaceTextureDestroyed(android.graphics.SurfaceTexture st) {
+				mSurfaceReady = false;
+				if (mPreviewSurface != null) { mPreviewSurface.release(); mPreviewSurface = null; }
+				return true;
+			}
+			@Override public void onSurfaceTextureUpdated(android.graphics.SurfaceTexture st) {}
+		});
 		FrameLayout.LayoutParams svLP = new FrameLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 		svLP.gravity = Gravity.CENTER;
-		root.addView(mSv, svLP);
+		root.addView(mTv, svLP);
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -507,7 +501,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		});
 
 		CheckBox mCbSpec = new CheckBox(this);
-		mCbStabSpec = mCbSpec; // ссылка для авто-выключения при stab
 		mCbSpec.setText("Spectrum");
 		mCbSpec.setTextColor(0xCCCCCCCC); mCbSpec.setTextSize(11);
 		mCbSpec.setChecked(true);
@@ -528,6 +521,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbFocusAssist.setTextColor(0xCCCCCCCC); mCbFocusAssist.setTextSize(11);
 		mCbFocusAssist.setVisibility(View.GONE);
 		leftCol.addView(mCbFocusAssist);
+
+		// — Digital Stabilization —
+		mCbDigiStab = new CheckBox(this);
+		mCbDigiStab.setText("Digital stab");
+		mCbDigiStab.setTextColor(0xCCCCCCCC); mCbDigiStab.setTextSize(11);
+		mCbDigiStab.setChecked(false);
+		mCbDigiStab.setOnCheckedChangeListener((cb, checked) -> {
+			mDigiStabEnabled = checked;
+			if (!checked) {
+				// Сбрасываем накопленный сдвиг и убираем трансформацию
+				if (mStab != null) mStab.reset();
+				applyStabTransform(0f, 0f);
+			}
+		});
+		leftCol.addView(mCbDigiStab);
 
 		// — Pre-buffer: чекбокс + слайдер 1..5 с —
 		CheckBox cbPB = new CheckBox(this);
@@ -595,64 +603,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
 		rightSettings.addView(bpsRow);
-
-		// — Стабилизация —
-		CheckBox cbStab = new CheckBox(this);
-		cbStab.setText("Stab");
-		cbStab.setTextColor(0xCCCCCCCC); cbStab.setTextSize(11);
-		cbStab.setChecked(false);
-
-		// Панель опций стабилизации (скрыта пока stab выкл)
-		LinearLayout stabOpts = new LinearLayout(this);
-		stabOpts.setOrientation(LinearLayout.VERTICAL);
-		stabOpts.setVisibility(View.GONE);
-
-		CheckBox cbCrop = new CheckBox(this);
-		cbCrop.setText("Crop");
-		cbCrop.setTextColor(0xCCCCCCCC); cbCrop.setTextSize(11);
-		cbCrop.setChecked(true);
-		cbCrop.setOnCheckedChangeListener((cb2, on) -> mStabCrop = on);
-
-		final TextView tvAggr = smallLabel("40%");
-		SeekBar sbAggr = new SeekBar(this);
-		sbAggr.setMax(100); sbAggr.setProgress(40); // 40% по умолчанию
-		sbAggr.setLayoutParams(new LinearLayout.LayoutParams(
-			0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-		sbAggr.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mStabAggr = p / 100f;
-				tvAggr.setText(p + "%");
-			}
-			public void onStartTrackingTouch(SeekBar s) {}
-			public void onStopTrackingTouch(SeekBar s) {}
-		});
-		LinearLayout aggrRow = new LinearLayout(this);
-		aggrRow.setOrientation(LinearLayout.HORIZONTAL);
-		aggrRow.setGravity(Gravity.CENTER_VERTICAL);
-		aggrRow.addView(smallLabel("Aggr "));
-		aggrRow.addView(sbAggr); aggrRow.addView(tvAggr);
-
-		stabOpts.addView(cbCrop);
-		stabOpts.addView(aggrRow);
-
-		// Spectrum checkbox — нужна ссылка чтобы авто-выключать
-		// (mCbStabSpec устанавливается в левой колонке)
-		cbStab.setOnCheckedChangeListener((cb2, on) -> {
-			mStabEnabled = on;
-			stabOpts.setVisibility(on ? View.VISIBLE : View.GONE);
-			if (!on) { mStabX=0f; mStabY=0f; mCumX=0f; mCumY=0f; mSmoothedX=0f; mSmoothedY=0f; mStabPrev=null; }
-			// Авто-выключаем спектр-анализатор при включении stab
-			if (mCbStabSpec != null) mCbStabSpec.setChecked(!on);
-			// Пересоздаём камера-сессию (добавить/убрать ImageReader)
-			if (mCamHandler != null) mCamHandler.post(() -> {
-				stopStabReader();
-				if (on) startStabReader();
-				startPreview();
-			});
-		});
-
-		rightSettings.addView(cbStab);
-		rightSettings.addView(stabOpts);
 
 		mAudioSrcPanel.addView(rightSettings);
 
@@ -777,227 +727,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		if (mTvEv == null) return;
 		runOnUiThread(() -> mTvEv.setText(ev == 0 ? "EV  0" : String.format("EV %+d", ev)));
 	}
-
-	// =========================================================================
-	// Цифровая стабилизация
-	// =========================================================================
-
-	/** Предвычисляем 2D Hann-окно один раз. */
-	private void initHannWindow() {
-		for (int y = 0; y < STAB_H; y++) {
-			float wy = 0.5f * (1f - (float) Math.cos(2.0 * Math.PI * y / (STAB_H - 1)));
-			for (int x = 0; x < STAB_W; x++) {
-				float wx = 0.5f * (1f - (float) Math.cos(2.0 * Math.PI * x / (STAB_W - 1)));
-				mHann[y * STAB_W + x] = wx * wy;
-			}
-		}
-	}
-
-	/** Создаёт ImageReader и запускает поток обработки. */
-	private void startStabReader() {
-		if (mStabThread != null) return;
-		try {
-			mStabThread = new HandlerThread("stab");
-			mStabThread.start();
-			mStabHandler = new Handler(mStabThread.getLooper());
-			mStabReader = ImageReader.newInstance(STAB_IW, STAB_IH,
-					android.graphics.ImageFormat.YUV_420_888, 2);
-			mStabReader.setOnImageAvailableListener(this::processStabFrame, mStabHandler);
-		} catch (Exception e) {
-			stopStabReader();
-			status("Stab init error: " + e.getMessage());
-		}
-	}
-
-	/** Останавливает стаб-поток и закрывает ImageReader. */
-	private void stopStabReader() {
-		mStabPrev = null;
-		mStabX = 0f; mStabY = 0f;
-		mCumX = 0f; mCumY = 0f;
-		mSmoothedX = 0f; mSmoothedY = 0f;
-		if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
-		if (mStabThread != null) { mStabThread.quitSafely(); mStabThread = null; mStabHandler = null; }
-	}
-
-	/**
-	 * Обрабатывает кадр из ImageReader:
-	 * 1. Вырезает центральный патч STAB_W×STAB_H лума-плоскости.
-	 * 2. Применяет 2D Hann-окно.
-	 * 3. Фазовая кросс-корреляция с предыдущим патчем.
-	 * 4. Аргмакс → сдвиг в координатах патча → пересчёт в пикселях сенсора.
-	 * 5. EMA-фильтр → обновляет mStabX/Y → buildAndSendRequest().
-	 *
-	 * Знаки: τx < 0 → B смещён влево относительно A → камера пошла вправо.
-	 * Компенсация: cropX += (-τx) * scale (смещаем кроп вправо вслед за камерой).
-	 * Это отрицательная обратная связь: корректный знак ✓
-	 */
-	private void processStabFrame(ImageReader reader) {
-		if (!mStabEnabled) { try { Image ig = reader.acquireLatestImage(); if(ig!=null) ig.close(); } catch(Exception ignored){} return; }
-		Image img = null;
-		try {
-			img = reader.acquireLatestImage();
-			if (img == null) return;
-			Image.Plane yp = img.getPlanes()[0];
-			java.nio.ByteBuffer yBuf = yp.getBuffer();
-			int rowStride = yp.getRowStride();
-			int iw = img.getWidth(), ih = img.getHeight();
-			// Вырезаем центральный патч
-			int sx = (iw - STAB_W) / 2, sy = (ih - STAB_H) / 2;
-			float[] patch = new float[STAB_W * STAB_H];
-			for (int y = 0; y < STAB_H; y++) {
-				for (int x = 0; x < STAB_W; x++) {
-					patch[y * STAB_W + x] =
-						(yBuf.get((sy + y) * rowStride + (sx + x)) & 0xFF) / 255f;
-				}
-			}
-			// Hann-окно
-			for (int i = 0; i < STAB_W * STAB_H; i++) patch[i] *= mHann[i];
-			if (mStabPrev == null) { mStabPrev = patch; return; }
-
-			// --- Фазовая кросс-корреляция ---
-			System.arraycopy(mStabPrev, 0, mFftReA, 0, STAB_W * STAB_H);
-			Arrays.fill(mFftImA, 0f);
-			System.arraycopy(patch,    0, mFftReB, 0, STAB_W * STAB_H);
-			Arrays.fill(mFftImB, 0f);
-			stabFft2d(mFftReA, mFftImA, false);
-			stabFft2d(mFftReB, mFftImB, false);
-			// C = A * conj(B) / |A * conj(B)| (нормированный фазовый спектр)
-			for (int i = 0; i < STAB_W * STAB_H; i++) {
-				float cRe = mFftReA[i]*mFftReB[i] + mFftImA[i]*mFftImB[i];
-				float cIm = mFftImA[i]*mFftReB[i] - mFftReA[i]*mFftImB[i];
-				float mag = (float) Math.sqrt(cRe*cRe + cIm*cIm);
-				if (mag > 1e-9f) { cRe /= mag; cIm /= mag; }
-				mFftReA[i] = cRe; mFftImA[i] = cIm;
-			}
-			stabFft2d(mFftReA, mFftImA, true); // IFFT
-			// Аргмакс в корреляционной поверхности
-			int peakIdx = 0; float peakVal = mFftReA[0];
-			for (int i = 1; i < STAB_W * STAB_H; i++)
-				if (mFftReA[i] > peakVal) { peakVal = mFftReA[i]; peakIdx = i; }
-			int px = peakIdx % STAB_W, py = peakIdx / STAB_W;
-			// Разворачиваем циклический сдвиг в [-N/2, N/2)
-			int tauX = px > STAB_W/2 ? px - STAB_W : px;
-			int tauY = py > STAB_H/2 ? py - STAB_H : py;
-			// Отсекаем выбросы по агрессивности (отказ от корреляции при слишком большом сдвиге)
-			// maxTau: максимально допустимый сдвиг между кадрами в пикселях патча.
-			// Слишком большой → выброс (непригодный кадр: резкий поворот, потеря корреляции).
-			// 30..120 пикс. в 256px патче = 12%..47% ширины.
-			int maxTau = (int)(mStabAggr * 90) + 30;
-			if (Math.abs(tauX) > maxTau || Math.abs(tauY) > maxTau) {
-				// Не обновляем mStabPrev — следующий кадр сравнивается с «надёжным»
-				return;
-			}
-			// ── Пересчёт сдвига в пиксели сенсора ───────────────────────────
-			// tauX > 0 → контент в B сдвинут влево → камера пошла вправо.
-			// extra: запас для кропа — небольшой (1.10..1.20×), не «зум-актор».
-			float extra = mStabCrop ? (1.10f + mStabAggr * 0.10f) : 1f;
-			float effZoom = mZoomLevel * extra;
-			float cropW = mSensorRect != null ? mSensorRect.width()  / effZoom : iw;
-			float cropH = mSensorRect != null ? mSensorRect.height() / effZoom : ih;
-			// dx = движение камеры в пикселях сенсора (в системе текущего кропа).
-			float dx = tauX * cropW / iw;
-			float dy = tauY * cropH / ih;
-
-			// ── Leaky integrator (правильная архитектура для feedback-loop) ─
-			//
-			// ПОЧЕМУ накопитель+LPF (старый подход) НЕ РАБОТАЕТ:
-			// ImageReader читает из того же кропа, к которому применена коррекция.
-			// После применения correction кадр K+1 показывает tauX≈0 (мы уже
-			// исправили смещение). Накопитель видит нулевое движение → LPF
-			// догоняет cum → rawX→0 → коррекция откатывается. Эффект нулевой.
-			//
-			// Leaky integrator вместо этого: tauX — это ОСТАТОЧНАЯ ошибка
-			// (сколько кроп не успел исправить). Интегратор с утечкой накапливает
-			// ошибку и автоматически пропускает медленный намеренный паннинг.
-			//
-			// decay: 0%→0.85 (только быстрая дрожь), 100%→0.97 (агрессивно).
-			float decay = 0.85f + mStabAggr * 0.12f;
-			// dx>0: камера вправо → кроп должен идти влево → stabX уменьшается
-			mStabX = mStabX * decay - dx;
-			mStabY = mStabY * decay - dy;
-
-			// ── Клампинг к доступному полю (запас от extra-zoom) ────────────
-			if (mSensorRect != null) {
-				float baseW = mSensorRect.width()  / mZoomLevel;
-				float baseH = mSensorRect.height() / mZoomLevel;
-				float maxDx = (baseW - cropW) / 2f; // половина разницы = доступный сдвиг
-				float maxDy = (baseH - cropH) / 2f;
-				mStabX = Math.max(-maxDx, Math.min(maxDx, mStabX));
-				mStabY = Math.max(-maxDy, Math.min(maxDy, mStabY));
-			} else {
-				mStabX = Math.max(-50f, Math.min(50f, mStabX));
-				mStabY = Math.max(-50f, Math.min(50f, mStabY));
-			}
-			mStabPrev = patch;
-			if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
-		} catch (Exception e) {
-			// молча игнорируем (например, IllegalStateException при закрытии)
-		} finally {
-			if (img != null) try { img.close(); } catch (Exception ignored) {}
-		}
-	}
-
-	// ── 2D FFT (фазовая корреляция, in-place) ─────────────────────────────────
-
-	/**
-	 * 2D FFT/IFFT на квадратном массиве STAB_W × STAB_H.
-	 * Строки: 1D FFT stride=1; столбцы: транспозиция + 1D FFT stride=1 + транспозиция.
-	 */
-	private void stabFft2d(float[] re, float[] im, boolean inv) {
-		// FFT по строкам
-		for (int r = 0; r < STAB_H; r++)
-			stabFft1d(re, im, r * STAB_W, 1, STAB_W, inv);
-		// Транспозиция (квадратная матрица)
-		for (int i = 0; i < STAB_H; i++) for (int j = i+1; j < STAB_W; j++) {
-			int a = i*STAB_W+j, b = j*STAB_W+i;
-			float t; t=re[a]; re[a]=re[b]; re[b]=t; t=im[a]; im[a]=im[b]; im[b]=t;
-		}
-		// FFT по столбцам (теперь строки после транспозиции)
-		for (int r = 0; r < STAB_W; r++)
-			stabFft1d(re, im, r * STAB_H, 1, STAB_H, inv);
-		// Транспозиция обратно
-		for (int i = 0; i < STAB_H; i++) for (int j = i+1; j < STAB_W; j++) {
-			int a = i*STAB_W+j, b = j*STAB_W+i;
-			float t; t=re[a]; re[a]=re[b]; re[b]=t; t=im[a]; im[a]=im[b]; im[b]=t;
-		}
-		if (inv) {
-			float s = 1f / (STAB_W * STAB_H);
-			for (int i = 0; i < STAB_W*STAB_H; i++) { re[i]*=s; im[i]*=s; }
-		}
-	}
-
-	/** Cooley-Tukey radix-2 in-place FFT. off=начало, stride=шаг, n=длина (степень 2). */
-	private static void stabFft1d(float[] re, float[] im, int off, int stride, int n, boolean inv) {
-		// Бит-реверсивная перестановка
-		for (int i = 1, j = 0; i < n; i++) {
-			int bit = n >> 1;
-			for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-			j ^= bit;
-			if (i < j) {
-				int ai = off+i*stride, aj = off+j*stride;
-				float t; t=re[ai]; re[ai]=re[aj]; re[aj]=t; t=im[ai]; im[ai]=im[aj]; im[aj]=t;
-			}
-		}
-		// Бабочки
-		for (int len = 2; len <= n; len <<= 1) {
-			double ang = (inv ? 2.0 : -2.0) * Math.PI / len;
-			float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
-			for (int i = 0; i < n; i += len) {
-				float curRe = 1f, curIm = 0f;
-				for (int k = 0; k < len/2; k++) {
-					int ui = off+(i+k)*stride, vi = off+(i+k+len/2)*stride;
-					float uRe=re[ui], uIm=im[ui];
-					float vRe=re[vi]*curRe - im[vi]*curIm;
-					float vIm=re[vi]*curIm + im[vi]*curRe;
-					re[ui]=uRe+vRe; im[ui]=uIm+vIm;
-					re[vi]=uRe-vRe; im[vi]=uIm-vIm;
-					float nRe=curRe*wRe-curIm*wIm;
-					curIm=curRe*wIm+curIm*wRe; curRe=nRe;
-				}
-			}
-		}
-	}
-
 	
 	// ── Helpers ───────────────────────────────────────────────────────────────
 	
@@ -1098,26 +827,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 	
 	// =========================================================================
-	// SurfaceHolder.Callback
-	// =========================================================================
-	
-	@Override
-	public void surfaceCreated(SurfaceHolder h) {
-		mSurfaceReady = true;
-		if (mPermsOk)
-		openCamera();
-	}
-	
-	@Override
-	public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {
-	}
-	
-	@Override
-	public void surfaceDestroyed(SurfaceHolder h) {
-		mSurfaceReady = false;
-	}
-	
-	// =========================================================================
 	// Camera2
 	// =========================================================================
 	
@@ -1190,14 +899,21 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mCapSess.close();
 				mCapSess = null;
 			}
-			Surface preview = mSv.getHolder().getSurface();
+
+			// Закрываем старый ридер анализа
+			if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
+			// ImageReader 320×180 YUV для анализа стабилизации (всегда создаём, но слушатель работает только если enabled)
+			mStabReader = ImageReader.newInstance(320, 180, android.graphics.ImageFormat.YUV_420_888, 2);
+			if (mStab == null) mStab = new DigitalStabilizer();
+			mStabReader.setOnImageAvailableListener(mStab::onFrame, mCamHandler);
+
+			Surface preview = mPreviewSurface;
 			List<Surface> targets = new ArrayList<>();
 			targets.add(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 			targets.add(mEncSurface);
-			if (mStabEnabled && mStabReader != null)
 			targets.add(mStabReader.getSurface());
-
+			
 			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
 				@Override
 				public void onConfigured(CameraCaptureSession sess) {
@@ -1225,16 +941,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// поэтому AE не пересчитывается и яркость не прыгает.
 			// Encoder surface просто добавляется как дополнительный target.
 			int tmpl = CameraDevice.TEMPLATE_PREVIEW;
-			Surface preview = mSv.getHolder().getSurface();
+			Surface preview = mPreviewSurface;
 			CaptureRequest.Builder rb = dev.createCaptureRequest(tmpl);
 			rb.addTarget(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 			rb.addTarget(mEncSurface);
-			// ── STAB FIX: Surface должна быть в каждом CaptureRequest, ──────────
-			// не только в createCaptureSession — иначе Camera2 не доставляет кадры
-			if (mStabEnabled && mStabReader != null)
+			if (mStabReader != null)
 			rb.addTarget(mStabReader.getSurface());
-
+			
 			if (mManualFocus) {
 				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
 				// Верх слайдера = прогресс 100 = macro (mMinFocusDist)
@@ -1250,22 +964,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				// extra: тот же запас что в processStabFrame — 1.10..1.20× (не «зум-актор»)
-				float extraZoom = (mStabEnabled && mStabCrop)
-					? 1.10f + mStabAggr * 0.10f
-					: 1f;
-				float effZoom = mZoomLevel * extraZoom;
-				int cropW = Math.max(1, (int)(mSensorRect.width()  / effZoom));
-				int cropH = Math.max(1, (int)(mSensorRect.height() / effZoom));
-				// центр сенсора + смещение стабилизатора
-				int cx = mSensorRect.left + (mSensorRect.width()  - cropW) / 2
-					+ (mStabEnabled ? (int) mStabX : 0);
-				int cy = mSensorRect.top  + (mSensorRect.height() - cropH) / 2
-					+ (mStabEnabled ? (int) mStabY : 0);
-				// Клампинг к границам сенсора
-				cx = Math.max(mSensorRect.left, Math.min(mSensorRect.right  - cropW, cx));
-				cy = Math.max(mSensorRect.top,  Math.min(mSensorRect.bottom - cropH, cy));
-				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cx, cy, cx + cropW, cy + cropH));
+				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
+				int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
+				int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
+				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -2215,14 +1918,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 		
 		private void capture() {
-			if (mSv == null || !mSurfaceReady) return;
+			if (mTv == null || !mSurfaceReady) return;
 			if (android.os.Build.VERSION.SDK_INT < 26) {
 				// PixelCopy недоступен — рисуем заглушку
 				invalidate();
 				return;
 			}
 			try {
-				int svW = mSv.getWidth(), svH = mSv.getHeight();
+				int svW = mTv.getWidth(), svH = mTv.getHeight();
 				if (svW <= 0 || svH <= 0) return;
 				
 				// Центральная область SAMPLE_SIZE × SAMPLE_SIZE
@@ -2232,7 +1935,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				android.graphics.Rect src = new android.graphics.Rect(l, t, r, b);
 				
 				Bitmap dst = Bitmap.createBitmap(r - l, b - t, Bitmap.Config.ARGB_8888);
-				android.view.PixelCopy.request(mSv, src, dst, result -> {
+				android.view.PixelCopy.request(mTv, src, dst, result -> {
 					if (result == android.view.PixelCopy.SUCCESS) {
 						mBmp = dst;
 						postInvalidate();
@@ -2864,5 +2567,206 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 		}
 	}
+
+	// ─── Применение трансформации стабилизации к TextureView ─────────────────
+	private void applyStabTransform(float dx, float dy) {
+		mUiHandler.post(() -> {
+			if (mTv == null) return;
+			android.graphics.Matrix m = new android.graphics.Matrix();
+			m.setTranslate(dx, dy);
+			mTv.setTransform(m);
+		});
+	}
+
+	// =========================================================================
+	// Digital Stabilizer
+	// Принцип: 1D-проекции Y-плоскости по строкам и столбцам → FFT-фазовая
+	// кросс-корреляция с предыдущим кадром → инкрементальный сдвиг → IIR →
+	// трансляция TextureView (чёрные полосы = виден сдвиг, кроп не делается).
+	// =========================================================================
+	class DigitalStabilizer {
+		// Размеры кадра ImageReader
+		private static final int AW = 320, AH = 180;
+
+		// FFT-размеры: степень двойки ≥ 2 * длины проекции (zero-pad для линейной КК)
+		// AW=320 → 2*320=640 → ближайшая степень двойки = 1024
+		// AH=180 → 2*180=360 → ближайшая степень двойки = 512
+		private static final int FFT_W = 1024;
+		private static final int FFT_H = 512;
+
+		// IIR decay: 0.95 ≈ τ=20 кадров (~0.67 с @ 30 fps) — агрессивная стаб.
+		private static final float DECAY      = 0.95f;
+		// Скорость обновления опорной проекции (компенсация дрейфа сцены)
+		private static final float REF_UPDATE = 0.25f;
+		// Максимальный сдвиг в долях от размера TextureView
+		private static final float MAX_SHIFT_FRAC = 0.12f;
+
+		private float[] mPrevRowProj = new float[AH];
+		private float[] mPrevColProj = new float[AW];
+		private float   mAccDx = 0f, mAccDy = 0f; // накопленный сдвиг (в пикс. анализа)
+		private boolean mHasRef = false;
+
+		/** Вызывается из mCamHandler-потока при каждом новом кадре ImageReader. */
+		void onFrame(ImageReader reader) {
+			android.media.Image img = null;
+			try { img = reader.acquireLatestImage(); } catch (Exception e) { return; }
+			if (img == null) return;
+			try {
+				if (!mDigiStabEnabled) return;
+
+				android.media.Image.Plane yPlane = img.getPlanes()[0];
+				ByteBuffer yBuf   = yPlane.getBuffer();
+				int rowStride      = yPlane.getRowStride();
+				int pixelStride    = yPlane.getPixelStride();
+
+				// ── Строчная проекция: средняя яркость каждой строки (длина AH) ──
+				float[] rowProj = new float[AH];
+				for (int y = 0; y < AH; y++) {
+					long sum = 0;
+					int rowOff = y * rowStride;
+					for (int x = 0; x < AW; x++)
+						sum += (yBuf.get(rowOff + x * pixelStride) & 0xFF);
+					rowProj[y] = sum / (float) AW;
+				}
+
+				// ── Столбцовая проекция: средняя яркость каждого столбца (длина AW) ─
+				float[] colProj = new float[AW];
+				for (int x = 0; x < AW; x++) {
+					long sum = 0;
+					for (int y = 0; y < AH; y++)
+						sum += (yBuf.get(y * rowStride + x * pixelStride) & 0xFF);
+					colProj[x] = sum / (float) AH;
+				}
+
+				if (!mHasRef) {
+					mPrevColProj = colProj.clone();
+					mPrevRowProj = rowProj.clone();
+					mHasRef = true;
+					return;
+				}
+
+				// ── Фазовая кросс-корреляция по обеим осям ──────────────────────
+				float rawDx = crossCorr1D(mPrevColProj, colProj, AW, FFT_W);
+				float rawDy = crossCorr1D(mPrevRowProj, rowProj, AH, FFT_H);
+
+				// Медленно обновляем опору (drift compensation)
+				for (int i = 0; i < AW; i++)
+					mPrevColProj[i] = mPrevColProj[i] * (1f - REF_UPDATE) + colProj[i] * REF_UPDATE;
+				for (int i = 0; i < AH; i++)
+					mPrevRowProj[i] = mPrevRowProj[i] * (1f - REF_UPDATE) + rowProj[i] * REF_UPDATE;
+
+				// ── IIR-фильтр сдвига ────────────────────────────────────────────
+				mAccDx = mAccDx * DECAY + rawDx;
+				mAccDy = mAccDy * DECAY + rawDy;
+
+				// ── Масштабируем в пиксели TextureView и применяем ──────────────
+				float tvW = mTv != null && mTv.getWidth()  > 0 ? mTv.getWidth()  : VIDEO_W;
+				float tvH = mTv != null && mTv.getHeight() > 0 ? mTv.getHeight() : VIDEO_H;
+				float scaleX = tvW / AW;
+				float scaleY = tvH / AH;
+				float maxDx  = tvW * MAX_SHIFT_FRAC;
+				float maxDy  = tvH * MAX_SHIFT_FRAC;
+
+				float dispDx = Math.max(-maxDx, Math.min(maxDx, -mAccDx * scaleX));
+				float dispDy = Math.max(-maxDy, Math.min(maxDy, -mAccDy * scaleY));
+				applyStabTransform(dispDx, dispDy);
+
+			} finally {
+				img.close();
+			}
+		}
+
+		/** Сбрасывает накопленный сдвиг и опорный кадр. */
+		void reset() {
+			mHasRef = false;
+			mAccDx  = 0f;
+			mAccDy  = 0f;
+		}
+
+		// ─────────────────────────────────────────────────────────────────────
+		// 1D Phase-only cross-correlation via FFT.
+		// prev, cur — проекции длиной len; fftSize — степень двойки ≥ 2*len.
+		// Возвращает сдвиг в отсчётах (>0 = cur сдвинута вправо/вниз).
+		// ─────────────────────────────────────────────────────────────────────
+		private float crossCorr1D(float[] prev, float[] cur, int len, int fftSize) {
+			float[] reA = new float[fftSize], imA = new float[fftSize];
+			float[] reB = new float[fftSize], imB = new float[fftSize];
+
+			// DC removal + заполнение (zero-pad автоматически, массивы инициализированы 0)
+			float meanA = 0f, meanB = 0f;
+			for (int i = 0; i < len; i++) { meanA += prev[i]; meanB += cur[i]; }
+			meanA /= len; meanB /= len;
+			for (int i = 0; i < len; i++) { reA[i] = prev[i] - meanA; reB[i] = cur[i] - meanB; }
+
+			fft(reA, imA, fftSize);
+			fft(reB, imB, fftSize);
+
+			// Кросс-спектр A * conj(B), нормализованный (фазовая корреляция)
+			float[] xRe = new float[fftSize], xIm = new float[fftSize];
+			for (int i = 0; i < fftSize; i++) {
+				float a = reA[i], b = imA[i], c = reB[i], d = imB[i];
+				float re = a*c + b*d; float im = b*c - a*d;
+				float mag = (float) Math.sqrt(re*re + im*im);
+				if (mag > 1e-6f) { xRe[i] = re/mag; xIm[i] = im/mag; }
+			}
+
+			// IFFT через: conj → FFT → conj → /N
+			for (int i = 0; i < fftSize; i++) xIm[i] = -xIm[i];
+			fft(xRe, xIm, fftSize);
+			for (int i = 0; i < fftSize; i++) xRe[i] /= fftSize;
+
+			// Ищем пик в диапазоне ±len/4 (отсекаем крупные ложные пики)
+			int halfSearch = len / 4;
+			int peakIdx = 0;
+			float peakVal = Float.NEGATIVE_INFINITY;
+			for (int i = 0; i <= halfSearch; i++) {
+				if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i; }
+			}
+			for (int i = fftSize - halfSearch; i < fftSize; i++) {
+				if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i - fftSize; }
+			}
+
+			// Параболическая субпиксельная интерполяция
+			int pi = (peakIdx + fftSize) % fftSize;
+			int pm = (pi - 1 + fftSize) % fftSize;
+			int pp = (pi + 1) % fftSize;
+			float ym = xRe[pm], y0 = xRe[pi], yp = xRe[pp];
+			float denom = 2f * (2f * y0 - ym - yp);
+			float sub = (denom != 0f) ? (yp - ym) / denom : 0f;
+			return peakIdx + sub;
+		}
+
+		// ─────────────────────────────────────────────────────────────────────
+		// Cooley-Tukey in-place radix-2 DIT FFT — та же реализация, что в
+		// SpectrumView, повторно используется для корреляционного анализа.
+		// ─────────────────────────────────────────────────────────────────────
+		private void fft(float[] re, float[] im, int n) {
+			for (int i = 1, j = 0; i < n; i++) {
+				int bit = n >> 1;
+				for (; (j & bit) != 0; bit >>= 1) j ^= bit;
+				j ^= bit;
+				if (i < j) {
+					float tr = re[i]; re[i] = re[j]; re[j] = tr;
+					float ti = im[i]; im[i] = im[j]; im[j] = ti;
+				}
+			}
+			for (int len = 2; len <= n; len <<= 1) {
+				double ang = -2.0 * Math.PI / len;
+				float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
+				for (int i = 0; i < n; i += len) {
+					float curRe = 1f, curIm = 0f;
+					for (int k = 0; k < len / 2; k++) {
+						float uRe = re[i+k], uIm = im[i+k];
+						float vRe = re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
+						float vIm = re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
+						re[i+k]       = uRe+vRe; im[i+k]       = uIm+vIm;
+						re[i+k+len/2] = uRe-vRe; im[i+k+len/2] = uIm-vIm;
+						float nRe = curRe*wRe - curIm*wIm;
+						curIm = curRe*wIm + curIm*wRe; curRe = nRe;
+					}
+				}
+			}
+		}
+	} // end DigitalStabilizer
 
 }
