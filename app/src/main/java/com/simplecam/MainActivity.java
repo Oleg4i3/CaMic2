@@ -170,11 +170,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// Цифровая стабилизация — 1D-проекционная кросс-корреляция
 	// ═══════════════════════════════════════════════════════════════════════════
 	// Проекции усредняются по строкам/столбцам → 1D FFT по каждой оси.
-	// STAB_IW/IH — размер ImageReader; STAB_FFT_W/H — следующая степень 2 >= IW/IH.
 	private static final int   STAB_IW    = 640;   // ширина ImageReader
 	private static final int   STAB_IH    = 480;   // высота ImageReader
-	private static final int   STAB_FFT_W = 1024;  // степень 2 >= STAB_IW
-	private static final int   STAB_FFT_H = 512;   // степень 2 >= STAB_IH
 	private static final float STAB_ALPHA = 0.94f; // EMA-утечка накопленного сдвига
 
 	private volatile boolean mStabEnabled = false;
@@ -188,11 +185,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private Handler mStabHandler;
 	private int mStabDbgCount = 0; // счётчик для диагностических сообщений
 	private CheckBox mCbStabSpec; // ссылка на чекбокс spectrum, чтобы выключать
-	// Рабочие буферы 1D FFT (без выделения памяти на каждый кадр)
-	private final float[] mFftXRe = new float[STAB_FFT_W];
-	private final float[] mFftXIm = new float[STAB_FFT_W];
-	private final float[] mFftYRe = new float[STAB_FFT_H];
-	private final float[] mFftYIm = new float[STAB_FFT_H];
+
 	
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
 	private final Runnable mZoomRunnable = new Runnable() {
@@ -814,63 +807,76 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		try {
 			img = reader.acquireLatestImage();
 			if (img == null) return;
-			Image.Plane yp = img.getPlanes()[0];
+			Image.Plane yp   = img.getPlanes()[0];
 			java.nio.ByteBuffer yBuf = yp.getBuffer();
-			int rowStride = yp.getRowStride();
+			yBuf.rewind();  // гарантируем position=0
+			int rowStride   = yp.getRowStride();
+			int pixelStride = yp.getPixelStride(); // обычно 1, но бывает 2
 			int iw = img.getWidth(), ih = img.getHeight();
 
-			// ── 1D проекции: свёртка всех строк → projX[x], всех столбцов → projY[y] ──
-			// projX[x] = среднее яркости по всем строкам в столбце x  (→ определяет сдвиг по X)
-			// projY[y] = среднее яркости по всем столбцам в строке y  (→ определяет сдвиг по Y)
+			// ── 1D проекции: усредняем по строкам → projX[x], по столбцам → projY[y] ──
 			float[] projX = new float[iw];
 			float[] projY = new float[ih];
 			for (int y = 0; y < ih; y++) {
 				int rowOff = y * rowStride;
 				float rowSum = 0f;
 				for (int x = 0; x < iw; x++) {
-					float v = (yBuf.get(rowOff + x) & 0xFF);
+					float v = (yBuf.get(rowOff + x * pixelStride) & 0xFF) / 255f;
 					projX[x] += v;
 					rowSum    += v;
 				}
 				projY[y] = rowSum / iw;
 			}
-			float colNorm = 255f * ih;
-			for (int x = 0; x < iw; x++) projX[x] /= colNorm;
-			float rowNorm = 255f;
-			for (int y = 0; y < ih; y++) projY[y] /= rowNorm;
+			for (int x = 0; x < iw; x++) projX[x] /= ih;
 
-			if (mProjXPrev == null) { mProjXPrev = projX; mProjYPrev = projY; return; }
+			// Диагностика каждые ~30 кадров
+			if (mStabDbgCount % 30 == 0) {
+				float mx = 0; for (float v : projX) mx += v; mx /= iw;
+				float vx = 0; for (float v : projX) vx += (v-mx)*(v-mx); vx /= iw;
+				final float dbgMean = mx, dbgVar = vx;
+				runOnUiThread(() -> status(
+					"Stab frame=" + mStabDbgCount +
+					" mean=" + String.format("%.2f", dbgMean) +
+					" var=" + String.format("%.5f", dbgVar) +
+					" ps=" + pixelStride));
+			}
 
-			// ── 1D фазовая кросс-корреляция по каждой оси ──
-			int tauX = stabCrossCorr1D(mProjXPrev, projX, iw, mFftXRe, mFftXIm, STAB_FFT_W);
-			int tauY = stabCrossCorr1D(mProjYPrev, projY, ih, mFftYRe, mFftYIm, STAB_FFT_H);
+			if (mProjXPrev == null) {
+				mProjXPrev = projX; mProjYPrev = projY;
+				mStabDbgCount++;
+				return;
+			}
 
-			// Диагностика: выводим в статус каждые ~30 кадров
-			if (mStabDbgCount++ % 30 == 0) {
+			// ── Прямая NCC: ищем сдвиг в диапазоне ±maxTau ──
+			// Быстрее и надёжнее FFT-фазовой корреляции для 1D проекций
+			int maxTau = (int)(mStabAggr * 90) + 10; // 10..100 пкс в коорд. ImageReader
+			int tauX = stabShift1D(mProjXPrev, projX, iw, maxTau);
+			int tauY = stabShift1D(mProjYPrev, projY, ih, maxTau);
+
+			// Диагностика tau и shift
+			if (mStabDbgCount % 30 == 0) {
 				final int dbgX = tauX, dbgY = tauY;
 				final float dbgSX = mStabX, dbgSY = mStabY;
 				runOnUiThread(() -> status(
-					"Stab tau=(" + dbgX + "," + dbgY + ") shift=(" +
+					"tau=(" + dbgX + "," + dbgY + ") shift=(" +
 					(int)dbgSX + "," + (int)dbgSY + ")"));
 			}
-
-			// Порог выброса: 10..100 пкс в координатах ImageReader
-			int maxTau = (int)(mStabAggr * 90) + 10;
-			if (Math.abs(tauX) > maxTau || Math.abs(tauY) > maxTau) {
-				mProjXPrev = projX; mProjYPrev = projY; return;
-			}
+			mStabDbgCount++;
 
 			// Масштаб: 1 пкс ImageReader = cropW_sensor / iw пкс сенсора
 			float cropW = mSensorRect != null ? mSensorRect.width()  / mZoomLevel : iw;
 			float cropH = mSensorRect != null ? mSensorRect.height() / mZoomLevel : ih;
-			float dx = -tauX * cropW / iw;  // >0 → камера пошла вправо
-			float dy = -tauY * cropH / ih;
+			// tauX от NCC: при сдвиге камеры вправо на d → tauX = -d
+			// Компенсация: dx = +tauX * scale (убираем знак минус по сравнению с FFT)
+			// Знак проверен: tauX<0 (камера вправо) → dx<0 → cx уменьшается → кроп влево ✓
+			float dx = tauX * cropW / iw;
+			float dy = tauY * cropH / ih;
 
 			// EMA-накопление (leaky integrator)
 			mStabX = STAB_ALPHA * mStabX + dx;
 			mStabY = STAB_ALPHA * mStabY + dy;
 
-			// Отладочный режим без кропа: клампинг к ±25% поля сенсора
+			// Клампинг ±25% поля (отладочный режим без кропа)
 			if (mSensorRect != null) {
 				float maxDx = cropW * 0.25f;
 				float maxDy = cropH * 0.25f;
@@ -888,82 +894,34 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		}
 	}
 
-	// ── 1D фазовая кросс-корреляция ───────────────────────────────────────────
-
+	// ── Прямой поиск сдвига по NCC (без FFT) ────────────────────────────────
 	/**
-	 * Возвращает сдвиг в пикселях [-fftN/2, fftN/2) по одной оси.
-	 * A, B — проекции длиной dataLen; re/im — рабочие буферы длиной fftN (степень 2 >= dataLen).
-	 * Нормировка: нет нужды в делении, argmax не зависит от масштаба.
+	 * Ищет сдвиг τ в [-maxTau, maxTau] максимизирующий нормированную кросс-корреляцию.
+	 * Возвращает τ такой, что B[x + τ] ≈ A[x] (τ = -d когда камера сдвинулась на +d).
 	 */
-	private int stabCrossCorr1D(float[] A, float[] B, int dataLen,
-	                             float[] re, float[] im, int fftN) {
-		// FFT(A)
-		System.arraycopy(A, 0, re, 0, dataLen);
-		Arrays.fill(re, dataLen, fftN, 0f);
-		Arrays.fill(im, 0, fftN, 0f);
-		stabFft1d(re, im, 0, 1, fftN, false);
-		// Сохраняем спектр A
-		float[] reA = Arrays.copyOf(re, fftN);
-		float[] imA = Arrays.copyOf(im, fftN);
+	private static int stabShift1D(float[] A, float[] B, int len, int maxTau) {
+		// Убираем DC (среднее)
+		float ma = 0, mb = 0;
+		for (int i = 0; i < len; i++) { ma += A[i]; mb += B[i]; }
+		ma /= len; mb /= len;
 
-		// FFT(B)
-		System.arraycopy(B, 0, re, 0, dataLen);
-		Arrays.fill(re, dataLen, fftN, 0f);
-		Arrays.fill(im, 0, fftN, 0f);
-		stabFft1d(re, im, 0, 1, fftN, false);
+		int   bestTau  = 0;
+		float bestCorr = Float.NEGATIVE_INFINITY;
 
-		// C = A * conj(B) / |A * conj(B)| — нормированный фазовый спектр
-		for (int i = 0; i < fftN; i++) {
-			float cRe = reA[i]*re[i] + imA[i]*im[i];
-			float cIm = imA[i]*re[i] - reA[i]*im[i];
-			float mag = (float) Math.sqrt(cRe*cRe + cIm*cIm);
-			re[i] = mag > 1e-9f ? cRe / mag : 0f;
-			im[i] = mag > 1e-9f ? cIm / mag : 0f;
+		for (int tau = -maxTau; tau <= maxTau; tau++) {
+			int x0 = Math.max(0, -tau);
+			int x1 = Math.min(len, len - tau);
+			if (x1 <= x0) continue;
+			float corr = 0;
+			for (int x = x0; x < x1; x++)
+				corr += (A[x] - ma) * (B[x + tau] - mb);
+			// Нормируем на количество точек (чтобы не зависеть от x0..x1)
+			corr /= (x1 - x0);
+			if (corr > bestCorr) { bestCorr = corr; bestTau = tau; }
 		}
-
-		// IFFT → корреляционная функция
-		stabFft1d(re, im, 0, 1, fftN, true);
-
-		// Аргмакс (нормировать на 1/fftN не нужно — argmax не меняется)
-		int peakIdx = 0; float peakVal = re[0];
-		for (int i = 1; i < fftN; i++)
-			if (re[i] > peakVal) { peakVal = re[i]; peakIdx = i; }
-
-		// Разворачиваем циклический сдвиг в [-fftN/2, fftN/2)
-		return peakIdx > fftN / 2 ? peakIdx - fftN : peakIdx;
+		return bestTau;
 	}
 
-	/** Cooley-Tukey radix-2 in-place FFT. off=начало, stride=шаг, n=длина (степень 2). */
-	private static void stabFft1d(float[] re, float[] im, int off, int stride, int n, boolean inv) {
-		// Бит-реверсивная перестановка
-		for (int i = 1, j = 0; i < n; i++) {
-			int bit = n >> 1;
-			for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-			j ^= bit;
-			if (i < j) {
-				int ai = off+i*stride, aj = off+j*stride;
-				float t; t=re[ai]; re[ai]=re[aj]; re[aj]=t; t=im[ai]; im[ai]=im[aj]; im[aj]=t;
-			}
-		}
-		// Бабочки
-		for (int len = 2; len <= n; len <<= 1) {
-			double ang = (inv ? 2.0 : -2.0) * Math.PI / len;
-			float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
-			for (int i = 0; i < n; i += len) {
-				float curRe = 1f, curIm = 0f;
-				for (int k = 0; k < len/2; k++) {
-					int ui = off+(i+k)*stride, vi = off+(i+k+len/2)*stride;
-					float uRe=re[ui], uIm=im[ui];
-					float vRe=re[vi]*curRe - im[vi]*curIm;
-					float vIm=re[vi]*curIm + im[vi]*curRe;
-					re[ui]=uRe+vRe; im[ui]=uIm+vIm;
-					re[vi]=uRe-vRe; im[vi]=uIm-vIm;
-					float nRe=curRe*wRe-curIm*wIm;
-					curIm=curRe*wIm+curIm*wRe; curRe=nRe;
-				}
-			}
-		}
-	}
 
 	
 	// ── Helpers ───────────────────────────────────────────────────────────────
