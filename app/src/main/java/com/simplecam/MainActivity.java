@@ -173,12 +173,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private static final int   STAB_H    = 256;   // высота патча (степень 2)
 	private static final int   STAB_IW   = 640;   // ширина ImageReader
 	private static final int   STAB_IH   = 480;   // высота ImageReader
-	private static final float STAB_ALPHA = 0.94f;// EMA: τ ≈ 0.5 с при 30 fps
+// STAB_ALPHA: коэффициент сглаживания LPF на позиции, τ ≈ 0.5 с при 30 fps
+	private static final float STAB_ALPHA = 0.94f;
 
 	private volatile boolean mStabEnabled = false;
 	private volatile boolean mStabCrop    = true;
-	private volatile float   mStabAggr    = 0.5f;  // 0..1
-	private volatile float   mStabX = 0f, mStabY = 0f; // накоплен. сдвиг, сенсор-пкс
+	private volatile float   mStabAggr    = 0.4f;  // 0..1  (40% по умолчанию)
+	// Правильная LPF-стабилизация: накоп. позиция + сглаженная позиция
+	private float mCumX = 0f, mCumY = 0f;           // сырая накопленная позиция камеры
+	private float mSmoothedX = 0f, mSmoothedY = 0f; // LPF(позиция) = куда хочет смотреть камера
+	private volatile float mStabX = 0f, mStabY = 0f;// коррекция = smoothed - cum  ← идёт в crop
 	private float[] mStabPrev = null;    // лума-патч предыдущего кадра
 	private ImageReader mStabReader;
 	private HandlerThread mStabThread;
@@ -609,9 +613,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbCrop.setChecked(true);
 		cbCrop.setOnCheckedChangeListener((cb2, on) -> mStabCrop = on);
 
-		final TextView tvAggr = smallLabel("50%");
+		final TextView tvAggr = smallLabel("40%");
 		SeekBar sbAggr = new SeekBar(this);
-		sbAggr.setMax(100); sbAggr.setProgress(50);
+		sbAggr.setMax(100); sbAggr.setProgress(40); // 40% по умолчанию
 		sbAggr.setLayoutParams(new LinearLayout.LayoutParams(
 			0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		sbAggr.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
@@ -636,7 +640,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbStab.setOnCheckedChangeListener((cb2, on) -> {
 			mStabEnabled = on;
 			stabOpts.setVisibility(on ? View.VISIBLE : View.GONE);
-			if (!on) { mStabX = 0f; mStabY = 0f; mStabPrev = null; }
+			if (!on) { mStabX=0f; mStabY=0f; mCumX=0f; mCumY=0f; mSmoothedX=0f; mSmoothedY=0f; mStabPrev=null; }
 			// Авто-выключаем спектр-анализатор при включении stab
 			if (mCbStabSpec != null) mCbStabSpec.setChecked(!on);
 			// Пересоздаём камера-сессию (добавить/убрать ImageReader)
@@ -807,7 +811,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	/** Останавливает стаб-поток и закрывает ImageReader. */
 	private void stopStabReader() {
-		mStabPrev = null; mStabX = 0f; mStabY = 0f;
+		mStabPrev = null;
+		mStabX = 0f; mStabY = 0f;
+		mCumX = 0f; mCumY = 0f;
+		mSmoothedX = 0f; mSmoothedY = 0f;
 		if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
 		if (mStabThread != null) { mStabThread.quitSafely(); mStabThread = null; mStabHandler = null; }
 	}
@@ -872,34 +879,51 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			int tauX = px > STAB_W/2 ? px - STAB_W : px;
 			int tauY = py > STAB_H/2 ? py - STAB_H : py;
 			// Отсекаем выбросы по агрессивности (отказ от корреляции при слишком большом сдвиге)
-			int maxTau = (int)(mStabAggr * 90) + 10; // 10..100 пикс. в coords патча
+			// maxTau: максимально допустимый сдвиг между кадрами в пикселях патча.
+			// Слишком большой → выброс (непригодный кадр: резкий поворот, потеря корреляции).
+			// 30..120 пикс. в 256px патче = 12%..47% ширины.
+			int maxTau = (int)(mStabAggr * 90) + 30;
 			if (Math.abs(tauX) > maxTau || Math.abs(tauY) > maxTau) {
-				mStabPrev = patch; return; // выброс — игнорируем кадр
+				// Не обновляем mStabPrev — следующий кадр сравнивается с «надёжным»
+				return;
 			}
-			// Пересчёт в пиксели сенсора.
-			// tauX < 0 → B смещён влево (камера пошла вправо).
-			// Движение камеры: dx_cam = -tauX (в пикс. ImageReader).
-			// Масштаб: 1 пкс ImageReader = currentCropW / iw пкс. сенсора.
-			float cropW = mSensorRect != null
-				? mSensorRect.width()  / (mZoomLevel * (mStabCrop ? (1f + 0.06f + mStabAggr*0.44f) : 1f))
-				: iw;
-			float cropH = mSensorRect != null
-				? mSensorRect.height() / (mZoomLevel * (mStabCrop ? (1f + 0.06f + mStabAggr*0.44f) : 1f))
-				: ih;
-			float dx = -tauX * cropW / iw;  // сенсор-пкс, + = камера пошла вправо
-			float dy = -tauY * cropH / ih;  // сенсор-пкс, + = камера пошла вниз
-			// EMA: накапливаем сдвиг, медленный откат
-			mStabX = STAB_ALPHA * mStabX + dx;
-			mStabY = STAB_ALPHA * mStabY + dy;
-			// Клампинг к доступному полю (половина разницы zoom/effZoom)
+			// ── Пересчёт сдвига в пиксели сенсора ───────────────────────────
+			// tauX > 0 → B смещён ВПРАВО → камера пошла вправо → dx > 0.
+			// effZoom учитывает доп. кроп стабилизатора.
+			// При aggr=1.0: extra=3.5 → поле ±36% ширины (очень агрессивно).
+			float extra = mStabCrop ? (1f + mStabAggr * 2.5f) : 1f;
+			float effZoom = mZoomLevel * extra;
+			float cropW = mSensorRect != null ? mSensorRect.width()  / effZoom : iw;
+			float cropH = mSensorRect != null ? mSensorRect.height() / effZoom : ih;
+			// dx = движение камеры в пикселях сенсора; + = вправо
+			float dx = tauX * cropW / iw;
+			float dy = tauY * cropH / ih;
+
+			// ── Правильная LPF-стабилизация ────────────────────────────────
+			// cumX = сырая накопленная позиция камеры (куда она фактически смотрит)
+			// smoothedX = LPF(cumX) = куда камера «хочет» смотреть
+			// stabX = smoothed - cum = -(shake) → это и есть нужная коррекция.
+			// При резком прыжке вправо: cum растёт, smooth не успевает
+			// → stabX < 0 → cropX уменьшается → кроп идёт влево → компенсирует ✓
+			mCumX += dx;
+			mCumY += dy;
+			mSmoothedX = STAB_ALPHA * mSmoothedX + (1f - STAB_ALPHA) * mCumX;
+			mSmoothedY = STAB_ALPHA * mSmoothedY + (1f - STAB_ALPHA) * mCumY;
+			float rawX = mSmoothedX - mCumX;
+			float rawY = mSmoothedY - mCumY;
+
+			// ── Клампинг к доступному полю ──────────────────────────────────
 			if (mSensorRect != null) {
 				float baseW = mSensorRect.width()  / mZoomLevel;
 				float baseH = mSensorRect.height() / mZoomLevel;
-				float maxDx = mStabCrop ? (baseW - cropW) / 2f : mStabAggr * baseW * 0.12f;
-				float maxDy = mStabCrop ? (baseH - cropH) / 2f : mStabAggr * baseH * 0.12f;
-				mStabX = Math.max(-maxDx, Math.min(maxDx, mStabX));
-				mStabY = Math.max(-maxDy, Math.min(maxDy, mStabY));
-			}
+				float maxDx = mStabCrop ? (baseW - cropW) / 2f : mStabAggr * baseW * 0.08f;
+				float maxDy = mStabCrop ? (baseH - cropH) / 2f : mStabAggr * baseH * 0.08f;
+				mStabX = Math.max(-maxDx, Math.min(maxDx, rawX));
+				mStabY = Math.max(-maxDy, Math.min(maxDy, rawY));
+				// Anti-windup: если зажали клампом, сдвигаем cum чтобы не копить ошибку
+				if (Math.abs(rawX) > maxDx) mCumX = mSmoothedX - Math.signum(rawX)*maxDx;
+				if (Math.abs(rawY) > maxDy) mCumY = mSmoothedY - Math.signum(rawY)*maxDy;
+			} else { mStabX = rawX; mStabY = rawY; }
 			mStabPrev = patch;
 			if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
 		} catch (Exception e) {
@@ -1218,9 +1242,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				// effectiveZoom: при stab+crop добавляем поле для компенсации
+				// effZoom: та же формула что в processStabFrame — ОБЯЗАТЕЛЬНО согласованы
 				float extraZoom = (mStabEnabled && mStabCrop)
-					? 1f + 0.06f + mStabAggr * 0.44f // 6%..50% дополнительный зум
+					? 1f + mStabAggr * 2.5f // aggr=0→×1, aggr=0.5→×2.25, aggr=1→×3.5
 					: 1f;
 				float effZoom = mZoomLevel * extraZoom;
 				int cropW = Math.max(1, (int)(mSensorRect.width()  / effZoom));
