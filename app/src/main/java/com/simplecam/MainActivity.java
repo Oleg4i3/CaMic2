@@ -60,8 +60,8 @@ public class MainActivity extends Activity {
 	private CheckBox mCbDigiStab;
 	private DigitalStabilizer mStab;
 	private ImageReader mStabReader; // ImageReader для анализа кадров
-	// Смещение кропа сенсора для стабилизации (в пикселях сенсора).
-	// Устанавливается DigitalStabilizer, читается в buildAndSendRequest.
+	// Смещение кропа сенсора (в пикселях сенсора) для стабилизации.
+	// Устанавливается в DigitalStabilizer.onFrame(), читается в buildAndSendRequest().
 	private volatile int mStabCropDx = 0;
 	private volatile int mStabCropDy = 0;
 	private final android.os.Handler mUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
@@ -187,6 +187,10 @@ public class MainActivity extends Activity {
 				float speed = (float) ((Math.exp(abs * 3.0) - 1.0) / (Math.exp(3.0) - 1.0)) * MAX_ZOOM_SPEED
 				* Math.signum(lever);
 				mZoomLevel = Math.max(1f, Math.min(mMaxZoom, mZoomLevel + speed));
+				buildAndSendRequest();
+			} else if (mDigiStabEnabled) {
+				// Стабилизатор обновил mStabCropDx/Dy в onFrame();
+				// здесь применяем новый кроп к камере ~30 раз/с.
 				buildAndSendRequest();
 			}
 			if (mCamHandler != null)
@@ -583,21 +587,26 @@ public class MainActivity extends Activity {
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
 		rightSettings.addView(bpsRow);
 
-		// — Digital Stabilization (в правой колонке, под битрейтом) ——————————
+		// — Digital Stabilization ————————————————————————————————————————————
 		mCbDigiStab = new CheckBox(this);
 		mCbDigiStab.setText("Digital stab");
 		mCbDigiStab.setTextColor(0xCCCCCCCC); mCbDigiStab.setTextSize(11);
 		mCbDigiStab.setChecked(false);
 		mCbDigiStab.setOnCheckedChangeListener((cb, checked) -> {
 			mDigiStabEnabled = checked;
-			if (!checked) {
+			if (checked) {
+				if (mStab == null) mStab = new DigitalStabilizer();
+				mStab.reset(); // начинаем с чистого состояния
+			} else {
 				if (mStab != null) mStab.reset();
 				applyStabTransform(0f, 0f);
 			}
+			// Немедленно обновляем камеру: stab zoom + hw stab on/off
+			if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
 		});
 		rightSettings.addView(mCbDigiStab);
 
-		// Strength (SMOOTH): 85..99 → 0.85..0.99; default 95 → progress 10
+		// Strength (SMOOTH): 85..99 % → 0.85..0.99; default 10 → 95%
 		final TextView tvStrength = smallLabel("Str 95%");
 		SeekBar sbStrength = new SeekBar(this);
 		sbStrength.setMax(14); sbStrength.setProgress(10);
@@ -616,15 +625,15 @@ public class MainActivity extends Activity {
 		strengthRow.addView(tvStrength); strengthRow.addView(sbStrength);
 		rightSettings.addView(strengthRow);
 
-		// Max Crop: 3..20% → progress 0..17; default 10% → progress 7
+		// Max Crop (MAX_SHIFT_FRAC): 5..25% → progress 0..20; default 5 → 10%
 		final TextView tvCrop = smallLabel("Crop 10%");
 		SeekBar sbCrop = new SeekBar(this);
-		sbCrop.setMax(17); sbCrop.setProgress(7);
+		sbCrop.setMax(20); sbCrop.setProgress(5);
 		sbCrop.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		sbCrop.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				DigitalStabilizer.MAX_SHIFT_FRAC = (3 + p) / 100f;
-				tvCrop.setText("Crop " + (3 + p) + "%");
+				DigitalStabilizer.MAX_SHIFT_FRAC = (5 + p) / 100f;
+				tvCrop.setText("Crop " + (5 + p) + "%");
 			}
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
@@ -995,27 +1004,33 @@ public class MainActivity extends Activity {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				// При включённой стабилизации зумируем на (1 + 2*MAX_SHIFT_FRAC),
-				// чтобы зарезервировать поле для смещения кропа по ±MAX_SHIFT_FRAC.
-				float stabMargin = mDigiStabEnabled
-					? (1f + 2f * DigitalStabilizer.MAX_SHIFT_FRAC)
-					: 1f;
-				float effectiveZoom = Math.min(mZoomLevel * stabMargin, mMaxZoom);
-				int cropW = Math.max(1, (int) (mSensorRect.width()  / effectiveZoom));
-				int cropH = Math.max(1, (int) (mSensorRect.height() / effectiveZoom));
-				// Базовый центр кропа (без стабилизации)
+				// При включённой стабилизации зумируем на (1 + 2*FRAC), чтобы
+				// иметь поле ±FRAC для сдвига кропа в любую сторону.
+				// Не клампим по mMaxZoom: сенсорные границы достаточный ограничитель.
+				float zoomForCrop = mDigiStabEnabled
+					? mZoomLevel * (1f + 2f * DigitalStabilizer.MAX_SHIFT_FRAC)
+					: mZoomLevel;
+				int cropW = Math.max(16, (int)(mSensorRect.width()  / zoomForCrop));
+				int cropH = Math.max(16, (int)(mSensorRect.height() / zoomForCrop));
 				int baseCropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
 				int baseCropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2;
-				// Добавляем смещение стабилизатора
 				int cropX = baseCropX + (mDigiStabEnabled ? mStabCropDx : 0);
 				int cropY = baseCropY + (mDigiStabEnabled ? mStabCropDy : 0);
-				// Ограничиваем сенсорными границами
-				cropX = Math.max(mSensorRect.left,
-					Math.min(mSensorRect.right  - cropW, cropX));
-				cropY = Math.max(mSensorRect.top,
-					Math.min(mSensorRect.bottom - cropH, cropY));
+				// Клампим в границы сенсора
+				cropX = Math.max(mSensorRect.left, Math.min(mSensorRect.right  - cropW, cropX));
+				cropY = Math.max(mSensorRect.top,  Math.min(mSensorRect.bottom - cropH, cropY));
 				rb.set(CaptureRequest.SCALER_CROP_REGION,
 					new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
+			}
+			// Отключаем аппаратную стабилизацию когда работает наша:
+			// это даёт алгоритму полное сырое движение для компенсации.
+			if (mDigiStabEnabled) {
+				rb.set(CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+					CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE_OFF);
+				try {
+					rb.set(CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE,
+						CaptureRequest.LENS_OPTICAL_STABILIZATION_MODE_OFF);
+				} catch (Exception ignored) {}
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -2611,9 +2626,9 @@ public class MainActivity extends Activity {
 		}
 	}
 
-	// ─── Сброс визуального сдвига SurfaceView ───────────────────────────────
-	// Вызывается только при выключении стабилизации (dx=dy=0).
-	// Сама стабилизация работает через SCALER_CROP_REGION, а не через этот метод.
+	// ─── Применение стабилизационного сдвига к SurfaceView ──────────────────
+	// SurfaceView не поддерживает setTransform, поэтому используем setTranslationX/Y.
+	// Чёрные полосы по краям — это фон корневого FrameLayout (Color.BLACK).
 	private void applyStabTransform(float dx, float dy) {
 		mUiHandler.post(() -> {
 			if (mSv == null) return;
@@ -2624,40 +2639,34 @@ public class MainActivity extends Activity {
 
 	// =========================================================================
 	// Digital Stabilizer
-	// Архитектура: 1D-проекции Y-плоскости (строки/столбцы) → FFT фазовая
-	// кросс-корреляция кадр-к-кадру → интегральная позиция камеры →
-	// low-pass сглаживание позиции → компенсация разницы сдвигом SurfaceView.
-	// Опора обновляется строго предыдущим кадром (не lerp), что даёт
-	// полноамплитудное инкрементальное смещение за один фрейм.
+	// Принцип: 1D-проекции Y-канала → FFT фазовая кросс-корреляция кадр-к-кадру
+	// → интегральная позиция камеры → low-pass → компенсация через
+	// SCALER_CROP_REGION (сдвиг зоны считывания на уровне сенсора, до энкодера).
+	// Стабилизирует и превью, и записываемое видео.
 	// =========================================================================
 	class DigitalStabilizer {
-		// Размеры кадра ImageReader
 		private static final int AW = 320, AH = 180;
+		private static final int FFT_W = 1024, FFT_H = 512;
 
-		// FFT-размеры: степень двойки ≥ 2 * длины проекции
-		private static final int FFT_W = 1024;
-		private static final int FFT_H = 512;
-
-		// ── Регулируемые параметры (меняются из UI-слайдеров) ─────────────────
-		// SMOOTH: коэф. low-pass для позиции камеры. 0.85=агрессивно, 0.99=мягко.
+		// ── Регулируемые параметры (слайдеры UI) ──────────────────────────────
+		// SMOOTH: коэф. low-pass позиции. 0.85=агрессивно, 0.99=плавно.
 		static volatile float SMOOTH         = 0.95f;
-		// MAX_SHIFT_FRAC: макс. сдвиг SurfaceView как доля его размера.
+		// MAX_SHIFT_FRAC: макс. поле кропа (доля от кадра). 0.10 = ±10%.
 		static volatile float MAX_SHIFT_FRAC = 0.10f;
-		// MIN_PEAK_VAL: мин. значение пика корреляции; ниже — кадр игнорируется.
+		// MIN_PEAK_VAL: порог достоверности корреляции. Ниже = шумовой кадр.
 		static volatile float MIN_PEAK_VAL   = 0.04f;
 
-		// Проекции предыдущего кадра (строго кадр N-1, не lerp)
 		private float[] mPrevRowProj = new float[AH];
 		private float[] mPrevColProj = new float[AW];
+		private float   mCamPosX = 0f, mCamPosY = 0f; // интегральная позиция
+		private float   mSmoothX = 0f, mSmoothY = 0f; // low-pass позиции
+		private boolean mHasRef  = false;
 
-		// Интегральная позиция камеры (в пикселях анализ-разрешения)
-		private float mCamPosX = 0f, mCamPosY = 0f;
-		// Сглаженная позиция (low-pass)
-		private float mSmoothX = 0f, mSmoothY = 0f;
-
-		private boolean mHasRef = false;
-
-		/** Вызывается из mCamHandler-потока при каждом новом кадре ImageReader. */
+		/**
+		 * Вызывается из mCamHandler при каждом новом кадре ImageReader.
+		 * Вычисляет смещение кропа и записывает в mStabCropDx/Dy.
+		 * Crop применяется из zoom runnable (~30 раз/с).
+		 */
 		void onFrame(ImageReader reader) {
 			android.media.Image img = null;
 			try { img = reader.acquireLatestImage(); } catch (Exception e) { return; }
@@ -2670,16 +2679,14 @@ public class MainActivity extends Activity {
 				int rowStride    = yPlane.getRowStride();
 				int pixelStride  = yPlane.getPixelStride();
 
-				// ── Строчная проекция: средняя яркость каждой строки ────────────
+				// ── Строчная проекция: средняя яркость каждой строки ──────────────
 				float[] rowProj = new float[AH];
 				for (int y = 0; y < AH; y++) {
-					long sum = 0;
-					int off = y * rowStride;
+					long sum = 0; int off = y * rowStride;
 					for (int x = 0; x < AW; x++) sum += (yBuf.get(off + x * pixelStride) & 0xFF);
 					rowProj[y] = sum / (float) AW;
 				}
-
-				// ── Столбцовая проекция: средняя яркость каждого столбца ────────
+				// ── Столбцовая проекция: средняя яркость каждого столбца ─────────
 				float[] colProj = new float[AW];
 				for (int x = 0; x < AW; x++) {
 					long sum = 0;
@@ -2694,151 +2701,111 @@ public class MainActivity extends Activity {
 					return;
 				}
 
-				// ── Фазовая кросс-корреляция: инкрементальный сдвиг кадр-к-кадру
+				// ── Фазовая кросс-корреляция кадр-к-кадру ────────────────────────
 				float[] ccX = crossCorr1D(mPrevColProj, colProj, AW, FFT_W);
 				float[] ccY = crossCorr1D(mPrevRowProj, rowProj, AH, FFT_H);
 				float rawDx = ccX[0], peakX = ccX[1];
 				float rawDy = ccY[0], peakY = ccY[1];
 
-				// ── Обновляем опору строго текущим кадром — даёт полный rawDx ───
+				// ── Опора = строго предыдущий кадр (не lerp) ─────────────────────
 				mPrevColProj = colProj.clone();
 				mPrevRowProj = rowProj.clone();
 
-				// ── Отбрасываем шумовые кадры (слабый пик = нет уверенности) ───
+				// ── Отброс шумовых кадров ────────────────────────────────────────
 				if (peakX < MIN_PEAK_VAL) rawDx = 0f;
 				if (peakY < MIN_PEAK_VAL) rawDy = 0f;
 
-				// ── Интегрируем позицию камеры ───────────────────────────────────
+				// ── Интеграл позиции + low-pass ──────────────────────────────────
 				mCamPosX += rawDx;
 				mCamPosY += rawDy;
-
-				// ── Low-pass сглаживание: плавная траектория = желаемое движение
 				mSmoothX = SMOOTH * mSmoothX + (1f - SMOOTH) * mCamPosX;
 				mSmoothY = SMOOTH * mSmoothY + (1f - SMOOTH) * mCamPosY;
 
-				// ── Компенсация через SCALER_CROP_REGION ───────────────────────────
-				// errX/Y — высокочастотное дрожание в единицах анализ-разрешения (AW×AH).
-				// Переводим в пиксели сенсора с учётом текущего кропа.
+				// errX = высокочастотная тряска (то, что нужно компенсировать)
 				float errX = mCamPosX - mSmoothX;
 				float errY = mCamPosY - mSmoothY;
 
+				// ── Переводим ошибку в пиксели сенсора и записываем в поля ──────
 				if (mSensorRect != null) {
-					// Размер кропа при effectiveZoom (с учётом stab margin)
-					float stabZoom = Math.min(
-						mZoomLevel * (1f + 2f * MAX_SHIFT_FRAC), mMaxZoom);
-					float cropW_s = mSensorRect.width()  / stabZoom;
-					float cropH_s = mSensorRect.height() / stabZoom;
-
-					// Максимальный сдвиг кропа = MAX_SHIFT_FRAC от его размера
-					int maxOffX = (int)(cropW_s * MAX_SHIFT_FRAC);
-					int maxOffY = (int)(cropH_s * MAX_SHIFT_FRAC);
-
-					// -errX: камера дёрнулась вправо → кроп смещаем влево
-					mStabCropDx = (int) Math.max(-maxOffX,
-						Math.min(maxOffX, -errX * cropW_s / AW));
-					mStabCropDy = (int) Math.max(-maxOffY,
-						Math.min(maxOffY, -errY * cropH_s / AH));
+					// Размер кропа совпадает с формулой в buildAndSendRequest
+					float zfc = mZoomLevel * (1f + 2f * MAX_SHIFT_FRAC);
+					float cW  = mSensorRect.width()  / zfc;
+					float cH  = mSensorRect.height() / zfc;
+					int maxOX = (int)(cW * MAX_SHIFT_FRAC);
+					int maxOY = (int)(cH * MAX_SHIFT_FRAC);
+					// Камера сдвинулась на errX вправо → кроп смещаем влево (-errX)
+					mStabCropDx = (int) Math.max(-maxOX, Math.min(maxOX, -errX * cW / AW));
+					mStabCropDy = (int) Math.max(-maxOY, Math.min(maxOY, -errY * cH / AH));
 				}
+				// Crop применяется из zoom runnable каждые ~33мс
 
-				// Отправляем обновлённый CaptureRequest на тот же mCamHandler.
-				// post() ставит задачу ПОСЛЕ возврата из onFrame — нет рекурсии.
-				if (mCamHandler != null)
-					mCamHandler.post(MainActivity.this::buildAndSendRequest);
-
-			} finally {
-				img.close();
-			}
+			} finally { img.close(); }
 		}
 
-		/** Сбрасывает интегратор, опорный кадр и смещение кропа. */
+		/** Сбрасывает накопленное состояние и смещение кропа. */
 		void reset() {
 			mHasRef  = false;
 			mCamPosX = 0f; mCamPosY = 0f;
 			mSmoothX = 0f; mSmoothY = 0f;
 			mStabCropDx = 0; mStabCropDy = 0;
-			// Возвращаем кроп в нейтральное положение
-			if (mCamHandler != null)
-				mCamHandler.post(MainActivity.this::buildAndSendRequest);
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
 		// 1D Phase-only cross-correlation via FFT.
 		// Возвращает float[2]: [сдвиг в отсчётах, значение пика (0..1)].
-		// Сдвиг > 0 означает: cur сдвинута вправо/вниз относительно prev.
+		// Сдвиг > 0: cur сдвинута вправо/вниз относительно prev.
 		// ─────────────────────────────────────────────────────────────────────
 		private float[] crossCorr1D(float[] prev, float[] cur, int len, int fftSize) {
 			float[] reA = new float[fftSize], imA = new float[fftSize];
 			float[] reB = new float[fftSize], imB = new float[fftSize];
-
-			// DC removal + zero-pad (массивы уже заполнены нулями)
 			float meanA = 0f, meanB = 0f;
 			for (int i = 0; i < len; i++) { meanA += prev[i]; meanB += cur[i]; }
 			meanA /= len; meanB /= len;
-			for (int i = 0; i < len; i++) { reA[i] = prev[i] - meanA; reB[i] = cur[i] - meanB; }
-
-			fft(reA, imA, fftSize);
-			fft(reB, imB, fftSize);
-
-			// Кросс-спектр A * conj(B), фазовая нормализация
+			for (int i = 0; i < len; i++) { reA[i] = prev[i]-meanA; reB[i] = cur[i]-meanB; }
+			fft(reA, imA, fftSize); fft(reB, imB, fftSize);
 			float[] xRe = new float[fftSize], xIm = new float[fftSize];
 			for (int i = 0; i < fftSize; i++) {
-				float a=reA[i], b=imA[i], c=reB[i], d=imB[i];
+				float a=reA[i],b=imA[i],c=reB[i],d=imB[i];
 				float re=a*c+b*d, im=b*c-a*d;
 				float mag=(float)Math.sqrt(re*re+im*im);
-				if (mag>1e-6f) { xRe[i]=re/mag; xIm[i]=im/mag; }
+				if (mag>1e-6f){xRe[i]=re/mag;xIm[i]=im/mag;}
 			}
-
-			// IFFT: conj → FFT → conj → /N
 			for (int i=0;i<fftSize;i++) xIm[i]=-xIm[i];
-			fft(xRe, xIm, fftSize);
+			fft(xRe,xIm,fftSize);
 			for (int i=0;i<fftSize;i++) xRe[i]/=fftSize;
-
-			// Ищем пик в диапазоне ±len/3 (шире, чем len/4 — меньше пропусков)
 			int halfSearch = len / 3;
-			int peakIdx = 0;
-			float peakVal = Float.NEGATIVE_INFINITY;
-			for (int i=0; i<=halfSearch; i++) {
-				if (xRe[i]>peakVal) { peakVal=xRe[i]; peakIdx=i; }
-			}
-			for (int i=fftSize-halfSearch; i<fftSize; i++) {
-				if (xRe[i]>peakVal) { peakVal=xRe[i]; peakIdx=i-fftSize; }
-			}
-
-			// Параболическая субпиксельная интерполяция
-			int pi=(peakIdx+fftSize)%fftSize;
-			int pm=(pi-1+fftSize)%fftSize, pp=(pi+1)%fftSize;
-			float ym=xRe[pm], y0=xRe[pi], yp=xRe[pp];
+			int peakIdx = 0; float peakVal = Float.NEGATIVE_INFINITY;
+			for (int i=0;i<=halfSearch;i++){if(xRe[i]>peakVal){peakVal=xRe[i];peakIdx=i;}}
+			for (int i=fftSize-halfSearch;i<fftSize;i++){if(xRe[i]>peakVal){peakVal=xRe[i];peakIdx=i-fftSize;}}
+			int pi=(peakIdx+fftSize)%fftSize, pm=(pi-1+fftSize)%fftSize, pp=(pi+1)%fftSize;
+			float ym=xRe[pm],y0=xRe[pi],yp=xRe[pp];
 			float denom=2f*(2f*y0-ym-yp);
 			float sub=(denom!=0f)?(yp-ym)/denom:0f;
-			return new float[]{ peakIdx+sub, peakVal };
+			return new float[]{peakIdx+sub, peakVal};
 		}
 
 		// ─────────────────────────────────────────────────────────────────────
-		// Cooley-Tukey in-place radix-2 DIT FFT.
+		// Cooley-Tukey in-place radix-2 DIT FFT
 		// ─────────────────────────────────────────────────────────────────────
 		private void fft(float[] re, float[] im, int n) {
-			for (int i=1,j=0; i<n; i++) {
+			for (int i=1,j=0;i<n;i++){
 				int bit=n>>1;
-				for (; (j&bit)!=0; bit>>=1) j^=bit;
+				for(;(j&bit)!=0;bit>>=1)j^=bit;
 				j^=bit;
-				if (i<j) {
-					float tr=re[i]; re[i]=re[j]; re[j]=tr;
-					float ti=im[i]; im[i]=im[j]; im[j]=ti;
-				}
+				if(i<j){float tr=re[i];re[i]=re[j];re[j]=tr;float ti=im[i];im[i]=im[j];im[j]=ti;}
 			}
-			for (int len=2; len<=n; len<<=1) {
+			for(int len=2;len<=n;len<<=1){
 				double ang=-2.0*Math.PI/len;
-				float wRe=(float)Math.cos(ang), wIm=(float)Math.sin(ang);
-				for (int i=0; i<n; i+=len) {
-					float curRe=1f, curIm=0f;
-					for (int k=0; k<len/2; k++) {
-						float uRe=re[i+k], uIm=im[i+k];
-						float vRe=re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
-						float vIm=re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
-						re[i+k]      =uRe+vRe; im[i+k]      =uIm+vIm;
-						re[i+k+len/2]=uRe-vRe; im[i+k+len/2]=uIm-vIm;
-						float nRe=curRe*wRe-curIm*wIm;
-						curIm=curRe*wIm+curIm*wRe; curRe=nRe;
+				float wRe=(float)Math.cos(ang),wIm=(float)Math.sin(ang);
+				for(int i=0;i<n;i+=len){
+					float curRe=1f,curIm=0f;
+					for(int k=0;k<len/2;k++){
+						float uRe=re[i+k],uIm=im[i+k];
+						float vRe=re[i+k+len/2]*curRe-im[i+k+len/2]*curIm;
+						float vIm=re[i+k+len/2]*curIm+im[i+k+len/2]*curRe;
+						re[i+k]=uRe+vRe;im[i+k]=uIm+vIm;
+						re[i+k+len/2]=uRe-vRe;im[i+k+len/2]=uIm-vIm;
+						float nRe=curRe*wRe-curIm*wIm;curIm=curRe*wIm+curIm*wRe;curRe=nRe;
 					}
 				}
 			}
