@@ -28,8 +28,7 @@ import android.media.audiofx.NoiseSuppressor;
 import android.media.audiofx.AcousticEchoCanceler;
 
 import android.opengl.*;
-import javax.microedition.khronos.egl.EGLConfig;
-import javax.microedition.khronos.opengles.GL10;
+import android.opengl.EGLConfig;
 
 import java.io.File;
 import java.nio.ByteBuffer;
@@ -579,8 +578,7 @@ public class MainActivity extends Activity {
 
         return root;
     }
-
-    private View buildFocusColumn() {
+	    private View buildFocusColumn() {
         FrameLayout col = new FrameLayout(this);
         col.setBackgroundColor(0x33000000);
 
@@ -737,8 +735,8 @@ public class MainActivity extends Activity {
         if (mSurfaceReady)
             openCamera();
     }
-	
-	    @SuppressLint("MissingPermission")
+
+    @SuppressLint("MissingPermission")
     private void openCamera() {
         if (mCamThread == null || !mCamThread.isAlive()) {
             mCamThread = new HandlerThread("cam");
@@ -775,7 +773,6 @@ public class MainActivity extends Activity {
                 @Override
                 public void onOpened(CameraDevice dev) {
                     mCamDev = dev;
-                    // Инициализируем рендерер
                     mRenderer = new StabilizedRenderer();
                     mRenderer.init(mSv.getHolder().getSurface(), VIDEO_W, VIDEO_H);
                     startPreview();
@@ -817,7 +814,6 @@ public class MainActivity extends Activity {
                 mCapSess = null;
             }
 
-            // ImageReader для анализа стабилизации (320x180 YUV)
             if (mStabReader != null) {
                 try { mStabReader.close(); } catch (Exception ignored) {}
             }
@@ -828,7 +824,6 @@ public class MainActivity extends Activity {
                     mStab.onFrame(reader);
             }, mCamHandler);
 
-            // Рендерер даёт SurfaceTexture, на который камера будет слать кадры
             SurfaceTexture texture = mRenderer.getInputSurfaceTexture();
             texture.setDefaultBufferSize(VIDEO_W, VIDEO_H);
             Surface cameraSurface = new Surface(texture);
@@ -889,10 +884,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // =========================================================================
-    // REC / STOP
-    // =========================================================================
-
     private void onPauseClick() {
         mPaused = !mPaused;
         if (mPaused) {
@@ -929,12 +920,7 @@ public class MainActivity extends Activity {
         }
     }
 
-    // =========================================================================
-    // Энкодеры: создание / видео-петля
-    // =========================================================================
-
     private synchronized void ensureEncoders() {
-        // Видео-энкодер
         if (mVidEnc == null || mEncSurface == null || !mEncSurface.isValid()) {
             try {
                 if (mVidEnc != null) { try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null; }
@@ -948,7 +934,6 @@ public class MainActivity extends Activity {
                 vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
                 mVidEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
                 mVidEnc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-                // ВАЖНО: энкодер получает Surface от рендерера, а не от камеры!
                 mEncSurface = mRenderer.getEncoderSurface();
                 mVidEnc.start();
                 mVidOutFmt = null;
@@ -1020,10 +1005,6 @@ public class MainActivity extends Activity {
         }
         mVidLoopRunning = false;
     }
-
-    // =========================================================================
-    // Аудио-пайплайн
-    // =========================================================================
 
     @SuppressLint("MissingPermission")
     private void startMonitor() {
@@ -1185,10 +1166,6 @@ public class MainActivity extends Activity {
         }
     }
 
-    // =========================================================================
-    // REC: doStart / doStop / finalizeMuxer
-    // =========================================================================
-
     @SuppressLint("MissingPermission")
     private void doStart() {
         try {
@@ -1303,10 +1280,6 @@ public class MainActivity extends Activity {
         runOnUiThread(() -> mTvStatus.setText(s));
     }
 
-    // =========================================================================
-    // Аудио-источники
-    // =========================================================================
-
     private void buildAudioSources() {
         List<AudioSrcItem> list = new ArrayList<>();
         if (Build.VERSION.SDK_INT >= 23) {
@@ -1391,8 +1364,8 @@ public class MainActivity extends Activity {
             device = d;
         }
     }
-	
-	    // =========================================================================
+
+    // =========================================================================
     // Вспомогательные классы UI и визуализации
     // =========================================================================
 
@@ -2329,63 +2302,46 @@ public class MainActivity extends Activity {
             }
         }
     }
-	
-	    // =========================================================================
+
+    // =========================================================================
     // Digital Stabilizer (анализ дрожания, буферизация, сглаживание траектории)
     // =========================================================================
     class DigitalStabilizer {
-        // Размеры анализируемого кадра (из ImageReader)
         private static final int AW = 320, AH = 180;
-        // Размер буфера кадров (60 кадров ≈ 2 секунды при 30 fps)
         private static final int BUF_SIZE = 60;
-        // Задержка в кадрах для компенсации (15 кадров ≈ 0.5 с)
         private static final int LAG_FRAMES = 15;
-        // Частота среза фильтра траектории (число кадров в окне скользящего среднего)
         private static final int SMOOTH_WINDOW = 15;
-
-        // FFT размеры (степень двойки ≥ 2*длина проекции)
         private static final int FFT_W = 1024;
         private static final int FFT_H = 512;
-
-        // Максимальный сдвиг в долях от размера SurfaceView
         private static final float MAX_SHIFT_FRAC = 0.25f;
 
-        // Кольцевой буфер проекций
         private final float[][] rowProjBuf = new float[BUF_SIZE][AH];
         private final float[][] colProjBuf = new float[BUF_SIZE][AW];
         private final long[] timeStampBuf = new long[BUF_SIZE];
         private int bufWritePos = 0;
         private int bufCount = 0;
 
-        // Траектория: кумулятивные сдвиги относительно первого кадра буфера
         private float[] trajX = new float[BUF_SIZE];
         private float[] trajY = new float[BUF_SIZE];
         private boolean trajValid = false;
 
-        // Сглаженная траектория
         private float[] smoothTrajX = new float[BUF_SIZE];
         private float[] smoothTrajY = new float[BUF_SIZE];
 
-        // Текущий накопленный сдвиг для применения к SurfaceView (не используется, компенсация через рендерер)
         private float currentDx = 0f, currentDy = 0f;
-
         private boolean enabled = true;
 
-        /** Вызывается из mCamHandler при каждом новом кадре ImageReader */
         void onFrame(ImageReader reader) {
             if (!enabled) return;
-
             android.media.Image img = null;
             try { img = reader.acquireLatestImage(); } catch (Exception e) { return; }
             if (img == null) return;
-
             try {
                 android.media.Image.Plane yPlane = img.getPlanes()[0];
                 ByteBuffer yBuf = yPlane.getBuffer();
                 int rowStride = yPlane.getRowStride();
                 int pixelStride = yPlane.getPixelStride();
 
-                // Строим проекции
                 float[] rowProj = new float[AH];
                 float[] colProj = new float[AW];
                 for (int y = 0; y < AH; y++) {
@@ -2402,7 +2358,6 @@ public class MainActivity extends Activity {
                     colProj[x] = sum / (float) AH;
                 }
 
-                // Добавляем в кольцевой буфер
                 int idx = bufWritePos;
                 System.arraycopy(rowProj, 0, rowProjBuf[idx], 0, AH);
                 System.arraycopy(colProj, 0, colProjBuf[idx], 0, AW);
@@ -2410,50 +2365,40 @@ public class MainActivity extends Activity {
                 bufWritePos = (bufWritePos + 1) % BUF_SIZE;
                 if (bufCount < BUF_SIZE) bufCount++;
 
-                // Пересчитываем траекторию, когда буфер заполнен достаточно
                 if (bufCount >= 2) {
                     updateTrajectory();
                 }
 
-                // Передаём сглаженный сдвиг в рендерер (с задержкой)
                 if (bufCount > LAG_FRAMES && trajValid && mRenderer != null) {
                     int targetIdx = (bufWritePos - 1 - LAG_FRAMES + BUF_SIZE) % BUF_SIZE;
                     float compX = smoothTrajX[targetIdx] - trajX[targetIdx];
                     float compY = smoothTrajY[targetIdx] - trajY[targetIdx];
 
-                    // Масштабируем в пиксели кадра (VIDEO_W, VIDEO_H)
                     float scaleX = (float) VIDEO_W / AW;
                     float scaleY = (float) VIDEO_H / AH;
                     float shiftX = compX * scaleX;
                     float shiftY = compY * scaleY;
 
-                    // Ограничиваем максимальным кропом
                     float maxShiftX = VIDEO_W * MAX_SHIFT_FRAC;
                     float maxShiftY = VIDEO_H * MAX_SHIFT_FRAC;
                     shiftX = Math.max(-maxShiftX, Math.min(maxShiftX, shiftX));
                     shiftY = Math.max(-maxShiftY, Math.min(maxShiftY, shiftY));
 
-                    // Применяем сглаживание самого сдвига (небольшая инерция)
                     currentDx = currentDx * 0.7f + shiftX * 0.3f;
                     currentDy = currentDy * 0.7f + shiftY * 0.3f;
                     mRenderer.setStabilizationShift(currentDx, currentDy);
                 }
-
             } finally {
                 img.close();
             }
         }
 
-        /** Вычисляет межкадровые сдвиги и строит траекторию */
         private void updateTrajectory() {
-            // Очищаем траекторию
             trajX[0] = 0f;
             trajY[0] = 0f;
-
             int startIdx = (bufWritePos - bufCount + BUF_SIZE) % BUF_SIZE;
             int prevIdx = startIdx;
             float sumDx = 0f, sumDy = 0f;
-
             for (int i = 1; i < bufCount; i++) {
                 int curIdx = (startIdx + i) % BUF_SIZE;
                 float dx = crossCorr1D(colProjBuf[prevIdx], colProjBuf[curIdx], AW, FFT_W);
@@ -2464,16 +2409,13 @@ public class MainActivity extends Activity {
                 trajY[curIdx] = sumDy;
                 prevIdx = curIdx;
             }
-
             smoothTrajectory();
             trajValid = true;
         }
 
-        /** Применяет скользящее среднее с окном SMOOTH_WINDOW к траектории */
         private void smoothTrajectory() {
             int startIdx = (bufWritePos - bufCount + BUF_SIZE) % BUF_SIZE;
             int halfWin = SMOOTH_WINDOW / 2;
-
             for (int i = 0; i < bufCount; i++) {
                 int idx = (startIdx + i) % BUF_SIZE;
                 float sumX = 0f, sumY = 0f;
@@ -2492,7 +2434,6 @@ public class MainActivity extends Activity {
             }
         }
 
-        /** Сбрасывает состояние стабилизатора */
         void reset() {
             bufCount = 0;
             bufWritePos = 0;
@@ -2507,21 +2448,15 @@ public class MainActivity extends Activity {
             if (!enabled) reset();
         }
 
-        // =======================================================================
-        // 1D Phase-only cross-correlation
-        // =======================================================================
         private float crossCorr1D(float[] prev, float[] cur, int len, int fftSize) {
             float[] reA = new float[fftSize], imA = new float[fftSize];
             float[] reB = new float[fftSize], imB = new float[fftSize];
-
             float meanA = 0f, meanB = 0f;
             for (int i = 0; i < len; i++) { meanA += prev[i]; meanB += cur[i]; }
             meanA /= len; meanB /= len;
             for (int i = 0; i < len; i++) { reA[i] = prev[i] - meanA; reB[i] = cur[i] - meanB; }
-
             fft(reA, imA, fftSize);
             fft(reB, imB, fftSize);
-
             float[] xRe = new float[fftSize], xIm = new float[fftSize];
             for (int i = 0; i < fftSize; i++) {
                 float a = reA[i], b = imA[i], c = reB[i], d = imB[i];
@@ -2529,11 +2464,9 @@ public class MainActivity extends Activity {
                 float mag = (float) Math.sqrt(re*re + im*im);
                 if (mag > 1e-6f) { xRe[i] = re/mag; xIm[i] = im/mag; }
             }
-
             for (int i = 0; i < fftSize; i++) xIm[i] = -xIm[i];
             fft(xRe, xIm, fftSize);
             for (int i = 0; i < fftSize; i++) xRe[i] /= fftSize;
-
             int halfSearch = len / 4;
             int peakIdx = 0;
             float peakVal = Float.NEGATIVE_INFINITY;
@@ -2543,7 +2476,6 @@ public class MainActivity extends Activity {
             for (int i = fftSize - halfSearch; i < fftSize; i++) {
                 if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i - fftSize; }
             }
-
             int pi = (peakIdx + fftSize) % fftSize;
             int pm = (pi - 1 + fftSize) % fftSize;
             int pp = (pi + 1) % fftSize;
@@ -2586,17 +2518,15 @@ public class MainActivity extends Activity {
     // StabilizedRenderer — OpenGL рендерер с компенсацией дрожания
     // =========================================================================
     class StabilizedRenderer {
-        private static final String TAG = "StabilizedRenderer";
-
         private SurfaceTexture mInputTexture;
         private Surface mInputSurface;
         private Surface mEncoderSurface;
         private Surface mPreviewSurface;
 
-        private EGLDisplay mEglDisplay;
-        private EGLContext mEglContext;
-        private EGLSurface mEglEncoderSurface;
-        private EGLSurface mEglPreviewSurface;
+        private android.opengl.EGLDisplay mEglDisplay;
+        private android.opengl.EGLContext mEglContext;
+        private android.opengl.EGLSurface mEglEncoderSurface;
+        private android.opengl.EGLSurface mEglPreviewSurface;
 
         private int mWidth, mHeight;
         private int mTexId;
@@ -2652,23 +2582,20 @@ public class MainActivity extends Activity {
                     EGL14.EGL_ALPHA_SIZE, 8,
                     EGL14.EGL_NONE
             };
-            EGLConfig[] configs = new EGLConfig[1];
+            android.opengl.EGLConfig[] configs = new android.opengl.EGLConfig[1];
             int[] numConfigs = new int[1];
             EGL14.eglChooseConfig(mEglDisplay, configAttribs, 0, configs, 0, 1, numConfigs, 0);
-            EGLConfig config = configs[0];
+            android.opengl.EGLConfig config = configs[0];
 
             int[] ctxAttribs = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
             mEglContext = EGL14.eglCreateContext(mEglDisplay, config, EGL14.EGL_NO_CONTEXT, ctxAttribs, 0);
 
-            // Encoder surface
             int[] surfAttribs = { EGL14.EGL_NONE };
             mEglEncoderSurface = EGL14.eglCreateWindowSurface(mEglDisplay, config, mEncoderSurface, surfAttribs, 0);
-            // Preview surface
             mEglPreviewSurface = EGL14.eglCreateWindowSurface(mEglDisplay, config, mPreviewSurface, surfAttribs, 0);
 
             EGL14.eglMakeCurrent(mEglDisplay, mEglEncoderSurface, mEglEncoderSurface, mEglContext);
 
-            // Создаём текстуру для входных кадров
             int[] tex = new int[1];
             GLES20.glGenTextures(1, tex, 0);
             mTexId = tex[0];
@@ -2687,9 +2614,7 @@ public class MainActivity extends Activity {
                 }
             });
 
-            // Инициализируем шейдеры
             initShaders();
-
             mInitialized = true;
         }
 
@@ -2736,41 +2661,31 @@ public class MainActivity extends Activity {
 
         private void drawFrame() {
             if (!mInitialized) return;
-
             mInputTexture.updateTexImage();
             mInputTexture.getTransformMatrix(mTransformMatrix);
-
-            // Рендерим на оба surface
             renderToSurface(mEglEncoderSurface);
             renderToSurface(mEglPreviewSurface);
         }
 
-        private void renderToSurface(EGLSurface surface) {
+        private void renderToSurface(android.opengl.EGLSurface surface) {
             EGL14.eglMakeCurrent(mEglDisplay, surface, surface, mEglContext);
-
             GLES20.glClearColor(0f, 0f, 0f, 1f);
             GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
-
             GLES20.glUseProgram(mProgram);
 
-            // Вычисляем матрицу проекции с учётом стабилизационного сдвига и кропа
             float[] projMatrix = new float[16];
             android.opengl.Matrix.orthoM(projMatrix, 0, -1f, 1f, -1f, 1f, -1f, 1f);
 
             if (mStabilizationEnabled) {
-                // Применяем сдвиг (в нормализованных координатах)
                 float shiftXnorm = (mShiftX / mWidth) * 2f;
                 float shiftYnorm = (mShiftY / mHeight) * 2f;
                 android.opengl.Matrix.translateM(projMatrix, 0, -shiftXnorm, -shiftYnorm, 0f);
-
-                // Добавляем кроп для компенсации сдвига (масштабирование)
                 float scale = 1f + Math.max(Math.abs(shiftXnorm), Math.abs(shiftYnorm)) * 0.5f;
                 android.opengl.Matrix.scaleM(projMatrix, 0, scale, scale, 1f);
             }
 
             GLES20.glUniformMatrix4fv(mMvpLoc, 1, false, projMatrix, 0);
 
-            // Вершины и текстурные координаты (полноэкранный квад)
             float[] vertices = {
                     -1f, -1f, 0f,
                     1f, -1f, 0f,
@@ -2797,7 +2712,6 @@ public class MainActivity extends Activity {
             GLES20.glUniform1i(mTexLoc, 0);
 
             GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-
             EGL14.eglSwapBuffers(mEglDisplay, surface);
         }
 
@@ -2820,26 +2734,15 @@ public class MainActivity extends Activity {
         }
 
         SurfaceTexture getInputSurfaceTexture() { return mInputTexture; }
-
         Surface getEncoderSurface() { return mEncoderSurface; }
-
-        void setEncoderSurface(Surface surface) {
-            mEncoderSurface = surface;
-            // EGL surface будет создан при инициализации
-        }
-
-        void setStabilizationEnabled(boolean enabled) {
-            mStabilizationEnabled = enabled;
-        }
-
-        void setStabilizationShift(float dx, float dy) {
-            mShiftX = dx;
-            mShiftY = dy;
-        }
+        void setEncoderSurface(Surface surface) { mEncoderSurface = surface; }
+        void setStabilizationEnabled(boolean enabled) { mStabilizationEnabled = enabled; }
+        void setStabilizationShift(float dx, float dy) { mShiftX = dx; mShiftY = dy; }
     }
 
-    // Применение стабилизационного сдвига к SurfaceView (для совместимости)
     private void applyStabTransform(float dx, float dy) {
-        // В новой архитектуре это не используется, сдвиг применяется через рендерер
+        // Заглушка для обратной совместимости, в новой архитектуре не используется
     }
 }
+
+
