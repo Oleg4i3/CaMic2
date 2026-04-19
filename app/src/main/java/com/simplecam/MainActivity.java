@@ -1021,7 +1021,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 	private void startEis() {
 		stopEis();
-		synchronized (mEisRefLock) { mEisRefBlock = null; mEisFrameCnt = 0; }
+		synchronized (mEisRefLock) { mEisFrameCnt = 0; }
 		mEisRunning = true;
 		mEisThread = new Thread(this::eisProcessingLoop, "eis-proc");
 		mEisThread.setDaemon(true);
