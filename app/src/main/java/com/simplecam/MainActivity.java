@@ -41,7 +41,7 @@ import java.util.concurrent.TimeUnit;
 * Справа — рычаг Zoom + появляющийся слайдер Manual Focus.
 * Снизу — панель управления с круглой кнопкой REC.
 */
-public class MainActivity extends Activity {
+public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	
 	// ─── Константы ────────────────────────────────────────────────────────────
 	private static final int VIDEO_W = 1280;
@@ -54,16 +54,6 @@ public class MainActivity extends Activity {
 	
 	// ─── UI ───────────────────────────────────────────────────────────────────
 	private SurfaceView mSv;
-
-	// ─── Digital Stabilization (EIS v2) ──────────────────────────────────────
-	// Стабилизация через SCALER_CROP_REGION — работает и в превью, и в записи.
-	private volatile boolean mDigiStabEnabled = false;
-	private CheckBox mCbDigiStab;
-	private DigitalStabilizer mStab;
-	private ImageReader mStabReader;         // YUV 320×180 для анализа
-	private volatile int mStabSensorX = 0;  // смещение кропа в сенсорных пикс. по X
-	private volatile int mStabSensorY = 0;  // смещение кропа в сенсорных пикс. по Y
-	private final android.os.Handler mUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 	private Spinner mSpinner;
 	private VerticalSeekBar mSeekGain;
 	private FocusDrumView mFocusDrum; // барабан ручного фокуса
@@ -175,6 +165,34 @@ public class MainActivity extends Activity {
 	private int mEvMin = -6, mEvMax = 6;
 	private SeekBar mSeekEv;
 	private TextView mTvEv;
+
+	// ─── EIS (электронная стабилизация) ──────────────────────────────────────
+	// Стратегия: ImageReader 640×360 YUV → Y-плоскость → контраст-буст → SAD
+	// блок-матчинг центрального блока (150×150) с поиском ±EIS_SEARCH пикс.
+	// Найденный сдвиг пересчитывается в сенсорные координаты и применяется
+	// сдвигом SCALER_CROP_REGION на каждом кадре (задержка ≈ 1 фрейм).
+	// Референс-блок обновляется раз в EIS_REF_UPDATE_FRAMES (≈6 с), чтобы
+	// компенсировать медленный дрейф. Дополнительный кроп EIS_CROP_FACTOR
+	// обеспечивает «запас хода» для сдвигов без выхода за границу сенсора.
+	private static final float EIS_CROP_FACTOR      = 1.30f; // +30% кроп
+	private static final int   EIS_SEARCH           = 44;    // ±44 пикс при 640×360
+	private static final int   EIS_BLOCK            = 160;   // 160×160 блок при 640×360
+	private static final int   EIS_COARSE_STEP      = 4;     // шаг грубого поиска
+	private static final int   EIS_W                = 640;   // ширина анализа
+	private static final int   EIS_H                = 360;   // высота анализа
+	private static final int   EIS_REF_UPDATE_FRAMES = 180;  // обновление ~6 с
+
+	private volatile boolean   mEisEnabled  = false;
+	private ImageReader        mEisReader;
+	private volatile boolean   mEisRunning  = false;
+	private Thread             mEisThread;
+	// Применяемый сдвиг в координатах выходного кадра (1280×720)
+	private volatile float     mEisApplyX   = 0f;
+	private volatile float     mEisApplyY   = 0f;
+	// Рабочие буферы (выделяются при первом кадре)
+	private byte[]             mEisWorkY    = null;  // Y-плоскость текущего кадра
+	private int                mEisFrameCnt = 0;
+	private final Object       mEisRefLock  = new Object();
 	
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
 	private final Runnable mZoomRunnable = new Runnable() {
@@ -222,10 +240,10 @@ public class MainActivity extends Activity {
 		if (mCamHandler != null)
 		mCamHandler.removeCallbacks(mZoomRunnable);
 		mVidLoopRunning = false;
+		stopEis();
+		if (mEisReader != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
 		stopAudio();
 		finalizeMuxer();
-		if (mStab != null) { mStab.stop(); mStab = null; }
-		if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
@@ -269,14 +287,7 @@ public class MainActivity extends Activity {
 				}
 			}
 		};
-		mSv.getHolder().addCallback(new SurfaceHolder.Callback() {
-			@Override public void surfaceCreated(SurfaceHolder h) {
-				mSurfaceReady = true;
-				if (mPermsOk) openCamera();
-			}
-			@Override public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {}
-			@Override public void surfaceDestroyed(SurfaceHolder h) { mSurfaceReady = false; }
-		});
+		mSv.getHolder().addCallback(this);
 		FrameLayout.LayoutParams svLP = new FrameLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 		svLP.gravity = Gravity.CENTER;
@@ -417,86 +428,91 @@ public class MainActivity extends Activity {
 		// Шестерёнка слева, статус справа (weight=1)
 		panel.addView(hrow(mSrcToggleBtn, mTvStatus));
 		
-		// ═══════════════════════════════════════════════════════════════════════
-		// Схлопываемая панель настроек — двухколоночная горизонтальная сетка.
-		// Левая колонка: аудио-источник, чекбоксы, пре-буфер.
-		// Правая колонка: EV, битрейт.
-		// Панель занимает всю ширину экрана (за вычетом Gain-слайдера слева).
-		// ═══════════════════════════════════════════════════════════════════════
+		// Схлопываемая панель: спиннер + soft clip + manual focus
+		// Центрируем по экрану — слайдер Gain слева не перекрывает
 		mAudioSrcPanel = new LinearLayout(this);
-		mAudioSrcPanel.setOrientation(LinearLayout.HORIZONTAL);
+		mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL);
 		mAudioSrcPanel.setVisibility(View.GONE);
-		mAudioSrcPanel.setPadding(dp(4), dp(2), dp(4), dp(2));
-
-		// ── ЛЕВАЯ КОЛОНКА (weight=1) ─────────────────────────────────────────
-		LinearLayout leftCol = new LinearLayout(this);
-		leftCol.setOrientation(LinearLayout.VERTICAL);
-		LinearLayout.LayoutParams leftColLP =
-			new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-		leftColLP.rightMargin = dp(8);
-		leftCol.setLayoutParams(leftColLP);
-
-		// — Аудио-источник —
+		mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
+		
 		mSpinner = new Spinner(this);
 		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
-			new ArrayList<String>());
+		new ArrayList<String>());
 		ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
 		mSpinner.setAdapter(ad);
-		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+		// Фиксированная ширина вместо weight=1 — не тянется на весь экран
+		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
 		mSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-			@Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
-				if (!mRecording) { stopAudio(); startMonitor(); }
+			@Override
+			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+				if (!mRecording) {
+					stopAudio();
+					startMonitor();
+				}
 			}
-			@Override public void onNothingSelected(AdapterView<?> p) {}
+			
+			@Override
+			public void onNothingSelected(AdapterView<?> p) {
+			}
 		});
+		
 		LinearLayout srcRow = new LinearLayout(this);
 		srcRow.setOrientation(LinearLayout.HORIZONTAL);
 		srcRow.setGravity(Gravity.CENTER_VERTICAL);
 		srcRow.addView(smallLabel("Src: "));
 		srcRow.addView(mSpinner);
-		leftCol.addView(srcRow);
-
-		// — Строка 1 чекбоксов: Soft clip + Manual focus —
+		mAudioSrcPanel.addView(srcRow);
+		
 		mCbSoftClip = new CheckBox(this);
 		mCbSoftClip.setText("Soft clip");
-		mCbSoftClip.setTextColor(0xCCCCCCCC); mCbSoftClip.setTextSize(11);
-		mCbSoftClip.setChecked(true); mSoftClip = true;
+		mCbSoftClip.setTextColor(0xCCCCCCCC);
+		mCbSoftClip.setTextSize(12);
+		mCbSoftClip.setChecked(true);
+		mSoftClip = true;
 		mCbSoftClip.setOnCheckedChangeListener((cb, checked) -> mSoftClip = checked);
-
+		
 		mCbManualFocus = new CheckBox(this);
 		mCbManualFocus.setText("Manual focus");
-		mCbManualFocus.setTextColor(0xCCCCCCCC); mCbManualFocus.setTextSize(11);
+		mCbManualFocus.setTextColor(0xCCCCCCCC);
+		mCbManualFocus.setTextSize(12);
 		mCbManualFocus.setOnCheckedChangeListener((cb, checked) -> {
 			mManualFocus = checked;
 			mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
+			// Сдвигаем кнопку REC влево на полширины когда барабан виден
+			// mBtn теперь в root FrameLayout с фиксированным rightMargin — не трогаем
+			// Чекбокс Focus Assist — только при ручной фокусировке
 			if (mCbFocusAssist != null)
-				mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (!checked && mFocusAssistHandler != null)
-				mFocusAssistHandler.removeCallbacksAndMessages(null);
-			if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
+			mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (!checked) {
+				// Скрываем ассист и отменяем восстановление зума
+				if (mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
+			}
+			if (mCamHandler != null)
+			mCamHandler.post(this::buildAndSendRequest);
 		});
+		
+		LinearLayout cbRow = new LinearLayout(this);
+		cbRow.setOrientation(LinearLayout.HORIZONTAL);
+		cbRow.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow.addView(mCbSoftClip);
+		cbRow.addView(mCbManualFocus);
+		mAudioSrcPanel.addView(cbRow);
 
-		LinearLayout cbRow1 = new LinearLayout(this);
-		cbRow1.setOrientation(LinearLayout.HORIZONTAL);
-		cbRow1.setGravity(Gravity.CENTER_VERTICAL);
-		cbRow1.addView(mCbSoftClip);
-		cbRow1.addView(mCbManualFocus);
-		leftCol.addView(cbRow1);
-
-		// — Строка 2 чекбоксов: Oscilloscope + Spectrum —
+		// Чекбоксы видимости анализаторов
 		CheckBox mCbOsc = new CheckBox(this);
 		mCbOsc.setText("Oscilloscope");
-		mCbOsc.setTextColor(0xCCCCCCCC); mCbOsc.setTextSize(11);
+		mCbOsc.setTextColor(0xCCCCCCCC);
+		mCbOsc.setTextSize(12);
 		mCbOsc.setChecked(false);
 		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
 			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (mEnvelope     != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
+			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
 		});
 
 		CheckBox mCbSpec = new CheckBox(this);
-		mCbSpec.setText("Spectrum");
-		mCbSpec.setTextColor(0xCCCCCCCC); mCbSpec.setTextSize(11);
+		mCbSpec.setText("Spectrum analyzer");
+		mCbSpec.setTextColor(0xCCCCCCCC);
+		mCbSpec.setTextSize(12);
 		mCbSpec.setChecked(true);
 		mCbSpec.setOnCheckedChangeListener((cb, checked) -> {
 			if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE);
@@ -507,69 +523,21 @@ public class MainActivity extends Activity {
 		cbRow2.setGravity(Gravity.CENTER_VERTICAL);
 		cbRow2.addView(mCbOsc);
 		cbRow2.addView(mCbSpec);
-		leftCol.addView(cbRow2);
-
-		// — Focus Assist (скрыт, появляется с Manual focus) —
+		mAudioSrcPanel.addView(cbRow2);
+		
+		// Focus Assist
 		mCbFocusAssist = new CheckBox(this);
-		mCbFocusAssist.setText("Focus assist");
-		mCbFocusAssist.setTextColor(0xCCCCCCCC); mCbFocusAssist.setTextSize(11);
+		mCbFocusAssist.setText("Focus assist (zoom while focusing)");
+		mCbFocusAssist.setTextColor(0xCCCCCCCC);
+		mCbFocusAssist.setTextSize(12);
 		mCbFocusAssist.setVisibility(View.GONE);
-		leftCol.addView(mCbFocusAssist);
+		mAudioSrcPanel.addView(mCbFocusAssist);
 
-		// — Digital Stabilization —
-		mCbDigiStab = new CheckBox(this);
-		mCbDigiStab.setText("Digital stab");
-		mCbDigiStab.setTextColor(0xCCCCCCCC); mCbDigiStab.setTextSize(11);
-		mCbDigiStab.setChecked(false);
-		mCbDigiStab.setOnCheckedChangeListener((cb, checked) -> {
-			mDigiStabEnabled = checked;
-			if (!checked) {
-				// Сбрасываем накопленный сдвиг и возвращаем кроп в центр
-				if (mStab != null) mStab.reset();
-				mStabSensorX = 0;
-				mStabSensorY = 0;
-				// Перестраиваем запрос — кроп вернётся к обычному зуму
-				if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-			}
-		});
-		leftCol.addView(mCbDigiStab);
-
-		// — Pre-buffer: чекбокс + слайдер 1..5 с —
-		CheckBox cbPB = new CheckBox(this);
-		cbPB.setText("Pre-buf");
-		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(11);
-		cbPB.setChecked(true);
-		cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
-		final TextView tvPBLen = smallLabel("1 s");
-		SeekBar sbPB = new SeekBar(this);
-		sbPB.setMax(4); sbPB.setProgress(0);
-		sbPB.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-		sbPB.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mPreBufSecs = p + 1; tvPBLen.setText(mPreBufSecs + " s");
-			}
-			public void onStartTrackingTouch(SeekBar s) {}
-			public void onStopTrackingTouch(SeekBar s) {}
-		});
-		LinearLayout pbRow = new LinearLayout(this);
-		pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL);
-		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
-		leftCol.addView(pbRow);
-
-		mAudioSrcPanel.addView(leftCol);
-
-		// ── ПРАВАЯ КОЛОНКА (weight=1) ────────────────────────────────────────
-		LinearLayout rightSettings = new LinearLayout(this);
-		rightSettings.setOrientation(LinearLayout.VERTICAL);
-		rightSettings.setLayoutParams(
-			new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-		rightSettings.setPadding(dp(4), 0, dp(4), 0);
-
-		// — EV-компенсация —
+		// ── EV ──────────────────────────────────────────────────────────────
 		mTvEv = smallLabel("EV  0");
 		mSeekEv = new SeekBar(this);
 		mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin);
-		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
 		mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
 				mEvComp = mEvMin + p; updateEvLabel(mEvComp);
@@ -581,17 +549,58 @@ public class MainActivity extends Activity {
 		LinearLayout evRow = new LinearLayout(this);
 		evRow.setOrientation(LinearLayout.HORIZONTAL); evRow.setGravity(Gravity.CENTER_VERTICAL);
 		evRow.addView(mTvEv); evRow.addView(mSeekEv);
-		rightSettings.addView(evRow);
+		mAudioSrcPanel.addView(evRow);
 
-		// — Битрейт видео —
+		// ── EIS ──────────────────────────────────────────────────────────────
+		CheckBox cbEis = new CheckBox(this);
+		cbEis.setText("EIS stabilization (kроп +30%)");
+		cbEis.setTextColor(0xCCCCCCCC);
+		cbEis.setTextSize(12);
+		cbEis.setChecked(false);
+		cbEis.setOnCheckedChangeListener((cb, on) -> {
+			if (mRecording) {
+				// во время записи не переключаем — рестарт сессии сломает файл
+				cbEis.setChecked(!on);
+				status("Stop recording to toggle EIS");
+				return;
+			}
+			mEisEnabled = on;
+			mEisApplyX = 0f; mEisApplyY = 0f;
+			stopEis();
+			if (mCamHandler != null) mCamHandler.post(() -> startPreview());
+		});
+		mAudioSrcPanel.addView(cbEis);
+
+		// ── Pre-buffer ───────────────────────────────────────────────────────
+		CheckBox cbPB = new CheckBox(this);
+		cbPB.setText("Pre-buffer");
+		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12);
+		cbPB.setChecked(true); // включён по умолчанию
+		cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
+		final TextView tvPBLen = smallLabel("1 s");
+		SeekBar sbPB = new SeekBar(this);
+		sbPB.setMax(4); sbPB.setProgress(0);
+		sbPB.setLayoutParams(new LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT));
+		sbPB.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+			public void onProgressChanged(SeekBar s, int p, boolean u) {
+				mPreBufSecs = p + 1; tvPBLen.setText(mPreBufSecs + " s");
+			}
+			public void onStartTrackingTouch(SeekBar s) {}
+			public void onStopTrackingTouch(SeekBar s) {}
+		});
+		LinearLayout pbRow = new LinearLayout(this);
+		pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL);
+		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
+		mAudioSrcPanel.addView(pbRow);
+
+		// ── Битрейт видео ────────────────────────────────────────────────────
 		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
 		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
 		Spinner spBps = new Spinner(this);
 		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
 		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
 		spBps.setAdapter(bpsAd); spBps.setSelection(5); // 6 Mbps
-		spBps.setLayoutParams(new LinearLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
+		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(190), ViewGroup.LayoutParams.WRAP_CONTENT));
 		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsV[pos]; }
 			public void onNothingSelected(AdapterView<?> p) {}
@@ -599,9 +608,7 @@ public class MainActivity extends Activity {
 		LinearLayout bpsRow = new LinearLayout(this);
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
 		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		rightSettings.addView(bpsRow);
-
-		mAudioSrcPanel.addView(rightSettings);
+		mAudioSrcPanel.addView(bpsRow);
 
 		panel.addView(mAudioSrcPanel);
 
@@ -609,10 +616,9 @@ public class MainActivity extends Activity {
 		// REC справа, с отступом rightMargin=58dp чтобы не перекрыть рычаг зума (54dp)
 		// Спектр — только анализатор, занимает всю ширину нижней панели
 		mSpectrum = new SpectrumView(this);
-		// rightMargin оставляем под зум-рычаг (54dp) + REC (68dp) + зазор
 		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
 			ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
-		specLP.rightMargin = dp(136);
+		specLP.rightMargin = dp(120); // не заходить под кнопки REC+PAUSE
 		panel.addView(mSpectrum, specLP);
 
 		// ── REC и PAUSE фиксированы в root (FrameLayout), не сдвигаются ──────
@@ -824,6 +830,26 @@ public class MainActivity extends Activity {
 	}
 	
 	// =========================================================================
+	// SurfaceHolder.Callback
+	// =========================================================================
+	
+	@Override
+	public void surfaceCreated(SurfaceHolder h) {
+		mSurfaceReady = true;
+		if (mPermsOk)
+		openCamera();
+	}
+	
+	@Override
+	public void surfaceChanged(SurfaceHolder h, int f, int w, int t) {
+	}
+	
+	@Override
+	public void surfaceDestroyed(SurfaceHolder h) {
+		mSurfaceReady = false;
+	}
+	
+	// =========================================================================
 	// Camera2
 	// =========================================================================
 	
@@ -891,34 +917,33 @@ public class MainActivity extends Activity {
 		if (mCamDev == null || !mSurfaceReady)
 		return;
 		ensureEncoders();
+		// Если EIS включён — создаём/пересоздаём ImageReader для анализа
+		if (mEisEnabled) {
+			if (mEisReader != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
+			mEisReader = ImageReader.newInstance(EIS_W, EIS_H, android.graphics.ImageFormat.YUV_420_888, 3);
+		} else {
+			if (mEisReader != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
+		}
 		try {
 			if (mCapSess != null) {
 				mCapSess.close();
 				mCapSess = null;
 			}
-
-			// Закрываем старый ридер анализа
-			if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
-			// ImageReader 320×180 YUV для анализа EIS (всегда создаём, работает только если enabled)
-			mStabReader = ImageReader.newInstance(320, 180, android.graphics.ImageFormat.YUV_420_888, 3);
-			if (mStab == null) mStab = new DigitalStabilizer();
-			else { mStab.stop(); mStab.reset(); }
-			mStab.start();
-			// onFrame вызывается из mCamHandler — быстро копирует данные и постит на mAnalThread
-			mStabReader.setOnImageAvailableListener(mStab::onFrame, mCamHandler);
-
 			Surface preview = mSv.getHolder().getSurface();
 			List<Surface> targets = new ArrayList<>();
 			targets.add(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 			targets.add(mEncSurface);
-			targets.add(mStabReader.getSurface());
+			if (mEisEnabled && mEisReader != null)
+			targets.add(mEisReader.getSurface());
 			
 			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
 				@Override
 				public void onConfigured(CameraCaptureSession sess) {
 					mCapSess = sess;
 					buildAndSendRequest();
+					// Запускаем EIS-петлю после успешного открытия сессии
+					if (mEisEnabled && mEisReader != null) startEis();
 				}
 				
 				@Override
@@ -946,8 +971,8 @@ public class MainActivity extends Activity {
 			rb.addTarget(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 			rb.addTarget(mEncSurface);
-			if (mStabReader != null)
-			rb.addTarget(mStabReader.getSurface());
+			if (mEisEnabled && mEisReader != null)
+			rb.addTarget(mEisReader.getSurface());
 			
 			if (mManualFocus) {
 				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
@@ -964,18 +989,25 @@ public class MainActivity extends Activity {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				// ── EIS: принудительный зум ≥ EIS_ZOOM_MIN даёт резерв для сдвига кропа ──
-				float effZoom = (mDigiStabEnabled && mStab != null)
-					? Math.max(mZoomLevel, DigitalStabilizer.EIS_ZOOM_MIN)
-					: mZoomLevel;
-				int cropW = Math.max(1, (int)(mSensorRect.width()  / effZoom));
-				int cropH = Math.max(1, (int)(mSensorRect.height() / effZoom));
-				// Центр кропа: нормальный центр сенсора + стабилизационный сдвиг
-				int cx = mSensorRect.left + mSensorRect.width()  / 2 + (mDigiStabEnabled ? mStabSensorX : 0);
-				int cy = mSensorRect.top  + mSensorRect.height() / 2 + (mDigiStabEnabled ? mStabSensorY : 0);
-				// Зажимаем, чтобы не выйти за пределы сенсора
-				int cropX = Math.max(mSensorRect.left,   Math.min(mSensorRect.right  - cropW, cx - cropW / 2));
-				int cropY = Math.max(mSensorRect.top,    Math.min(mSensorRect.bottom - cropH, cy - cropH / 2));
+				// Эффективный зум = пользовательский зум × EIS-кроп (если включён)
+				float effZoom = mZoomLevel * (mEisEnabled ? EIS_CROP_FACTOR : 1f);
+				int cropW = Math.max(1, (int) (mSensorRect.width()  / effZoom));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / effZoom));
+
+				// EIS-сдвиг: mEisApplyX/Y заданы в пикселях выходного кадра (1280×720).
+				// Масштаб: 1 выходной пиксель = cropW / VIDEO_W сенсорных пикселей.
+				int eisSensorDx = 0, eisSensorDy = 0;
+				if (mEisEnabled) {
+					float scale = cropW / (float) VIDEO_W;
+					eisSensorDx = (int) (mEisApplyX * scale);
+					eisSensorDy = (int) (mEisApplyY * scale);
+				}
+
+				int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2 + eisSensorDx;
+				int cropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2 + eisSensorDy;
+				// Не выходим за границы сенсора
+				cropX = Math.max(mSensorRect.left, Math.min(mSensorRect.right  - cropW, cropX));
+				cropY = Math.max(mSensorRect.top,  Math.min(mSensorRect.bottom - cropH, cropY));
 				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
@@ -983,6 +1015,202 @@ public class MainActivity extends Activity {
 		}
 	}
 	
+	// =========================================================================
+	// EIS: запуск / остановка / петля обработки / SAD-корреляция
+	// =========================================================================
+
+	private void startEis() {
+		stopEis();
+		synchronized (mEisRefLock) { mEisRefBlock = null; mEisFrameCnt = 0; }
+		mEisRunning = true;
+		mEisThread = new Thread(this::eisProcessingLoop, "eis-proc");
+		mEisThread.setDaemon(true);
+		mEisThread.start();
+	}
+
+	private void stopEis() {
+		mEisRunning = false;
+		if (mEisThread != null) {
+			try { mEisThread.join(400); } catch (Exception ignored) {}
+			mEisThread = null;
+		}
+	}
+
+	/**
+	 * EIS-петля: считывает кадры из ImageReader (640×360 YUV_420_888),
+	 * извлекает Y-плоскость, применяет контраст-буст на центральный блок,
+	 * запускает двухступенчатый SAD-поиск и обновляет mEisApplyX/Y.
+	 *
+	 * Ступень 1 (грубая): шаг EIS_COARSE_STEP, диапазон ±EIS_SEARCH →
+	 *   (2·EIS_SEARCH/EIS_COARSE_STEP+1)² позиций × (EIS_BLOCK/EIS_COARSE_STEP)²
+	 * Ступень 2 (точная): шаг 1, диапазон ±(EIS_COARSE_STEP+1) → 81 позиция × EIS_BLOCK²
+	 *
+	 * Вся арифметика — целочисленная, нет float/double внутри SAD.
+	 */
+	private void eisProcessingLoop() {
+		final int W = EIS_W, H = EIS_H;
+		final int BLK = EIS_BLOCK;
+		final int SRCH = EIS_SEARCH;
+		// Центр блока в анализ-разрешении
+		final int cx = W / 2 - BLK / 2;
+		final int cy = H / 2 - BLK / 2;
+		// Максимальный сдвиг в coord выходного кадра (1280×720)
+		final float maxShiftX = VIDEO_W * (1f - 1f / EIS_CROP_FACTOR) * 0.9f;
+		final float maxShiftY = VIDEO_H * (1f - 1f / EIS_CROP_FACTOR) * 0.9f;
+		// Коэффициент масштаба анализ→полное разрешение
+		final float scaleX = (float) VIDEO_W / W;
+		final float scaleY = (float) VIDEO_H / H;
+
+		if (mEisWorkY == null) mEisWorkY = new byte[W * H];
+		byte[] refBoost  = null; // контраст-бустнутый референс-блок
+		byte[] curBoost  = new byte[BLK * BLK];
+		byte[] workBoost = new byte[BLK * BLK]; // временный буфер для бустинга
+
+		while (mEisRunning) {
+			android.media.Image img = null;
+			try {
+				ImageReader reader = mEisReader;
+				if (reader == null) { Thread.sleep(10); continue; }
+
+				img = reader.acquireLatestImage();
+				if (img == null) { Thread.sleep(5); continue; }
+
+				// ── 1. Извлекаем Y-плоскость ─────────────────────────────────
+				android.media.Image.Plane yPlane = img.getPlanes()[0];
+				ByteBuffer yBuf = yPlane.getBuffer();
+				int rowStride = yPlane.getRowStride();
+				int pixStride = yPlane.getPixelStride();
+
+				// Быстрый путь: плотный буфер без паддинга
+				if (pixStride == 1 && rowStride == W) {
+					yBuf.get(mEisWorkY, 0, W * H);
+				} else {
+					// Общий путь: с учётом pixel stride и row stride
+					for (int row = 0; row < H; row++) {
+						int base = row * rowStride;
+						int dst  = row * W;
+						for (int col = 0; col < W; col++, dst++) {
+							mEisWorkY[dst] = yBuf.get(base + col * pixStride);
+						}
+					}
+				}
+
+				// ── 2. Контраст-буст центрального блока ──────────────────────
+				extractAndBoost(mEisWorkY, cx, cy, BLK, W, curBoost);
+
+				synchronized (mEisRefLock) {
+					if (refBoost == null) {
+						// Первый кадр: инициализируем референс
+						refBoost = curBoost.clone();
+						mEisFrameCnt = 0;
+						img.close(); img = null;
+						continue;
+					}
+
+					// ── 3. Двухступенчатый SAD-поиск ─────────────────────────
+					// Ступень 1: грубый поиск с шагом EIS_COARSE_STEP
+					int bestDx = 0, bestDy = 0;
+					long bestSAD = Long.MAX_VALUE;
+					int step1 = EIS_COARSE_STEP;
+					for (int dy = -SRCH; dy <= SRCH; dy += step1) {
+						for (int dx = -SRCH; dx <= SRCH; dx += step1) {
+							int nx = cx + dx, ny = cy + dy;
+							if (nx < 0 || ny < 0 || nx + BLK > W || ny + BLK > H) continue;
+							// Бустим текущую позицию для честного сравнения
+							extractAndBoost(mEisWorkY, nx, ny, BLK, W, workBoost);
+							long sad = sadFull(refBoost, workBoost, BLK, step1);
+							if (sad < bestSAD) { bestSAD = sad; bestDx = dx; bestDy = dy; }
+						}
+					}
+					// Ступень 2: точный поиск вокруг победителя (шаг 1)
+					int fineR = step1 + 1;
+					for (int dy = bestDy - fineR; dy <= bestDy + fineR; dy++) {
+						for (int dx = bestDx - fineR; dx <= bestDx + fineR; dx++) {
+							int nx = cx + dx, ny = cy + dy;
+							if (nx < 0 || ny < 0 || nx + BLK > W || ny + BLK > H) continue;
+							extractAndBoost(mEisWorkY, nx, ny, BLK, W, workBoost);
+							long sad = sadFull(refBoost, workBoost, BLK, 1);
+							if (sad < bestSAD) { bestSAD = sad; bestDx = dx; bestDy = dy; }
+						}
+					}
+
+					// ── 4. Применяем коррекцию ────────────────────────────────
+					// Блок сдвинулся на (bestDx, bestDy) → кроп двигаем ОБРАТНО
+					float rawX = -bestDx * scaleX;
+					float rawY = -bestDy * scaleY;
+					mEisApplyX = Math.max(-maxShiftX, Math.min(maxShiftX, rawX));
+					mEisApplyY = Math.max(-maxShiftY, Math.min(maxShiftY, rawY));
+
+					// Отправляем обновлённый запрос захвата
+					if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
+
+					// ── 5. Обновление референса ──────────────────────────────
+					// Обновляем каждые EIS_REF_UPDATE_FRAMES кадров (медленный drift)
+					mEisFrameCnt++;
+					if (mEisFrameCnt >= EIS_REF_UPDATE_FRAMES) {
+						// Новый референс = блок в текущей СТАБИЛИЗИРОВАННОЙ позиции
+						// (т.е. там, куда мы сдвинули кроп, а не rawDx/rawDy)
+						refBoost = curBoost.clone();
+						mEisFrameCnt = 0;
+					}
+				}
+
+			} catch (Exception e) {
+				// продолжаем работу при ошибках отдельных кадров
+			} finally {
+				if (img != null) { try { img.close(); } catch (Exception ignored) {} }
+			}
+		}
+	}
+
+	/**
+	 * Извлекает блок BLK×BLK из Y-плоскости начиная с (bx, by),
+	 * применяет линейное растяжение контраста и записывает в out[].
+	 * Растяжение: min→0, max→255. Если диапазон < 8 (монотонная сцена),
+	 * растяжение не применяется (SAD всё равно будет ~0 для совпадающих блоков).
+	 */
+	private void extractAndBoost(byte[] y, int bx, int by, int blk, int width, byte[] out) {
+		// Проход 1: вытаскиваем сырые значения и ищем min/max
+		int min = 255, max = 0;
+		int idx = 0;
+		for (int r = 0; r < blk; r++) {
+			int src = (by + r) * width + bx;
+			for (int c = 0; c < blk; c++, idx++, src++) {
+				int v = y[src] & 0xFF;
+				out[idx] = (byte) v;
+				if (v < min) min = v;
+				if (v > max) max = v;
+			}
+		}
+		// Проход 2: контраст-буст (нормализация диапазона → 0..255)
+		int range = max - min;
+		if (range < 8) return; // слишком плоская сцена — не трогаем
+		// Умножаем на 256/range, потом сдвиг: быстро и точно в целых числах
+		// scale256 = round(255 * 256 / range) — фиксированная точка Q8
+		int scale256 = (255 * 256 + range / 2) / range;
+		for (int i = 0; i < blk * blk; i++) {
+			int v = (out[i] & 0xFF) - min;
+			int boosted = (v * scale256) >> 8;
+			out[i] = (byte)(boosted > 255 ? 255 : boosted);
+		}
+	}
+
+	/**
+	 * SAD (Sum of Absolute Differences) между двумя BLK×BLK блоками.
+	 * step > 1 — пропускаем пиксели для грубого поиска (экономим время).
+	 * Все операции — целочисленные, никакого float.
+	 */
+	private long sadFull(byte[] ref, byte[] cur, int blk, int step) {
+		long sad = 0;
+		for (int r = 0; r < blk; r += step) {
+			int base = r * blk;
+			for (int c = 0; c < blk; c += step) {
+				sad += Math.abs((ref[base + c] & 0xFF) - (cur[base + c] & 0xFF));
+			}
+		}
+		return sad;
+	}
+
 	// =========================================================================
 	// REC / STOP
 	// =========================================================================
@@ -1928,16 +2156,20 @@ public class MainActivity extends Activity {
 		private void capture() {
 			if (mSv == null || !mSurfaceReady) return;
 			if (android.os.Build.VERSION.SDK_INT < 26) {
+				// PixelCopy недоступен — рисуем заглушку
 				invalidate();
 				return;
 			}
 			try {
 				int svW = mSv.getWidth(), svH = mSv.getHeight();
 				if (svW <= 0 || svH <= 0) return;
+				
+				// Центральная область SAMPLE_SIZE × SAMPLE_SIZE
 				int cx = svW / 2, cy = svH / 2, half = SAMPLE_SIZE / 2;
 				int l = Math.max(0, cx - half), t = Math.max(0, cy - half);
 				int r = Math.min(svW, l + SAMPLE_SIZE), b = Math.min(svH, t + SAMPLE_SIZE);
 				android.graphics.Rect src = new android.graphics.Rect(l, t, r, b);
+				
 				Bitmap dst = Bitmap.createBitmap(r - l, b - t, Bitmap.Config.ARGB_8888);
 				android.view.PixelCopy.request(mSv, src, dst, result -> {
 					if (result == android.view.PixelCopy.SUCCESS) {
@@ -2571,301 +2803,5 @@ public class MainActivity extends Activity {
 			}
 		}
 	}
-
-	// ─── Стабилизационный сдвиг ────────────────────────────────────────────────
-	// EIS v2 работает через SCALER_CROP_REGION в buildAndSendRequest()
-	// и не требует трансформации SurfaceView (стабилизируется и превью, и запись).
-	// Метод оставлен как заглушка на случай совместимости.
-	private void applyStabTransform(float dx, float dy) {
-		// no-op: стабилизация теперь через смещение кропа (mStabSensorX/Y)
-	}
-
-	// =========================================================================
-	// Digital Stabilizer v2 — Crop-Region EIS
-	//
-	// Архитектура:
-	//   • Отдельный фоновый поток (mAnalThread) — не блокирует Camera2-handler.
-	//   • onFrame(): быстро копирует Y-данные, Image закрывается сразу же,
-	//     задача на анализ постится в mAnalThread.
-	//   • analyzeFrame(): взвешенные 1D-проекции (только контрастные строки/
-	//     столбцы, взвешенные нормированной дисперсией) → FFT фазовая
-	//     кросс-корреляция с ЗАФИКСИРОВАННЫМ опорным кадром (абсолютный сдвиг,
-	//     нет накопления ошибки) → обновление mStabSensorX/Y.
-	//   • buildAndSendRequest() читает mStabSensorX/Y и смещает SCALER_CROP_REGION
-	//     от центра — стабилизация применяется одновременно к превью И к записи.
-	//   • EIS_ZOOM_MIN = 1.25× : принудительный кроп оставляет ±10% резерва
-	//     для сдвига на каждой стороне кадра без выхода за границы сенсора.
-	//   • Адаптация опоры: при устойчивом сдвиге > 70% лимита (намеренное
-	//     панорамирование) опора медленно сдвигается вслед за кадром.
-	// =========================================================================
-	class DigitalStabilizer {
-
-		/** Принудительный зум при включённом EIS. Кроп = 1/EIS_ZOOM_MIN от сенсора → резерв сдвига. */
-		static final float EIS_ZOOM_MIN = 1.25f;
-
-		// Размеры анализ-кадра (совпадают с ImageReader)
-		private static final int AW = 320, AH = 180;
-
-		// FFT-размеры: степень двойки ≥ 2 × длина проекции
-		private static final int FFT_W = 1024;  // для AW=320
-		private static final int FFT_H = 512;   // для AH=180
-
-		// Максимальная компенсация в долях от анализ-кадра
-		// 9% * 320px = ~29px → при EIS_ZOOM_MIN=1.25 покрывает 90% доступного резерва
-		private static final float MAX_SHIFT_FRAC = 0.09f;
-
-		// Порог дисперсии строки/столбца: ниже — однородный регион, пропускаем
-		private static final float VAR_MIN = 6f; // σ² в яркостных единицах²
-
-		// Адаптация опоры при панировании
-		private static final int   DRIFT_FRAMES_LIMIT = 18; // ~0.6 с @ 30 fps
-		private static final float DRIFT_BLEND        = 0.07f;
-		private int mDriftFrames = 0;
-
-		// Опорные проекции (зафиксированы при первом кадре или после reset())
-		private float[] mRefProjX = null; // длина AW: горизонтальная структура
-		private float[] mRefProjY = null; // длина AH: вертикальная структура
-
-		// Поток анализа (не блокирует Camera2)
-		private HandlerThread mAnalThread;
-		private Handler       mAnalHandler;
-		// Флаг занятости: если анализ не успел завершиться, новый кадр пропускается
-		private volatile boolean mAnalBusy = false;
-
-		// ── Управление потоком ────────────────────────────────────────────────
-
-		void start() {
-			stop();
-			mAnalThread = new HandlerThread("eis-analysis", android.os.Process.THREAD_PRIORITY_DEFAULT);
-			mAnalThread.start();
-			mAnalHandler = new Handler(mAnalThread.getLooper());
-		}
-
-		void stop() {
-			if (mAnalThread != null) {
-				mAnalThread.quitSafely();
-				try { mAnalThread.join(300); } catch (InterruptedException ignored) {}
-				mAnalThread = null;
-				mAnalHandler = null;
-			}
-			mAnalBusy = false;
-		}
-
-		/** Сбрасывает опорный кадр и накопленный сдвиг (вызов из UI-потока). */
-		void reset() {
-			mRefProjX    = null;
-			mRefProjY    = null;
-			mDriftFrames = 0;
-			mAnalBusy    = false;
-			mStabSensorX = 0;
-			mStabSensorY = 0;
-		}
-
-		// ── Приём кадра из Camera2 (вызов из mCamHandler) ────────────────────
-
-		void onFrame(ImageReader reader) {
-			android.media.Image img = null;
-			try { img = reader.acquireLatestImage(); } catch (Exception ignored) { return; }
-			if (img == null) return;
-			try {
-				if (!mDigiStabEnabled || mAnalHandler == null || mAnalBusy) return;
-
-				android.media.Image.Plane yp = img.getPlanes()[0];
-				ByteBuffer yBuf = yp.getBuffer();
-				final int rs = yp.getRowStride();
-				final int ps = yp.getPixelStride();
-
-				// Копируем только нужный объём Y-плоскости (AH строк по rs байт)
-				int needed = rs * AH;
-				if (yBuf.remaining() < needed) return;
-				final byte[] yData = new byte[needed];
-				yBuf.get(yData, 0, needed);
-
-				mAnalBusy = true;
-				mAnalHandler.post(() -> {
-					try { analyzeFrame(yData, rs, ps); }
-					finally { mAnalBusy = false; }
-				});
-			} finally {
-				img.close(); // закрываем сразу — не задерживаем Camera2 pipeline
-			}
-		}
-
-		// ── Анализ кадра (вызов из mAnalThread) ──────────────────────────────
-
-		private void analyzeFrame(byte[] y, int rs, int ps) {
-
-			// ── Взвешенная проекция по X (горизонтальная структура): projX[x] ──
-			// Суммируем z-нормированные строки — вклад пропорционален контрасту строки.
-			float[] projX = new float[AW];
-			for (int row = 0; row < AH; row++) {
-				int off = row * rs;
-				// Среднее строки
-				float sum = 0f;
-				for (int x = 0; x < AW; x++) sum += (y[off + x * ps] & 0xFF);
-				float mean = sum / AW;
-				// Дисперсия строки
-				float var = 0f;
-				for (int x = 0; x < AW; x++) {
-					float d = (y[off + x * ps] & 0xFF) - mean;
-					var += d * d;
-				}
-				var /= AW;
-				if (var < VAR_MIN) continue; // однородная строка — пропускаем
-				// Z-нормированный вклад в projX
-				float invStd = 1f / (float) Math.sqrt(var);
-				for (int x = 0; x < AW; x++) {
-					projX[x] += ((y[off + x * ps] & 0xFF) - mean) * invStd;
-				}
-			}
-
-			// ── Взвешенная проекция по Y (вертикальная структура): projY[row] ──
-			float[] projY = new float[AH];
-			for (int col = 0; col < AW; col++) {
-				float sum = 0f;
-				for (int row = 0; row < AH; row++) sum += (y[row * rs + col * ps] & 0xFF);
-				float mean = sum / AH;
-				float var = 0f;
-				for (int row = 0; row < AH; row++) {
-					float d = (y[row * rs + col * ps] & 0xFF) - mean;
-					var += d * d;
-				}
-				var /= AH;
-				if (var < VAR_MIN) continue;
-				float invStd = 1f / (float) Math.sqrt(var);
-				for (int row = 0; row < AH; row++) {
-					projY[row] += ((y[row * rs + col * ps] & 0xFF) - mean) * invStd;
-				}
-			}
-
-			// ── Инициализация опоры при первом кадре ──────────────────────────
-			if (mRefProjX == null) {
-				mRefProjX = projX.clone();
-				mRefProjY = projY.clone();
-				return;
-			}
-
-			// ── Фазовая кросс-корреляция с опорным кадром (абсолютный сдвиг) ─
-			// dx > 0: сцена сдвинулась вправо относительно опоры
-			// dy > 0: сцена сдвинулась вниз
-			float dx = crossCorr1D(mRefProjX, projX, AW, FFT_W);
-			float dy = crossCorr1D(mRefProjY, projY, AH, FFT_H);
-
-			float maxDxPx = AW * MAX_SHIFT_FRAC;
-			float maxDyPx = AH * MAX_SHIFT_FRAC;
-
-			// ── Адаптация опоры при устойчивом большом сдвиге (панорамирование) ─
-			boolean nearLimit = (Math.abs(dx) > maxDxPx * 0.70f || Math.abs(dy) > maxDyPx * 0.70f);
-			if (nearLimit) {
-				mDriftFrames++;
-				if (mDriftFrames > DRIFT_FRAMES_LIMIT) {
-					// Плавно сдвигаем опору к текущему кадру
-					for (int i = 0; i < AW; i++) mRefProjX[i] += (projX[i] - mRefProjX[i]) * DRIFT_BLEND;
-					for (int i = 0; i < AH; i++) mRefProjY[i] += (projY[i] - mRefProjY[i]) * DRIFT_BLEND;
-				}
-			} else {
-				mDriftFrames = 0;
-			}
-
-			// ── Ограничиваем сдвиг доступным резервом ────────────────────────
-			dx = Math.max(-maxDxPx, Math.min(maxDxPx, dx));
-			dy = Math.max(-maxDyPx, Math.min(maxDyPx, dy));
-
-			// ── Конвертируем в сенсорные пиксели ─────────────────────────────
-			// Анализ-кадр 320×180 покрывает текущий кроп (cropW×cropH).
-			// stabSensor = -(dx_analysis / AW) * cropW
-			// Минус: компенсируем — если сцена сдвинулась вправо, двигаем кроп вправо
-			if (mSensorRect == null) return;
-			float eisZoom = Math.max(mZoomLevel, EIS_ZOOM_MIN);
-			float cropW   = mSensorRect.width()  / eisZoom;
-			float cropH   = mSensorRect.height() / eisZoom;
-
-			mStabSensorX = (int)(dx * cropW / AW); // знак «+»: кроп едет вправо компенсируя сдвиг влево
-			mStabSensorY = (int)(dy * cropH / AH);
-
-			// ── Применяем обновлённый кроп через камеру ──────────────────────
-			if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-		}
-
-		// ─── 1D Phase-only cross-correlation ──────────────────────────────────
-		// ref, cur — проекции длиной len; fftSize — степень двойки ≥ 2*len.
-		// Возвращает сдвиг в отсчётах (> 0: cur сдвинута вправо/вниз относительно ref).
-		private float crossCorr1D(float[] ref, float[] cur, int len, int fftSize) {
-			float[] reA = new float[fftSize], imA = new float[fftSize];
-			float[] reB = new float[fftSize], imB = new float[fftSize];
-
-			// Вычитаем среднее (DC-removal), zero-pad автоматически (массивы = 0)
-			float meanA = 0f, meanB = 0f;
-			for (int i = 0; i < len; i++) { meanA += ref[i]; meanB += cur[i]; }
-			meanA /= len; meanB /= len;
-			for (int i = 0; i < len; i++) { reA[i] = ref[i] - meanA; reB[i] = cur[i] - meanB; }
-
-			fft(reA, imA, fftSize);
-			fft(reB, imB, fftSize);
-
-			// Кросс-спектр A * conj(B), нормализованный (фазовая корреляция)
-			float[] xRe = new float[fftSize], xIm = new float[fftSize];
-			for (int i = 0; i < fftSize; i++) {
-				float a = reA[i], b = imA[i], c = reB[i], d = imB[i];
-				float re = a*c + b*d, im = b*c - a*d;
-				float mag = (float) Math.sqrt(re*re + im*im);
-				if (mag > 1e-6f) { xRe[i] = re / mag; xIm[i] = im / mag; }
-			}
-
-			// IFFT: conj → FFT → conj → /N
-			for (int i = 0; i < fftSize; i++) xIm[i] = -xIm[i];
-			fft(xRe, xIm, fftSize);
-			for (int i = 0; i < fftSize; i++) xRe[i] /= fftSize;
-
-			// Ищем пик в диапазоне ±len/4 (отсекаем крупные ложные пики)
-			int halfSearch = len / 4;
-			int peakIdx    = 0;
-			float peakVal  = Float.NEGATIVE_INFINITY;
-			for (int i = 0; i <= halfSearch; i++) {
-				if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i; }
-			}
-			for (int i = fftSize - halfSearch; i < fftSize; i++) {
-				if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i - fftSize; }
-			}
-
-			// Параболическая субпиксельная интерполяция
-			int pi = (peakIdx + fftSize) % fftSize;
-			int pm = (pi - 1 + fftSize) % fftSize;
-			int pp = (pi + 1)           % fftSize;
-			float ym = xRe[pm], y0 = xRe[pi], yp = xRe[pp];
-			float denom = 2f * (2f * y0 - ym - yp);
-			float sub   = (denom != 0f) ? (yp - ym) / denom : 0f;
-			return peakIdx + sub;
-		}
-
-		// ─── Cooley-Tukey in-place radix-2 DIT FFT ────────────────────────────
-		private void fft(float[] re, float[] im, int n) {
-			for (int i = 1, j = 0; i < n; i++) {
-				int bit = n >> 1;
-				for (; (j & bit) != 0; bit >>= 1) j ^= bit;
-				j ^= bit;
-				if (i < j) {
-					float tr = re[i]; re[i] = re[j]; re[j] = tr;
-					float ti = im[i]; im[i] = im[j]; im[j] = ti;
-				}
-			}
-			for (int len = 2; len <= n; len <<= 1) {
-				double ang = -2.0 * Math.PI / len;
-				float wRe = (float) Math.cos(ang), wIm = (float) Math.sin(ang);
-				for (int i = 0; i < n; i += len) {
-					float curRe = 1f, curIm = 0f;
-					for (int k = 0; k < len / 2; k++) {
-						float uRe = re[i+k], uIm = im[i+k];
-						float vRe = re[i+k+len/2]*curRe - im[i+k+len/2]*curIm;
-						float vIm = re[i+k+len/2]*curIm + im[i+k+len/2]*curRe;
-						re[i+k]       = uRe+vRe; im[i+k]       = uIm+vIm;
-						re[i+k+len/2] = uRe-vRe; im[i+k+len/2] = uIm-vIm;
-						float nRe = curRe*wRe - curIm*wIm;
-						curIm = curRe*wIm + curIm*wRe; curRe = nRe;
-					}
-				}
-			}
-		}
-	} // end DigitalStabilizer
 
 }
