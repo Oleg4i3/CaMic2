@@ -50,11 +50,7 @@ public class MainActivity extends Activity {
 	private static final int VIDEO_FPS = 30;
 	private static final int AUDIO_SR = 48000;
 	private static final int REQ_PERMS = 1;
-	private static final float MAX_ZOOM_SPEED  = 0.08f;
-	// Поле стабилизации: сенсорный кроп уменьшается на эту долю с каждой стороны.
-	// 0.14 → 28% общий кроп ≈ принудительный ×1.16 зум при включённой стабилизации.
-	// Это даёт ±14% кадра запаса для компенсации дрожания по каждой оси.
-	private static final float STAB_MARGIN = 0.14f;
+	private static final float MAX_ZOOM_SPEED = 0.08f;
 	
 	// ─── UI ───────────────────────────────────────────────────────────────────
 	private SurfaceView mSv;
@@ -64,6 +60,9 @@ public class MainActivity extends Activity {
 	private CheckBox mCbDigiStab;
 	private DigitalStabilizer mStab;
 	private ImageReader mStabReader; // ImageReader для анализа кадров
+	// Текущая коррекция стабилизации в пикселях сенсора (обновляется DigitalStabilizer,
+	// читается buildAndSendRequest; volatile — доступ с разных потоков).
+	private volatile float mStabSensorDx = 0f, mStabSensorDy = 0f;
 	private final android.os.Handler mUiHandler = new android.os.Handler(android.os.Looper.getMainLooper());
 	private Spinner mSpinner;
 	private VerticalSeekBar mSeekGain;
@@ -225,7 +224,6 @@ public class MainActivity extends Activity {
 		mVidLoopRunning = false;
 		stopAudio();
 		finalizeMuxer();
-		if (mStab != null) { mStab.release(); mStab = null; }
 		if (mStabReader != null) { try { mStabReader.close(); } catch (Exception ignored) {} mStabReader = null; }
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
@@ -525,11 +523,12 @@ public class MainActivity extends Activity {
 		mCbDigiStab.setOnCheckedChangeListener((cb, checked) -> {
 			mDigiStabEnabled = checked;
 			if (!checked) {
-				// Сбрасываем накопленный сдвиг; следующий buildAndSendRequest
-				// вернёт кроп на базовый зум без стабилизационного смещения
 				if (mStab != null) mStab.reset();
+				mStabSensorDx = 0f;
+				mStabSensorDy = 0f;
+				if (mCamHandler != null)
+					mCamHandler.post(MainActivity.this::buildAndSendRequest);
 			}
-			if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
 		});
 		leftCol.addView(mCbDigiStab);
 
@@ -960,39 +959,23 @@ public class MainActivity extends Activity {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				int sw = mSensorRect.width(), sh = mSensorRect.height();
+				int cropW = Math.max(1, (int) (mSensorRect.width()  / mZoomLevel));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
+				int cropX = mSensorRect.left + (mSensorRect.width()  - cropW) / 2;
+				int cropY = mSensorRect.top  + (mSensorRect.height() - cropH) / 2;
 
-				// Базовый кроп по зуму
-				int cropW = Math.max(1, (int)(sw / mZoomLevel));
-				int cropH = Math.max(1, (int)(sh / mZoomLevel));
-				int baseX = mSensorRect.left + (sw - cropW) / 2;
-				int baseY = mSensorRect.top  + (sh - cropH) / 2;
-
-				if (mDigiStabEnabled && mStab != null) {
-					// ── Стабилизация через сдвиг кропа ─────────────────────────────
-					// Уменьшаем кроп на STAB_MARGIN с каждой стороны — это даёт
-					// запас для смещения без выхода за пределы сенсора.
-					int mrgX = (int)(cropW * STAB_MARGIN);
-					int mrgY = (int)(cropH * STAB_MARGIN);
-					int stabW = Math.max(1, cropW - 2 * mrgX);
-					int stabH = Math.max(1, cropH - 2 * mrgY);
-
-					// Масштабируем коррекцию из пикс. анализа (320×180) в пикс. сенсора
-					float scX = (float) cropW / DigitalStabilizer.AW;
-					float scY = (float) cropH / DigitalStabilizer.AH;
-					int shiftX = Math.max(-mrgX, Math.min(mrgX, (int)(mStab.mCorrX * scX)));
-					int shiftY = Math.max(-mrgY, Math.min(mrgY, (int)(mStab.mCorrY * scY)));
-
-					int x0 = baseX + mrgX + shiftX;
-					int y0 = baseY + mrgY + shiftY;
-					// Клампируем в сенсорную область
-					x0 = Math.max(mSensorRect.left, Math.min(mSensorRect.right  - stabW, x0));
-					y0 = Math.max(mSensorRect.top,  Math.min(mSensorRect.bottom - stabH, y0));
-					rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(x0, y0, x0 + stabW, y0 + stabH));
-				} else {
-					rb.set(CaptureRequest.SCALER_CROP_REGION,
-						new Rect(baseX, baseY, baseX + cropW, baseY + cropH));
+				// Цифровая стабилизация: сдвигаем окно кропа на сенсоре,
+				// чтобы компенсировать смещение камеры.  Влияет одновременно на
+				// превью и на энкодер — стабилизированное видео записывается «в чистом виде».
+				if (mDigiStabEnabled) {
+					int ox = (int) mStabSensorDx;
+					int oy = (int) mStabSensorDy;
+					cropX = Math.max(mSensorRect.left,
+					        Math.min(mSensorRect.right  - cropW, cropX + ox));
+					cropY = Math.max(mSensorRect.top,
+					        Math.min(mSensorRect.bottom - cropH, cropY + oy));
 				}
+				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
 			} catch (Exception ignored) {
@@ -2588,298 +2571,307 @@ public class MainActivity extends Activity {
 		}
 	}
 
-	// applyStabTransform() удалён: стабилизация выполняется через SCALER_CROP_REGION
-	// в buildAndSendRequest(), что одновременно влияет и на превью, и на запись.
+	// Стабилизация теперь реализована через SCALER_CROP_REGION в buildAndSendRequest():
+	// смещение окна кропа на сенсоре затрагивает одновременно превью и энкодер.
+	// Метод оставлен как заглушка для совместимости, тело пусто.
+	@SuppressWarnings("unused")
+	private void applyStabTransform(float dx, float dy) { /* no-op */ }
 
 	// =========================================================================
-	// Digital Stabilizer — псевдо-постобработка через SCALER_CROP_REGION
+	// DigitalStabilizer — «прилипающая» цифровая стабилизация с задержкой.
 	//
-	// Архитектура (в отличие от старой реализации):
-	//
-	//  ┌─────────────────┐    copy Y     ┌──────────────────────┐
-	//  │  mCamHandler    │──────────────►│  mAnalThread         │
-	//  │  (ImageReader)  │  (мгновенно)  │  analyse():          │
-	//  └─────────────────┘               │  • stretch contrast   │
-	//                                    │  • phase corr vs      │
-	//                                    │    anchor (absolute)  │
-	//                                    │  • IIR path smooth    │
-	//                                    │  • delay buffer       │
-	//                                    │  → mCorrX/mCorrY ←   │
-	//                                    └──────────┬───────────┘
-	//                                               │ post()
-	//                                    ┌──────────▼───────────┐
-	//                                    │  mCamHandler         │
-	//                                    │  buildAndSendRequest │
-	//                                    │  → SCALER_CROP_REGION│
-	//                                    │    (preview + encode)│
-	//                                    └──────────────────────┘
-	//
-	// Ключевые отличия от старой версии:
-	//   1. Корреляция выполняется против якорного кадра (абсолютное смещение),
-	//      а не кадр-к-кадру. Нет накопления ошибок.
-	//   2. IIR применяется к позиции: correction = -(raw - smooth_raw).
-	//      Это стандартная формула warp stabilizer — убирает высокочастотное
-	//      дрожание, оставляя плавные движения.
-	//   3. Буфер задержки DELAY_FRAMES кадров (~167 мс @ 30 fps) позволяет
-	//      анализу завершиться до применения коррекции — нет гонки с камерой.
-	//   4. Коррекция применяется через SCALER_CROP_REGION, а не через
-	//      SurfaceView.setTranslationX/Y — одновременно стабилизирует
-	//      и превью, и файл записи.
-	//   5. Контрастирование (histogram stretching) перед корреляцией повышает
-	//      чёткость пика и устойчивость к слабоконтрастным сценам.
-	//   6. Порог достоверности пика: при слабом пике позиция не обновляется
-	//      (коррекция заморожена), якорь плавно дрейфует к текущему кадру.
+	// Принцип отличия от предыдущей версии:
+	//   ─ Измерение АБСОЛЮТНОЙ позиции (vs фиксированная опора), а не инкрементальное
+	//     сравнение кадр-с-кадром.  Нет накопления ошибки, нет дрейфа.
+	//   ─ Коррекция через SCALER_CROP_REGION → стабилизируется и превью, и запись;
+	//     никаких чёрных полос — кроп внутренний, аппаратный.
+	//   ─ Естественная задержка ~250 мс (центр тяжести Гауссова окна 17 кадров):
+	//     стабилизатор знает «прошлое», сглаживает траекторию и убирает только
+	//     отклонение от неё (дрожание), но не панорамирование.
+	//   ─ EMA на корректирующем сигнале: не гонится за отдельными быстрыми
+	//     выбросами — не создаёт осцилляций.
+	//   ─ Нормализация/контрастирование проекций перед FFT → более чёткий пик.
+	//   ─ Расширенный диапазон поиска (±len/3 вместо ±len/4).
 	// =========================================================================
 	class DigitalStabilizer {
+		// ── Разрешение анализа ──────────────────────────────────────────────────
+		private static final int AW = 320, AH = 180;
 
-		// ── Размеры анализа (должны совпадать с ImageReader) ──────────────────
-		static final int AW = 320, AH = 180;
-
-		// ── FFT-размеры: степень двойки ≥ 2×длина проекции ───────────────────
+		// ── FFT: степень двойки ≥ 2 × длины проекции ───────────────────────────
 		private static final int FFT_W = 1024, FFT_H = 512;
 
-		// ── Сглаживание пути ──────────────────────────────────────────────────
-		// SMOOTH=0.88 → τ≈8.3 кадра ≈ 275 мс @ 30fps
-		// Чем выше — тем агрессивнее стабилизация (и тем больше кроп-марж нужен)
-		private static final float SMOOTH = 0.88f;
+		// ── Скорость обновления опоры: 0.004 ≈ 250 кадров = ~8 с при 30 fps ───
+		// Медленно следует за панорамированием, не даёт rawDx выйти за диапазон поиска.
+		private static final float REF_UPDATE = 0.004f;
 
-		// ── Буфер задержки ────────────────────────────────────────────────────
-		// 5 кадров ≈ 167 мс @ 30 fps.
-		// Задержка некритична: видеозапись из предбуфера, статичные сцены.
-		private static final int DELAY_FRAMES = 5;
+		// ── Гауссово окно сглаживания ───────────────────────────────────────────
+		// 17 кадров = 567 мс; центр тяжести ≈ 8 кадров = ~267 мс задержки.
+		// Срезает всё выше ~1.8 Гц — типичная ручная тряска 2–10 Гц убирается.
+		private static final int SMOOTH_WIN = 17;
 
-		// ── Порог достоверности пика корреляции ───────────────────────────────
-		// Если оба пика ниже порога — считаем корреляцию ненадёжной.
-		private static final float PEAK_THRESHOLD = 0.04f;
+		// ── EMA на корректирующем сигнале ───────────────────────────────────────
+		// α = 0.35 → постоянная времени ≈ 2 кадра; не гонится за
+		// однокадровым джиттером, но достаточно быстро реагирует на дрожание.
+		private static final float CORR_ALPHA = 0.35f;
 
-		// ── Скорость дрейфа якоря ─────────────────────────────────────────────
-		// 0.012 → якорь обновляется за ~83 кадра ≈ 2.8 с @ 30 fps.
-		// Компенсирует медленное панорамирование, не путая со стабилизацией.
-		private static final float ANCHOR_DRIFT = 0.012f;
+		// ── Максимальный сдвиг кропа: 22 % от размера кропа ───────────────────
+		// Пользователь разрешил «огромный кроп» — берём агрессивно.
+		private static final float MAX_CORR_FRAC = 0.22f;
 
-		// ── Состояние ─────────────────────────────────────────────────────────
-		private float[] mAnchorRow = new float[AH];
-		private float[] mAnchorCol = new float[AW];
-		private boolean mHasAnchor = false;
+		// ── Минимальное качество пика для принятия измерения ──────────────────
+		// Отфильтровывает равномерные кадры (небо, стена), смазанные и т.п.
+		private static final float MIN_PEAK_QUALITY = 0.04f;
 
-		// Сырая (измеренная от якоря) и сглаженная позиция (пикс. анализа)
-		private float mRawX = 0f, mRawY = 0f;
-		private float mSmX  = 0f, mSmY  = 0f;
+		// ── Порог аварийного ускорения опоры (доля размера кадра) ─────────────
+		// Если камера сильно панорамировалась и rawDx велик — обновляем опору быстрее.
+		private static final float DRIFT_EMERGENCY_THR = 0.20f;
+		private static final float REF_UPDATE_EMERGENCY = 0.06f;
 
-		/** Текущая коррекция в пикселях анализа. Volatile — читает buildAndSendRequest. */
-		volatile float mCorrX = 0f, mCorrY = 0f;
+		// ── Состояние ──────────────────────────────────────────────────────────
+		private float[] mRefRowProj = new float[AH];
+		private float[] mRefColProj = new float[AW];
+		private boolean mHasRef = false;
 
-		// ── Отдельный поток анализа ───────────────────────────────────────────
-		private final HandlerThread mAnalThread;
-		private final Handler       mAnalHandler;
+		// Кольцевой буфер абсолютных позиций
+		private final float[] mPosXBuf = new float[SMOOTH_WIN];
+		private final float[] mPosYBuf = new float[SMOOTH_WIN];
+		private int mBufHead  = 0;
+		private int mBufCount = 0;
 
-		// AtomicBoolean: не очередим анализ быстрее, чем он успевает — пропускаем кадры
-		private final java.util.concurrent.atomic.AtomicBoolean mBusy =
-			new java.util.concurrent.atomic.AtomicBoolean(false);
+		// Гауссовы веса (index 0 = самый свежий кадр)
+		private final float[] mGaussW = new float[SMOOTH_WIN];
 
-		// Буфер задержки: хранит последние DELAY_FRAMES коррекций
-		private final ArrayDeque<float[]> mDelayBuf = new ArrayDeque<>();
+		// Текущая сглаженная коррекция в пикселях анализа (до масштабирования в сенсор)
+		private float mCorrDx = 0f, mCorrDy = 0f;
 
+		// ── Конструктор ────────────────────────────────────────────────────────
 		DigitalStabilizer() {
-			mAnalThread = new HandlerThread("stab-anal", android.os.Process.THREAD_PRIORITY_DEFAULT);
-			mAnalThread.start();
-			mAnalHandler = new Handler(mAnalThread.getLooper());
+			// σ = SMOOTH_WIN / 4  → плавное убывание веса к старым кадрам
+			float sigma = SMOOTH_WIN / 4.0f;
+			float wsum  = 0f;
+			for (int i = 0; i < SMOOTH_WIN; i++) {
+				mGaussW[i] = (float) Math.exp(-(double) i * i / (2.0 * sigma * sigma));
+				wsum += mGaussW[i];
+			}
+			for (int i = 0; i < SMOOTH_WIN; i++) mGaussW[i] /= wsum;
 		}
 
-		// ── Вход: вызывается из mCamHandler при каждом кадре ImageReader ──────
-		// Быстро копируем Y-плоскость в массив, закрываем Image, уходим.
-		// Анализ (тяжёлый) выполняется асинхронно в mAnalThread.
+		// ── Вызывается из mCamHandler при каждом кадре ImageReader ─────────────
 		void onFrame(ImageReader reader) {
-			android.media.Image img;
+			android.media.Image img = null;
 			try { img = reader.acquireLatestImage(); } catch (Exception e) { return; }
 			if (img == null) return;
-
-			if (!mDigiStabEnabled) { img.close(); return; }
-
-			// Если предыдущий анализ ещё не завершён — пропускаем кадр
-			if (!mBusy.compareAndSet(false, true)) { img.close(); return; }
-
-			final byte[] y = new byte[AW * AH];
 			try {
-				android.media.Image.Plane pl = img.getPlanes()[0];
-				ByteBuffer buf = pl.getBuffer();
-				int rs = pl.getRowStride();
-				int ps = pl.getPixelStride();
-				for (int r = 0; r < AH; r++) {
-					int off = r * rs;
-					for (int c = 0; c < AW; c++)
-						y[r * AW + c] = buf.get(off + c * ps);
+				if (!mDigiStabEnabled) return;
+
+				android.media.Image.Plane yPlane = img.getPlanes()[0];
+				ByteBuffer yBuf   = yPlane.getBuffer();
+				int rowStride     = yPlane.getRowStride();
+				int pixelStride   = yPlane.getPixelStride();
+
+				// ── Строим нормализованные проекции (контрастирование перед FFT) ──
+				float[] rowProj = buildRowProj(yBuf, rowStride, pixelStride);
+				float[] colProj = buildColProj(yBuf, rowStride, pixelStride);
+
+				// ── Инициализация опоры ────────────────────────────────────────────
+				if (!mHasRef) {
+					mRefRowProj = rowProj.clone();
+					mRefColProj = colProj.clone();
+					mHasRef = true;
+					return;
 				}
-			} finally { img.close(); }
 
-			mAnalHandler.post(() -> { analyse(y); mBusy.set(false); });
-		}
+				// ── Измеряем абсолютную позицию относительно ОПОРЫ ───────────────
+				// rawDx > 0: текущий кадр сдвинут вправо vs опора (камера ушла влево).
+				// rawDx < 0: текущий кадр сдвинут влево (камера ушла вправо).
+				float[] rx = crossCorr1D(mRefColProj, colProj, AW, FFT_W);
+				float[] ry = crossCorr1D(mRefRowProj, rowProj, AH, FFT_H);
+				float rawDx = rx[0], qualX = rx[1];
+				float rawDy = ry[0], qualY = ry[1];
 
-		// ── Основной анализ — выполняется в mAnalThread ───────────────────────
-		private void analyse(byte[] y) {
+				boolean validX = qualX >= MIN_PEAK_QUALITY;
+				boolean validY = qualY >= MIN_PEAK_QUALITY;
 
-			// 1. Строчная и столбцовая проекции яркости
-			float[] rowProj = buildRowProj(y);
-			float[] colProj = buildColProj(y);
+				// Зажимаем в диапазон поиска (±1/3 кадра)
+				if (validX) rawDx = Math.max(-AW / 3f, Math.min(AW / 3f, rawDx));
+				else        rawDx = mBufCount > 0 ? mPosXBuf[(mBufHead + SMOOTH_WIN - 1) % SMOOTH_WIN] : 0f;
+				if (validY) rawDy = Math.max(-AH / 3f, Math.min(AH / 3f, rawDy));
+				else        rawDy = mBufCount > 0 ? mPosYBuf[(mBufHead + SMOOTH_WIN - 1) % SMOOTH_WIN] : 0f;
 
-			// 2. Повышение контраста (histogram stretching)
-			//    Критично для слабоконтрастных сцен: без него пик корреляции плоский
-			stretch(rowProj, AH);
-			stretch(colProj, AW);
+				// ── Обновляем кольцевой буфер позиций ────────────────────────────
+				mPosXBuf[mBufHead] = rawDx;
+				mPosYBuf[mBufHead] = rawDy;
+				mBufHead = (mBufHead + 1) % SMOOTH_WIN;
+				if (mBufCount < SMOOTH_WIN) mBufCount++;
 
-			// 3. Первый кадр — устанавливаем якорь, выходим
-			if (!mHasAnchor) {
-				mAnchorRow = rowProj.clone();
-				mAnchorCol = colProj.clone();
-				mHasAnchor = true;
-				return;
+				// ── Обновляем опору (медленно следует за панорамированием) ────────
+				float drift   = Math.abs(rawDx) / AW + Math.abs(rawDy) / AH;
+				float refRate = drift > DRIFT_EMERGENCY_THR ? REF_UPDATE_EMERGENCY : REF_UPDATE;
+				for (int i = 0; i < AW; i++) mRefColProj[i] += (colProj[i] - mRefColProj[i]) * refRate;
+				for (int i = 0; i < AH; i++) mRefRowProj[i] += (rowProj[i] - mRefRowProj[i]) * refRate;
+
+				// ── Гауссово сглаживание истории позиций → «плавная траектория» ──
+				float smoothX = 0f, smoothY = 0f, wsum = 0f;
+				int n = Math.min(mBufCount, SMOOTH_WIN);
+				for (int i = 0; i < n; i++) {
+					int idx = (mBufHead - 1 - i + SMOOTH_WIN) % SMOOTH_WIN;
+					float w = mGaussW[i];
+					smoothX += mPosXBuf[idx] * w;
+					smoothY += mPosYBuf[idx] * w;
+					wsum    += w;
+				}
+				if (wsum > 0f) { smoothX /= wsum; smoothY /= wsum; }
+
+				// ── Целевая коррекция = отклонение от плавной траектории ──────────
+				// Панорамирование → rawDx ≈ smoothX → targetCorr ≈ 0 (не зажимается).
+				// Дрожание → rawDx резко отличается от smoothX → targetCorr большой.
+				//
+				// Знак: rawDx > 0 (камера ушла влево, сцена сдвинулась вправо) →
+				// нужно сдвинуть кроп ВПРАВО (увеличить cropX) → mStabSensorDx > 0.
+				// targetCorr = rawDx - smoothX: если current > smooth → корректируем вправо. ✓
+				float targetCorrDx = rawDx - smoothX;
+				float targetCorrDy = rawDy - smoothY;
+
+				// Масштабируем из пикс. анализа в пикс. сенсора
+				float cropW = (mSensorRect != null) ? (float) mSensorRect.width()  / mZoomLevel : (float) VIDEO_W;
+				float cropH = (mSensorRect != null) ? (float) mSensorRect.height() / mZoomLevel : (float) VIDEO_H;
+				float targetSensorDx = targetCorrDx * cropW / AW;
+				float targetSensorDy = targetCorrDy * cropH / AH;
+
+				// ── EMA сглаживание коррекции (не гонится за быстрым джиттером) ──
+				mCorrDx = mCorrDx * (1f - CORR_ALPHA) + targetSensorDx * CORR_ALPHA;
+				mCorrDy = mCorrDy * (1f - CORR_ALPHA) + targetSensorDy * CORR_ALPHA;
+
+				// ── Зажимаем в допустимый диапазон ────────────────────────────────
+				float maxX = cropW * MAX_CORR_FRAC;
+				float maxY = cropH * MAX_CORR_FRAC;
+				mStabSensorDx = Math.max(-maxX, Math.min(maxX, mCorrDx));
+				mStabSensorDy = Math.max(-maxY, Math.min(maxY, mCorrDy));
+
+				// ── Применяем: обновляем capture request с новым кропом ───────────
+				// Вызывается прямо здесь (уже на mCamHandler — не нужно post()).
+				buildAndSendRequest();
+
+			} finally {
+				img.close();
 			}
-
-			// 4. Фазовая корреляция против якорного кадра
-			//    Результат = абсолютное смещение от якоря (не дельта кадр-к-кадру!)
-			float[] pkX = new float[1], pkY = new float[1];
-			float rawX = crossCorr1D(mAnchorCol, colProj, AW, FFT_W, pkX);
-			float rawY = crossCorr1D(mAnchorRow, rowProj, AH, FFT_H, pkY);
-
-			// 5. Медленный дрейф якоря (компенсация панорамирования)
-			//    Выполняем всегда, до проверки порога, чтобы якорь не застывал
-			for (int i = 0; i < AW; i++)
-				mAnchorCol[i] += (colProj[i] - mAnchorCol[i]) * ANCHOR_DRIFT;
-			for (int i = 0; i < AH; i++)
-				mAnchorRow[i] += (rowProj[i] - mAnchorRow[i]) * ANCHOR_DRIFT;
-
-			// 6. Порог достоверности: если оба пика слабые — не обновляем позицию
-			if (pkX[0] < PEAK_THRESHOLD && pkY[0] < PEAK_THRESHOLD) {
-				// Повторяем последнюю коррекцию в буфер задержки (держим стабильность)
-				pushDelay(mCorrX, mCorrY);
-				return;
-			}
-
-			// 7. IIR сглаживание позиции (стандартная формула warp stabilizer):
-			//    smooth_pos = IIR(raw_pos)
-			//    correction = -(raw_pos - smooth_pos)  ← убираем дрожание, оставляем плавность
-			mRawX = rawX; mRawY = rawY;
-			mSmX  = mSmX * SMOOTH + rawX * (1f - SMOOTH);
-			mSmY  = mSmY * SMOOTH + rawY * (1f - SMOOTH);
-			float cx = -(rawX - mSmX);
-			float cy = -(rawY - mSmY);
-
-			// 8. Буфер задержки → берём коррекцию DELAY_FRAMES назад
-			pushDelay(cx, cy);
 		}
 
-		private void pushDelay(float cx, float cy) {
-			mDelayBuf.addLast(new float[]{cx, cy});
-			if (mDelayBuf.size() < DELAY_FRAMES) return; // накапливаем, не применяем
-			float[] delayed = mDelayBuf.removeFirst();
-			mCorrX = delayed[0];
-			mCorrY = delayed[1];
-
-			// 9. Уведомляем камеру применить новый кроп
-			if (mCamHandler != null)
-				mCamHandler.post(MainActivity.this::buildAndSendRequest);
-		}
-
-		// ── Строчная проекция: средняя яркость каждой строки ─────────────────
-		private float[] buildRowProj(byte[] y) {
-			float[] p = new float[AH];
-			for (int r = 0; r < AH; r++) {
-				long s = 0;
-				int base = r * AW;
-				for (int c = 0; c < AW; c++) s += (y[base + c] & 0xFF);
-				p[r] = s / (float) AW;
-			}
-			return p;
-		}
-
-		// ── Столбцовая проекция: средняя яркость каждого столбца ─────────────
-		private float[] buildColProj(byte[] y) {
-			float[] p = new float[AW];
-			for (int c = 0; c < AW; c++) {
-				long s = 0;
-				for (int r = 0; r < AH; r++) s += (y[r * AW + c] & 0xFF);
-				p[c] = s / (float) AH;
-			}
-			return p;
-		}
-
-		// ── Histogram stretching: растягиваем диапазон проекции до [0, 255] ──
-		// Важно: без этого на слабоконтрастных сценах пик корреляции теряется
-		// в шуме и стабилизация перестаёт реагировать.
-		private void stretch(float[] p, int len) {
-			float mn = p[0], mx = p[0];
-			for (int i = 1; i < len; i++) {
-				if (p[i] < mn) mn = p[i];
-				if (p[i] > mx) mx = p[i];
-			}
-			float range = mx - mn;
-			if (range < 2f) return; // почти однородная полоса — не трогаем
-			float inv = 255f / range;
-			for (int i = 0; i < len; i++) p[i] = (p[i] - mn) * inv;
-		}
-
-		/** Сброс при выключении стаба. */
+		// ── Сброс: вызывается с UI-потока через CheckBox ───────────────────────
+		// Не вызывает buildAndSendRequest — это делает вызывающий код.
 		void reset() {
-			mHasAnchor = false;
-			mRawX = mRawY = 0f;
-			mSmX  = mSmY  = 0f;
-			mCorrX = mCorrY = 0f;
-			mDelayBuf.clear();
+			mHasRef   = false;
+			mBufCount = 0;
+			mBufHead  = 0;
+			mCorrDx   = 0f;
+			mCorrDy   = 0f;
 		}
 
-		/** Завершение работы анализирующего потока при onDestroy. */
-		void release() {
-			mAnalThread.quitSafely();
+		// ══════════════════════════════════════════════════════════════════════
+		// Вспомогательные методы
+		// ══════════════════════════════════════════════════════════════════════
+
+		// ── Строчная проекция: средняя яркость каждой строки, нормализованная ─
+		private float[] buildRowProj(ByteBuffer yBuf, int rowStride, int pixelStride) {
+			float[] proj = new float[AH];
+			float minV = Float.MAX_VALUE, maxV = -Float.MAX_VALUE;
+			for (int y = 0; y < AH; y++) {
+				long sum = 0;
+				int rowOff = y * rowStride;
+				for (int x = 0; x < AW; x++) sum += yBuf.get(rowOff + x * pixelStride) & 0xFF;
+				proj[y] = sum / (float) AW;
+				if (proj[y] < minV) minV = proj[y];
+				if (proj[y] > maxV) maxV = proj[y];
+			}
+			// Контрастирование [min..max] → [0..1]: обостряет пик корреляции
+			float range = maxV - minV;
+			if (range > 1f) for (int y = 0; y < AH; y++) proj[y] = (proj[y] - minV) / range;
+			return proj;
 		}
 
-		// ─────────────────────────────────────────────────────────────────────
-		// 1D Phase-only cross-correlation via FFT.
-		//
-		// prev, cur   — проекции длиной len (histogram-stretched)
-		// fftSize     — степень двойки ≥ 2*len (zero-pad)
-		// peakOut[0]  — нормированная высота пика [0..1] (признак достоверности)
-		//
-		// Возвращает сдвиг в отсчётах (>0 = cur сдвинута вправо/вниз относительно prev).
-		// Поиск пика расширен до ±len/3 (вместо ±len/4 в старой версии).
-		// ─────────────────────────────────────────────────────────────────────
-		private float crossCorr1D(float[] prev, float[] cur, int len, int fftSize, float[] peakOut) {
+		// ── Столбцовая проекция: средняя яркость каждого столбца, нормализованная
+		private float[] buildColProj(ByteBuffer yBuf, int rowStride, int pixelStride) {
+			float[] proj = new float[AW];
+			float minV = Float.MAX_VALUE, maxV = -Float.MAX_VALUE;
+			for (int x = 0; x < AW; x++) {
+				long sum = 0;
+				for (int y = 0; y < AH; y++) sum += yBuf.get(y * rowStride + x * pixelStride) & 0xFF;
+				proj[x] = sum / (float) AH;
+				if (proj[x] < minV) minV = proj[x];
+				if (proj[x] > maxV) maxV = proj[x];
+			}
+			float range = maxV - minV;
+			if (range > 1f) for (int x = 0; x < AW; x++) proj[x] = (proj[x] - minV) / range;
+			return proj;
+		}
+
+		// ── 1D фазовая кросс-корреляция ────────────────────────────────────────
+		// Возвращает float[]{shift, quality}.
+		//   shift    — сдвиг в отсчётах: B[x] ≈ A[x + shift].
+		//   quality  — нормированное качество пика (0 = шум, 1 = идеально).
+		// Диапазон поиска расширен до ±len/3 (vs ±len/4 ранее).
+		// RMS-нормализация сигналов перед FFT → более острый пик.
+		private float[] crossCorr1D(float[] a, float[] b, int len, int fftSize) {
 			float[] reA = new float[fftSize], imA = new float[fftSize];
 			float[] reB = new float[fftSize], imB = new float[fftSize];
 
-			// DC removal (zero-pad заполняется автоматически нулями инициализации)
+			// DC removal
 			float meanA = 0f, meanB = 0f;
-			for (int i = 0; i < len; i++) { meanA += prev[i]; meanB += cur[i]; }
+			for (int i = 0; i < len; i++) { meanA += a[i]; meanB += b[i]; }
 			meanA /= len; meanB /= len;
-			for (int i = 0; i < len; i++) { reA[i] = prev[i] - meanA; reB[i] = cur[i] - meanB; }
+			for (int i = 0; i < len; i++) { reA[i] = a[i] - meanA; reB[i] = b[i] - meanB; }
+
+			// RMS нормализация (whitening) — обостряет пик кросс-корреляции
+			float rmsA = 0f, rmsB = 0f;
+			for (int i = 0; i < len; i++) { rmsA += reA[i]*reA[i]; rmsB += reB[i]*reB[i]; }
+			rmsA = (float) Math.sqrt(rmsA / len);
+			rmsB = (float) Math.sqrt(rmsB / len);
+			if (rmsA > 1e-6f) for (int i = 0; i < len; i++) reA[i] /= rmsA;
+			if (rmsB > 1e-6f) for (int i = 0; i < len; i++) reB[i] /= rmsB;
 
 			fft(reA, imA, fftSize);
 			fft(reB, imB, fftSize);
 
-			// Нормированный кросс-спектр: A * conj(B) / |A * conj(B)|  (phase-only)
+			// Фазовый кросс-спектр: A × conj(B), нормализованный
 			float[] xRe = new float[fftSize], xIm = new float[fftSize];
 			for (int i = 0; i < fftSize; i++) {
-				float a = reA[i], b = imA[i], c = reB[i], d = imB[i];
-				float re = a*c + b*d, im = b*c - a*d;
+				float ar = reA[i], ai = imA[i], br = reB[i], bi = imB[i];
+				float re = ar*br + ai*bi, im = ai*br - ar*bi;
 				float mag = (float) Math.sqrt(re*re + im*im);
-				if (mag > 1e-6f) { xRe[i] = re / mag; xIm[i] = im / mag; }
+				if (mag > 1e-8f) { xRe[i] = re/mag; xIm[i] = im/mag; }
 			}
 
-			// IFFT: conj → FFT → conj → /N
+			// IFFT через conj → FFT → /N
 			for (int i = 0; i < fftSize; i++) xIm[i] = -xIm[i];
 			fft(xRe, xIm, fftSize);
 			for (int i = 0; i < fftSize; i++) xRe[i] /= fftSize;
 
-			// Поиск пика в ±len/3 (расширено относительно старого ±len/4)
+			// Поиск пика в ±len/3; отслеживаем второй пик для метрики качества
 			int halfSearch = len / 3;
-			int peakIdx = 0;
-			float peakVal = Float.NEGATIVE_INFINITY;
+			int peakIdx    = 0;
+			float peakVal  = Float.NEGATIVE_INFINITY;
+			float secondVal = Float.NEGATIVE_INFINITY;
 			for (int i = 0; i <= halfSearch; i++) {
-				if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i; }
+				float v = xRe[i];
+				if (v > peakVal) { secondVal = peakVal; peakVal = v; peakIdx = i; }
+				else if (v > secondVal) secondVal = v;
 			}
 			for (int i = fftSize - halfSearch; i < fftSize; i++) {
-				if (xRe[i] > peakVal) { peakVal = xRe[i]; peakIdx = i - fftSize; }
+				float v = xRe[i];
+				int ci = i - fftSize;
+				if (v > peakVal) { secondVal = peakVal; peakVal = v; peakIdx = ci; }
+				else if (v > secondVal) secondVal = v;
 			}
-			if (peakOut != null) peakOut[0] = Math.max(0f, peakVal);
+
+			// Качество: насколько пик выделяется над вторым (0 = нет сигнала, 1 = идеально)
+			float quality;
+			if (peakVal <= 0f) {
+				quality = 0f;
+			} else if (secondVal <= 0f) {
+				quality = 1f;
+			} else {
+				quality = (peakVal - secondVal) / peakVal;
+			}
 
 			// Параболическая субпиксельная интерполяция
 			int pi = (peakIdx + fftSize) % fftSize;
@@ -2888,12 +2880,11 @@ public class MainActivity extends Activity {
 			float ym = xRe[pm], y0 = xRe[pi], yp = xRe[pp];
 			float denom = 2f * (2f * y0 - ym - yp);
 			float sub = (denom != 0f) ? (yp - ym) / denom : 0f;
-			return peakIdx + sub;
+
+			return new float[]{ peakIdx + sub, quality };
 		}
 
-		// ─────────────────────────────────────────────────────────────────────
-		// Cooley-Tukey in-place radix-2 DIT FFT (та же реализация, что в SpectrumView).
-		// ─────────────────────────────────────────────────────────────────────
+		// ── Cooley-Tukey in-place radix-2 DIT FFT ─────────────────────────────
 		private void fft(float[] re, float[] im, int n) {
 			for (int i = 1, j = 0; i < n; i++) {
 				int bit = n >> 1;
