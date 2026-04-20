@@ -29,8 +29,8 @@ android {
     }
 
     compileOptions {
-        sourceCompatibility JavaVersion.VERSION_11
-        targetCompatibility JavaVersion.VERSION_11
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
     }
 
     // Убираем предупреждение о lint в CI
@@ -46,9 +46,5 @@ android {
     }
 }
 
-dependencies {
-    // OpenCV Android (официальный Maven-пакет, доступен с версии 4.9.0)
-    implementation 'org.opencv:opencv:4.9.0'
-
-    
-}
+// Нет внешних зависимостей — только стандартный Android SDK
+dependencies {}
