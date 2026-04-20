@@ -599,7 +599,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			if (mSeekEisDrift != null) mSeekEisDrift.setEnabled(checked);
 			if (mEisDebugView != null)
 				mEisDebugView.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (!checked && mEisEngine != null) { mEisEngine.stop(); mEisEngine = null; }
+			// if (!checked && mEisEngine != null) { mEisEngine.stop(); mEisEngine = null; }
 			if (mCamHandler != null) mCamHandler.post(MainActivity.this::startPreview);
 		});
 		rightSettings.addView(mCbEis);
@@ -938,6 +938,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		try {
 			if (mCapSess != null) {
 				mCapSess.close();
+				mEisEngine.stop();
 				mCapSess = null;
 			}
 
@@ -2979,7 +2980,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			// dx/EIS_AW: знак совпадает с HTML (+dx/W → сдвиг вправо → компенсация движения вправо) ✓
 			// dy/EIS_AH: знак инвертируем (−dy) потому что glReadPixels row0=bottom → Mat Y-перевёрнут,
 			//            что инвертирует направление dy относительно HTML (где canvas Y=0 сверху).
-			mOutDxNorm =  dx / EIS_AW;
+			mOutDxNorm = -dx / EIS_AW;
 			mOutDyNorm = -dy / EIS_AH;
 
 			// Обновляем debug overlay
