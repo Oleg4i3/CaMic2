@@ -192,6 +192,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private CheckBox         mCbEis;
 	private SeekBar          mSeekEisDrift;
 	private TextView         mTvEisDrift;
+	private EisOverlayView   mEisOverlay;   // Canvas-оверлей для debug-рамок
 	static final int EIS_W = 320, EIS_H = 180;
 
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
@@ -291,6 +292,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
 		svLP.gravity = Gravity.CENTER;
 		root.addView(mSv, svLP);
+
+		// ── EIS overlay — прозрачный оверлей для debug-рамок EIS ───────────
+		mEisOverlay = new EisOverlayView(this);
+		mEisOverlay.setVisibility(View.GONE);
+		root.addView(mEisOverlay, new FrameLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
 		// ── Осциллограф — прозрачный оверлей, верхняя часть кадра ─────────
 		mOscilloscope = new OscilloscopeView(this);
@@ -922,22 +929,32 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			List<Surface> targets = new ArrayList<>();
 
 			if (mEisEnabled) {
-				// ── EIS-режим ────────────────────────────────────────────────────
-				// Запускаем GL-поток если не запущен
+				// ── EIS-режим ─────────────────────────────────────────────────────
+				// Превью: камера → SurfaceView напрямую (как обычно).
+				// Запись:  камера → SurfaceTexture → GL(EIS) → encoder.
+				// Рамки: рисует EisOverlayView поверх превью (Canvas, никакого EGL).
+				targets.add(mSv.getHolder().getSurface()); // превью напрямую
+
+				// Запускаем GL-поток (только encoder EGL surface)
 				if (mEisGlThread == null || !mEisGlThread.isAlive()) {
-					mEisGlThread = new EisGlThread(mEncSurface, mSv.getHolder().getSurface());
+					mEisGlThread = new EisGlThread(mEncSurface);
 					mEisGlThread.start();
 				}
 				SurfaceTexture st = mEisGlThread.getCameraTexture();
-				if (st != null) { st.setDefaultBufferSize(VIDEO_W, VIDEO_H); targets.add(new Surface(st)); }
+				if (st != null) {
+					st.setDefaultBufferSize(VIDEO_W, VIDEO_H);
+					targets.add(new Surface(st)); // вход для GL
+				}
 				// ImageReader для template matching
 				startEisReader();
 				if (mEisReader != null) targets.add(mEisReader.getSurface());
-				// Превью рисует GL-поток — НЕ добавляем mSv в сессию
+
+				runOnUiThread(() -> { if (mEisOverlay != null) mEisOverlay.setVisibility(View.VISIBLE); });
 			} else {
 				// ── Обычный режим ────────────────────────────────────────────────
 				targets.add(mSv.getHolder().getSurface());
 				if (mEncSurface != null && mEncSurface.isValid()) targets.add(mEncSurface);
+				runOnUiThread(() -> { if (mEisOverlay != null) mEisOverlay.setVisibility(View.GONE); });
 			}
 
 			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
@@ -1532,43 +1549,39 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	//   Красный rect: текущий матч; жёлтый rect: ghost после reset
 	// =========================================================================
 	class EisGlThread extends Thread {
-
-		// ── Параметры template matching ──────────────────────────────────────
-		private static final int   TMPL_W    = 80;
-		private static final int   TMPL_H    = 45;
-		private static final int   SEARCH_R  = 40;
-		private static final int   MAX_SHIFT = 20;
-		private static final int   EDGE_M    = 6;
-		private static final long  SAD_MAX   = (long) TMPL_W * TMPL_H * 90;
+		// ── Template matching constants ────────────────────────────────────────
+		static final int TMPL_W   = 80;
+		static final int TMPL_H   = 45;
+		private static final int SEARCH_R  = 40;
+		private static final int MAX_SHIFT = 20;
+		private static final int EDGE_M    = 6;
+		private static final long SAD_MAX  = (long) TMPL_W * TMPL_H * 90;
 		private final float IDEAL_X = (EIS_W - TMPL_W) / 2f;
 		private final float IDEAL_Y = (EIS_H - TMPL_H) / 2f;
 
-		// ── EGL ──────────────────────────────────────────────────────────────
+		// ── EGL (только один surface — encoder) ────────────────────────────────
+		// Превью идёт напрямую Camera → SurfaceView, никаких двойных EGL не нужно.
 		private static final int EGL_RECORDABLE_ANDROID = 0x3142;
-		private EGLDisplay mDisp    = EGL14.EGL_NO_DISPLAY;
-		private EGLContext mCtx     = EGL14.EGL_NO_CONTEXT;
-		private EGLSurface mEncEgl  = EGL14.EGL_NO_SURFACE;
-		private EGLSurface mPrevEgl = EGL14.EGL_NO_SURFACE;
+		private EGLDisplay mDisp   = EGL14.EGL_NO_DISPLAY;
+		private EGLContext mCtx    = EGL14.EGL_NO_CONTEXT;
+		private EGLSurface mEncEgl = EGL14.EGL_NO_SURFACE;
 
-		// ── GL ───────────────────────────────────────────────────────────────
+		// ── GL ─────────────────────────────────────────────────────────────────
 		private int mOesTex = -1;
 		private SurfaceTexture mCamST;
 		private final float[] mSTMat = new float[16];
 		private int mCamProg, mCamPos, mCamTexAttr, mCamSTUni, mCamShift, mCamSTexUni;
-		private int mRectProg, mRectPos, mRectColor;
-		private FloatBuffer mQuadBuf;   // full-screen quad
-		private FloatBuffer mLineBuf;   // rectangle lines
+		private FloatBuffer mQuadBuf;
 
-		// ── Latch: GL готов до чтения getCameraTexture() ─────────────────────
-		private final CountDownLatch mReadyLatch = new CountDownLatch(1);
-		// HandlerThread для SurfaceTexture.setOnFrameAvailableListener —
-		// ОБЯЗАТЕЛЕН: без Handler Android требует Looper на вызывающем потоке;
-		// EisGlThread — обычный Thread без Looper, поэтому колбэк без HandlerThread
-		// никогда не доставляется и GL-поток зависает навечно.
+		// HandlerThread для SurfaceTexture.OnFrameAvailableListener.
+		// ОБЯЗАТЕЛЕН: без Looper (EisGlThread — обычный Thread) колбэк не доставляется.
 		private HandlerThread mStListenerThread;
 		private Handler       mStListenerHandler;
 
-		// ── Состояние EIS (точные аналоги переменных из HTML) ────────────────
+		// ── Latch: GL готов ────────────────────────────────────────────────────
+		private final CountDownLatch mReadyLatch = new CountDownLatch(1);
+
+		// ── EIS state (зеркало HTML-переменных) ────────────────────────────────
 		private byte[]  mTemplate  = null;
 		private float   mVirtualX, mVirtualY;
 		private float   mLastMatchX, mLastMatchY;
@@ -1578,19 +1591,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		private volatile byte[] mPendingLuma = null;
 		private volatile float  mDriftSpeed  = 0.03f;
 
-		// ── Синхронизация фреймов ─────────────────────────────────────────────
-		private volatile boolean mRunning = true;
-		private final Object mFrameLock = new Object();
+		// ── Frame sync ─────────────────────────────────────────────────────────
+		private volatile boolean mRunning   = true;
+		private final Object     mFrameLock = new Object();
 		private volatile boolean mFrameAvail = false;
 
-		// ── Внешние поверхности ──────────────────────────────────────────────
 		private final Surface mEncSurf;
-		private final Surface mPrevSurf;
 
-		EisGlThread(Surface encSurf, Surface prevSurf) {
+		EisGlThread(Surface encSurf) {
 			super("eis-gl");
 			mEncSurf  = encSurf;
-			mPrevSurf = prevSurf;
 			mVirtualX = mLastMatchX = mMatchX = (EIS_W - TMPL_W) / 2f;
 			mVirtualY = mLastMatchY = mMatchY = (EIS_H - TMPL_H) / 2f;
 		}
@@ -1617,7 +1627,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			try {
 				setupEgl();
 				setupGl();
-				mReadyLatch.countDown(); // SurfaceTexture готова
+				mReadyLatch.countDown();
 
 				while (mRunning) {
 					synchronized (mFrameLock) {
@@ -1627,49 +1637,36 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 						if (!mRunning) break;
 						mFrameAvail = false;
 					}
-
+					// EGL context уже current на этом потоке (makeCurrent в setupEgl)
 					mCamST.updateTexImage();
 					mCamST.getTransformMatrix(mSTMat);
 					long pts = mCamST.getTimestamp(); // nanoseconds
 
-					// Template matching с последней полученной luma
 					byte[] luma = mPendingLuma;
 					if (luma != null) { mPendingLuma = null; processEis(luma); }
 
-					// Сдвиг в нормализованных tex-коорд: dx/EIS_W, dy/EIS_H
-					// HTML: dx = matchX − virtualX (сдвиг в пикселях кадра)
-					// GL: shiftU = dx/EIS_W, shiftV = -dy/EIS_H (Y инвертирован)
 					float shiftU =  (mMatchX - mVirtualX) / EIS_W;
 					float shiftV = -(mMatchY - mVirtualY) / EIS_H;
 
-					// Рендер → Encoder
-					EGL14.eglMakeCurrent(mDisp, mEncEgl, mEncEgl, mCtx);
 					try { EGLExt.eglPresentationTimeANDROID(mDisp, mEncEgl, pts); }
-					catch (Exception ignored) { /* расширение может отсутствовать */ }
+					catch (Exception ignored) {}
 					renderFrame(shiftU, shiftV);
 					EGL14.eglSwapBuffers(mDisp, mEncEgl);
-
-					// Рендер → Preview
-					EGL14.eglMakeCurrent(mDisp, mPrevEgl, mPrevEgl, mCtx);
-					renderFrame(shiftU, shiftV);
-					EGL14.eglSwapBuffers(mDisp, mPrevEgl);
 				}
-			} catch (Exception e) { status("EIS: " + e.getMessage()); }
+			} catch (Exception e) { status("EIS GL: " + e.getMessage()); }
 			finally { releaseGl(); }
 		}
 
-		// ── EIS: точная копия алгоритма videosuperstab.html ─────────────────
+		// ── EIS алгоритм (зеркало videosuperstab.html) ─────────────────────────
 
 		private void processEis(byte[] luma) {
 			if (mTemplate == null) { initTemplate(luma); return; }
 
-			// ROI вокруг lastMatchX/Y (аналог searchRoi в HTML)
 			int roiX = Math.max(0, (int)(mLastMatchX - SEARCH_R));
 			int roiY = Math.max(0, (int)(mLastMatchY - SEARCH_R));
 			int roiW = Math.min(EIS_W - roiX, TMPL_W + SEARCH_R * 2);
 			int roiH = Math.min(EIS_H - roiY, TMPL_H + SEARCH_R * 2);
 
-			// SAD-поиск шаблона в ROI текущего кадра
 			long bestSad = Long.MAX_VALUE; int bestDx = 0, bestDy = 0;
 			for (int ry = 0; ry + TMPL_H <= roiH; ry++) {
 				for (int rx = 0; rx + TMPL_W <= roiW; rx++) {
@@ -1686,12 +1683,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 
 			float matchX = roiX + bestDx;
 			float matchY = roiY + bestDy;
-
-			// Условия reset (аналог HTML):
-			//   bestSad > SAD_MAX  ≡ minMax.maxVal < 0.4
-			//   nearEdge           ≡ isNearEdge
-			//   jump > MAX_SHIFT   ≡ jumpDist > MAX_SHIFT
-			float jump = (float) Math.hypot(matchX - mLastMatchX, matchY - mLastMatchY);
+			float jump   = (float) Math.hypot(matchX - mLastMatchX, matchY - mLastMatchY);
 			boolean nearEdge =
 				matchX < EDGE_M || matchX + TMPL_W > EIS_W - EDGE_M ||
 				matchY < EDGE_M || matchY + TMPL_H > EIS_H - EDGE_M;
@@ -1702,27 +1694,28 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			} else {
 				mLastMatchX = matchX; mLastMatchY = matchY;
 			}
-
 			mMatchX = matchX; mMatchY = matchY;
 
-			// virtualX += (matchX − virtualX) * driftSpeed
 			float ds = mDriftSpeed;
 			mVirtualX += (matchX - mVirtualX) * ds;
 			mVirtualY += (matchY - mVirtualY) * ds;
+
+			// Обновляем overlay (рисует Canvas на UI-потоке, не требует GL)
+			if (mEisOverlay != null) {
+				final float mx = mMatchX, my = mMatchY;
+				final boolean hg = mHasGhost;
+				final float gx = mx + mGhostOffX, gy = my + mGhostOffY;
+				mEisOverlay.update(mx, my, hg, gx, gy);
+			}
 		}
 
-		/** Аналог triggerSmoothReset() из HTML. */
 		private void triggerSmoothReset(byte[] luma) {
-			// Ghost offset = где был старый шаблон (для жёлтого rect)
-			mGhostOffX = mLastMatchX - IDEAL_X;
-			mGhostOffY = mLastMatchY - IDEAL_Y;
-			mHasGhost  = true;
-			// Сохраняем текущее остаточное смещение
-			float cDx = mLastMatchX - mVirtualX;
-			float cDy = mLastMatchY - mVirtualY;
-			// Новый шаблон из центра текущего кадра
+			mGhostOffX  = mLastMatchX - IDEAL_X;
+			mGhostOffY  = mLastMatchY - IDEAL_Y;
+			mHasGhost   = true;
+			float cDx   = mLastMatchX - mVirtualX;
+			float cDy   = mLastMatchY - mVirtualY;
 			mTemplate   = extractBlock(luma, (int)IDEAL_X, (int)IDEAL_Y);
-			// Корректируем virtualX чтобы не было прыжка на выходе
 			mVirtualX   = IDEAL_X - cDx;
 			mVirtualY   = IDEAL_Y - cDy;
 			mLastMatchX = IDEAL_X; mLastMatchY = IDEAL_Y;
@@ -1743,21 +1736,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			return blk;
 		}
 
-		// ── GL rendering ─────────────────────────────────────────────────────
+		// ── GL ─────────────────────────────────────────────────────────────────
 
 		private void renderFrame(float shiftU, float shiftV) {
 			GLES20.glClearColor(0f, 0f, 0f, 1f);
 			GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
 			GLES20.glViewport(0, 0, VIDEO_W, VIDEO_H);
-
-			// ── Стабилизированный кадр камеры ────────────────────────────────
 			GLES20.glUseProgram(mCamProg);
 			GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
 			GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, mOesTex);
 			GLES20.glUniform1i(mCamSTexUni, 0);
 			GLES20.glUniformMatrix4fv(mCamSTUni, 1, false, mSTMat, 0);
 			GLES20.glUniform2f(mCamShift, shiftU, shiftV);
-
 			mQuadBuf.position(0);
 			GLES20.glEnableVertexAttribArray(mCamPos);
 			GLES20.glVertexAttribPointer(mCamPos, 2, GLES20.GL_FLOAT, false, 16, mQuadBuf);
@@ -1765,35 +1755,18 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			GLES20.glEnableVertexAttribArray(mCamTexAttr);
 			GLES20.glVertexAttribPointer(mCamTexAttr, 2, GLES20.GL_FLOAT, false, 16, mQuadBuf);
 			GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
-
-			// ── Debug-рамки ───────────────────────────────────────────────────
-			GLES20.glLineWidth(3f);
-			// Красная рамка = текущий матч (как красный rect в HTML)
-			drawEisRect(mMatchX, mMatchY, TMPL_W, TMPL_H, 1f, 0.1f, 0.1f);
-			// Жёлтая рамка = ghost после triggerSmoothReset
-			if (mHasGhost) drawEisRect(mMatchX + mGhostOffX, mMatchY + mGhostOffY,
-			                            TMPL_W, TMPL_H, 1f, 1f, 0f);
 		}
 
-		/** Рисует прямоугольник: EIS-коорд → NDC с учётом инверсии Y. */
-		private void drawEisRect(float ex, float ey, int w, int h, float r, float g, float b) {
-			float x0 =  ex       / EIS_W * 2f - 1f,  x1 = (ex+w) / EIS_W * 2f - 1f;
-			float y0 = 1f - ey   / EIS_H * 2f,        y1 = 1f - (ey+h) / EIS_H * 2f;
-			float[] lines = { x0,y0, x1,y0, x1,y0, x1,y1, x1,y1, x0,y1, x0,y1, x0,y0 };
-			mLineBuf.clear(); mLineBuf.put(lines); mLineBuf.position(0);
-			GLES20.glUseProgram(mRectProg);
-			GLES20.glEnableVertexAttribArray(mRectPos);
-			GLES20.glVertexAttribPointer(mRectPos, 2, GLES20.GL_FLOAT, false, 8, mLineBuf);
-			GLES20.glUniform4f(mRectColor, r, g, b, 1f);
-			GLES20.glDrawArrays(GLES20.GL_LINES, 0, 8);
-		}
-
-		// ── EGL setup / teardown ─────────────────────────────────────────────
+		// ── EGL setup / teardown ───────────────────────────────────────────────
 
 		private void setupEgl() {
 			mDisp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+			if (mDisp == EGL14.EGL_NO_DISPLAY) throw new RuntimeException("eglGetDisplay failed");
 			int[] ver = new int[2];
-			EGL14.eglInitialize(mDisp, ver, 0, ver, 1);
+			if (!EGL14.eglInitialize(mDisp, ver, 0, ver, 1))
+				throw new RuntimeException("eglInitialize failed");
+
+			// Пробуем конфиг с EGL_RECORDABLE_ANDROID (для encoder surface)
 			int[] cfgA = {
 				EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
 				EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
@@ -1802,30 +1775,47 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			};
 			EGLConfig[] cfgs = new EGLConfig[1]; int[] n = new int[1];
 			EGL14.eglChooseConfig(mDisp, cfgA, 0, cfgs, 0, 1, n, 0);
+			if (n[0] == 0) {
+				// Fallback без EGL_RECORDABLE_ANDROID
+				int[] cfgB = {
+					EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+					EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+					EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+					EGL14.EGL_NONE
+				};
+				EGL14.eglChooseConfig(mDisp, cfgB, 0, cfgs, 0, 1, n, 0);
+			}
+			if (n[0] == 0 || cfgs[0] == null)
+				throw new RuntimeException("No EGL config found");
+
 			int[] ctxA = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
-			mCtx     = EGL14.eglCreateContext(mDisp, cfgs[0], EGL14.EGL_NO_CONTEXT, ctxA, 0);
+			mCtx = EGL14.eglCreateContext(mDisp, cfgs[0], EGL14.EGL_NO_CONTEXT, ctxA, 0);
+			if (mCtx == EGL14.EGL_NO_CONTEXT)
+				throw new RuntimeException("eglCreateContext failed");
+
 			int[] sfA = { EGL14.EGL_NONE };
-			mEncEgl  = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], mEncSurf,  sfA, 0);
-			mPrevEgl = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], mPrevSurf, sfA, 0);
-			EGL14.eglMakeCurrent(mDisp, mEncEgl, mEncEgl, mCtx);
+			mEncEgl = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], mEncSurf, sfA, 0);
+			if (mEncEgl == EGL14.EGL_NO_SURFACE)
+				throw new RuntimeException("eglCreateWindowSurface(enc) failed");
+
+			if (!EGL14.eglMakeCurrent(mDisp, mEncEgl, mEncEgl, mCtx))
+				throw new RuntimeException("eglMakeCurrent failed");
 		}
 
 		private void setupGl() {
-			// OES-текстура для кадров камеры
 			int[] t = new int[1]; GLES20.glGenTextures(1, t, 0); mOesTex = t[0];
 			GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, mOesTex);
 			GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
 			GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
 			mCamST = new SurfaceTexture(mOesTex);
-			// Создаём отдельный HandlerThread — единственный надёжный способ
-			// доставки колбэков SurfaceTexture.OnFrameAvailableListener
-			// когда вызывающий поток не имеет Looper (как наш EisGlThread).
-			mStListenerThread = new HandlerThread("eis-st-listener");
+
+			// HandlerThread для доставки OnFrameAvailableListener — обязателен,
+			// т.к. EisGlThread не имеет Looper.
+			mStListenerThread = new HandlerThread("eis-st-cb");
 			mStListenerThread.start();
 			mStListenerHandler = new Handler(mStListenerThread.getLooper());
 			mCamST.setOnFrameAvailableListener(st -> notifyFrame(), mStListenerHandler);
 
-			// Camera program
 			mCamProg    = buildProg(VERT_CAM, FRAG_CAM);
 			mCamPos     = GLES20.glGetAttribLocation (mCamProg, "aPosition");
 			mCamTexAttr = GLES20.glGetAttribLocation (mCamProg, "aTexCoord");
@@ -1833,18 +1823,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCamShift   = GLES20.glGetUniformLocation(mCamProg, "uShift");
 			mCamSTexUni = GLES20.glGetUniformLocation(mCamProg, "sTexture");
 
-			// Rect program
-			mRectProg   = buildProg(VERT_RECT, FRAG_RECT);
-			mRectPos    = GLES20.glGetAttribLocation (mRectProg, "aPosition");
-			mRectColor  = GLES20.glGetUniformLocation(mRectProg, "uColor");
-
-			// Quad: x,y,u,v (TRIANGLE_STRIP full screen)
-			float[] quad = { -1f,-1f,0f,0f,  1f,-1f,1f,0f,  -1f,1f,0f,1f,  1f,1f,1f,1f };
+			float[] quad = { -1f,-1f,0f,0f, 1f,-1f,1f,0f, -1f,1f,0f,1f, 1f,1f,1f,1f };
 			mQuadBuf = ByteBuffer.allocateDirect(quad.length*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
 			mQuadBuf.put(quad);
-
-			// Line buffer: 4 lines × 2 pts × 2 floats = 16 floats; ×2 запас
-			mLineBuf = ByteBuffer.allocateDirect(32*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
 		}
 
 		private void releaseGl() {
@@ -1855,12 +1836,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 			if (mCamST != null) { mCamST.release(); mCamST = null; }
 			if (mDisp != EGL14.EGL_NO_DISPLAY) {
-				EGL14.eglMakeCurrent(mDisp, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
-				if (mEncEgl  != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(mDisp, mEncEgl);
-				if (mPrevEgl != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(mDisp, mPrevEgl);
+				EGL14.eglMakeCurrent(mDisp,
+					EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+				if (mEncEgl != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(mDisp, mEncEgl);
 				EGL14.eglDestroyContext(mDisp, mCtx);
 				EGL14.eglTerminate(mDisp);
 			}
+			if (mEisOverlay != null) runOnUiThread(() -> mEisOverlay.setVisibility(View.GONE));
 		}
 
 		private int buildProg(String v, String f) {
@@ -1873,9 +1855,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			GLES20.glLinkProgram(p); return p;
 		}
 
-		// ── GLSL шейдеры ─────────────────────────────────────────────────────
-		// Камера: сдвигаем tex-координаты на uShift; vRaw — до STMatrix, для
-		// проверки границ: OOB → чёрный пиксель (как в HTML: warpAffine + black border)
 		private static final String VERT_CAM =
 			"attribute vec4 aPosition;\n" +
 			"attribute vec2 aTexCoord;\n" +
@@ -1903,16 +1882,51 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			"  }\n" +
 			"}\n";
 
-		private static final String VERT_RECT =
-			"attribute vec4 aPosition;\n" +
-			"void main() { gl_Position = aPosition; }\n";
-
-		private static final String FRAG_RECT =
-			"precision mediump float;\n" +
-			"uniform vec4 uColor;\n" +
-			"void main() { gl_FragColor = uColor; }\n";
-
 	} // end EisGlThread
+
+	// =========================================================================
+	// EisOverlayView — прозрачный Canvas-оверлей для debug-рамок EIS.
+	// Рисует красный (текущий матч) и жёлтый (ghost) прямоугольники
+	// поверх SurfaceView превью. Обновляется через postInvalidate() из GL-потока.
+	// =========================================================================
+	static class EisOverlayView extends View {
+		private final Paint mRedPaint    = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private final Paint mYellowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
+		private float mMx, mMy, mGx, mGy;
+		private boolean mHasGhost;
+
+		EisOverlayView(Context c) {
+			super(c);
+			setWillNotDraw(false);
+			setBackgroundColor(Color.TRANSPARENT);
+			mRedPaint.setStyle(Paint.Style.STROKE);
+			mRedPaint.setColor(Color.RED);
+			mRedPaint.setStrokeWidth(4f);
+			mYellowPaint.setStyle(Paint.Style.STROKE);
+			mYellowPaint.setColor(Color.YELLOW);
+			mYellowPaint.setStrokeWidth(3f);
+		}
+
+		/** Вызывается из GL-потока (не UI-поток). postInvalidate безопасен. */
+		void update(float mx, float my, boolean hasGhost, float gx, float gy) {
+			mMx = mx; mMy = my; mHasGhost = hasGhost; mGx = gx; mGy = gy;
+			postInvalidate();
+		}
+
+		@Override protected void onDraw(Canvas canvas) {
+			int vw = getWidth(), vh = getHeight();
+			if (vw == 0 || vh == 0) return;
+			// Масштаб EIS-координат (320×180) → размеры View
+			float sx = (float) vw / EIS_W;
+			float sy = (float) vh / EIS_H;
+			float tw = EisGlThread.TMPL_W * sx;
+			float th = EisGlThread.TMPL_H * sy;
+			// Красный: текущий матч
+			canvas.drawRect(mMx*sx, mMy*sy, mMx*sx+tw, mMy*sy+th, mRedPaint);
+			// Жёлтый: ghost после triggerSmoothReset
+			if (mHasGhost) canvas.drawRect(mGx*sx, mGy*sy, mGx*sx+tw, mGy*sy+th, mYellowPaint);
+		}
+	}
 
 	private void buildAudioSources() {
 		List<AudioSrcItem> list = new ArrayList<>();
