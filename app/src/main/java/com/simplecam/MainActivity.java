@@ -427,116 +427,87 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Шестерёнка слева, статус справа (weight=1)
 		panel.addView(hrow(mSrcToggleBtn, mTvStatus));
 		
-		// Схлопываемая панель: спиннер + soft clip + manual focus
-		// Центрируем по экрану — слайдер Gain слева не перекрывает
+		// ═══════════════════════════════════════════════════════════════════
+		// Схлопываемая панель настроек — 2 колонки рядом:
+		//   Левая  (weight=1): аудио-источник, чекбоксы, EV, Pre-buffer
+		//   Правая (weight=1): анализаторы, битрейт, Super-stab (EIS)
+		// ═══════════════════════════════════════════════════════════════════
 		mAudioSrcPanel = new LinearLayout(this);
-		mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL);
+		mAudioSrcPanel.setOrientation(LinearLayout.HORIZONTAL);
 		mAudioSrcPanel.setVisibility(View.GONE);
-		mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
-		
+		mAudioSrcPanel.setPadding(dp(4), dp(2), dp(4), dp(2));
+
+		// ── Левая колонка: аудио ─────────────────────────────────────────────
+		LinearLayout colLeft = new LinearLayout(this);
+		colLeft.setOrientation(LinearLayout.VERTICAL);
+		colLeft.setPadding(dp(4), 0, dp(8), 0);
+		LinearLayout.LayoutParams colLP = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+		mAudioSrcPanel.addView(colLeft, colLP);
+
+		// Разделитель
+		View divider = new View(this);
+		divider.setBackgroundColor(0x44FFFFFF);
+		mAudioSrcPanel.addView(divider, new LinearLayout.LayoutParams(dp(1), ViewGroup.LayoutParams.MATCH_PARENT));
+
+		// ── Правая колонка: видео + EIS ──────────────────────────────────────
+		LinearLayout colRight = new LinearLayout(this);
+		colRight.setOrientation(LinearLayout.VERTICAL);
+		colRight.setPadding(dp(8), 0, dp(4), 0);
+		mAudioSrcPanel.addView(colRight, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+		// ════════════ ЛЕВАЯ КОЛОНКА ════════════
+
+		// Аудио-источник
 		mSpinner = new Spinner(this);
-		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
-		new ArrayList<String>());
+		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<String>());
 		ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
 		mSpinner.setAdapter(ad);
-		// Фиксированная ширина вместо weight=1 — не тянется на весь экран
-		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
+		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 		mSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-			@Override
-			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
-				if (!mRecording) {
-					stopAudio();
-					startMonitor();
-				}
+			@Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+				if (!mRecording) { stopAudio(); startMonitor(); }
 			}
-			
-			@Override
-			public void onNothingSelected(AdapterView<?> p) {
-			}
+			@Override public void onNothingSelected(AdapterView<?> p) {}
 		});
-		
 		LinearLayout srcRow = new LinearLayout(this);
-		srcRow.setOrientation(LinearLayout.HORIZONTAL);
-		srcRow.setGravity(Gravity.CENTER_VERTICAL);
-		srcRow.addView(smallLabel("Src: "));
-		srcRow.addView(mSpinner);
-		mAudioSrcPanel.addView(srcRow);
-		
+		srcRow.setOrientation(LinearLayout.HORIZONTAL); srcRow.setGravity(Gravity.CENTER_VERTICAL);
+		srcRow.addView(smallLabel("Src:")); srcRow.addView(mSpinner);
+		colLeft.addView(srcRow);
+
+		// Soft clip + Manual focus
 		mCbSoftClip = new CheckBox(this);
 		mCbSoftClip.setText("Soft clip");
-		mCbSoftClip.setTextColor(0xCCCCCCCC);
-		mCbSoftClip.setTextSize(12);
-		mCbSoftClip.setChecked(true);
-		mSoftClip = true;
+		mCbSoftClip.setTextColor(0xCCCCCCCC); mCbSoftClip.setTextSize(12);
+		mCbSoftClip.setChecked(true); mSoftClip = true;
 		mCbSoftClip.setOnCheckedChangeListener((cb, checked) -> mSoftClip = checked);
-		
+
 		mCbManualFocus = new CheckBox(this);
-		mCbManualFocus.setText("Manual focus");
-		mCbManualFocus.setTextColor(0xCCCCCCCC);
-		mCbManualFocus.setTextSize(12);
+		mCbManualFocus.setText("Man.focus");
+		mCbManualFocus.setTextColor(0xCCCCCCCC); mCbManualFocus.setTextSize(12);
 		mCbManualFocus.setOnCheckedChangeListener((cb, checked) -> {
 			mManualFocus = checked;
 			mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
-			// Сдвигаем кнопку REC влево на полширины когда барабан виден
-			// mBtn теперь в root FrameLayout с фиксированным rightMargin — не трогаем
-			// Чекбокс Focus Assist — только при ручной фокусировке
-			if (mCbFocusAssist != null)
-			mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (!checked) {
-				// Скрываем ассист и отменяем восстановление зума
-				if (mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
-			}
-			if (mCamHandler != null)
-			mCamHandler.post(this::buildAndSendRequest);
+			if (mCbFocusAssist != null) mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (!checked && mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
+			if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
 		});
-		
 		LinearLayout cbRow = new LinearLayout(this);
-		cbRow.setOrientation(LinearLayout.HORIZONTAL);
-		cbRow.setGravity(Gravity.CENTER_VERTICAL);
-		cbRow.addView(mCbSoftClip);
-		cbRow.addView(mCbManualFocus);
-		mAudioSrcPanel.addView(cbRow);
+		cbRow.setOrientation(LinearLayout.HORIZONTAL); cbRow.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow.addView(mCbSoftClip); cbRow.addView(mCbManualFocus);
+		colLeft.addView(cbRow);
 
-		// Чекбоксы видимости анализаторов
-		CheckBox mCbOsc = new CheckBox(this);
-		mCbOsc.setText("Oscilloscope");
-		mCbOsc.setTextColor(0xCCCCCCCC);
-		mCbOsc.setTextSize(12);
-		mCbOsc.setChecked(false);
-		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
-			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
-		});
-
-		CheckBox mCbSpec = new CheckBox(this);
-		mCbSpec.setText("Spectrum analyzer");
-		mCbSpec.setTextColor(0xCCCCCCCC);
-		mCbSpec.setTextSize(12);
-		mCbSpec.setChecked(true);
-		mCbSpec.setOnCheckedChangeListener((cb, checked) -> {
-			if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE);
-		});
-
-		LinearLayout cbRow2 = new LinearLayout(this);
-		cbRow2.setOrientation(LinearLayout.HORIZONTAL);
-		cbRow2.setGravity(Gravity.CENTER_VERTICAL);
-		cbRow2.addView(mCbOsc);
-		cbRow2.addView(mCbSpec);
-		mAudioSrcPanel.addView(cbRow2);
-		
 		// Focus Assist
 		mCbFocusAssist = new CheckBox(this);
-		mCbFocusAssist.setText("Focus assist (zoom while focusing)");
-		mCbFocusAssist.setTextColor(0xCCCCCCCC);
-		mCbFocusAssist.setTextSize(12);
+		mCbFocusAssist.setText("Focus assist");
+		mCbFocusAssist.setTextColor(0xCCCCCCCC); mCbFocusAssist.setTextSize(12);
 		mCbFocusAssist.setVisibility(View.GONE);
-		mAudioSrcPanel.addView(mCbFocusAssist);
+		colLeft.addView(mCbFocusAssist);
 
-		// ── EV ──────────────────────────────────────────────────────────────
+		// EV
 		mTvEv = smallLabel("EV  0");
 		mSeekEv = new SeekBar(this);
 		mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin);
-		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
+		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
 				mEvComp = mEvMin + p; updateEvLabel(mEvComp);
@@ -548,66 +519,84 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout evRow = new LinearLayout(this);
 		evRow.setOrientation(LinearLayout.HORIZONTAL); evRow.setGravity(Gravity.CENTER_VERTICAL);
 		evRow.addView(mTvEv); evRow.addView(mSeekEv);
-		mAudioSrcPanel.addView(evRow);
+		colLeft.addView(evRow);
 
-		// ── Pre-buffer ───────────────────────────────────────────────────────
+		// Pre-buffer
 		CheckBox cbPB = new CheckBox(this);
-		cbPB.setText("Pre-buffer");
-		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12);
-		cbPB.setChecked(true); // включён по умолчанию
+		cbPB.setText("Pre-buf");
+		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12); cbPB.setChecked(true);
 		cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
-		final TextView tvPBLen = smallLabel("1 s");
+		final TextView tvPBLen = smallLabel("1s");
 		SeekBar sbPB = new SeekBar(this);
 		sbPB.setMax(4); sbPB.setProgress(0);
-		sbPB.setLayoutParams(new LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT));
+		sbPB.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		sbPB.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mPreBufSecs = p + 1; tvPBLen.setText(mPreBufSecs + " s");
-			}
+			public void onProgressChanged(SeekBar s, int p, boolean u) { mPreBufSecs = p+1; tvPBLen.setText(mPreBufSecs+"s"); }
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
 		});
 		LinearLayout pbRow = new LinearLayout(this);
 		pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL);
 		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
-		mAudioSrcPanel.addView(pbRow);
+		colLeft.addView(pbRow);
 
-		// ── Битрейт видео ────────────────────────────────────────────────────
-		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
+		// ════════════ ПРАВАЯ КОЛОНКА ════════════
+
+		// Осциллограф + Спектр
+		CheckBox mCbOsc = new CheckBox(this);
+		mCbOsc.setText("Osc");
+		mCbOsc.setTextColor(0xCCCCCCCC); mCbOsc.setTextSize(12); mCbOsc.setChecked(false);
+		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
+			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (mEnvelope     != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
+		});
+		CheckBox mCbSpec = new CheckBox(this);
+		mCbSpec.setText("Spectrum");
+		mCbSpec.setTextColor(0xCCCCCCCC); mCbSpec.setTextSize(12); mCbSpec.setChecked(true);
+		mCbSpec.setOnCheckedChangeListener((cb, checked) -> {
+			if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE);
+		});
+		LinearLayout cbRow2 = new LinearLayout(this);
+		cbRow2.setOrientation(LinearLayout.HORIZONTAL); cbRow2.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow2.addView(mCbOsc); cbRow2.addView(mCbSpec);
+		colRight.addView(cbRow2);
+
+		// Битрейт
+		String[] bpsL={"500k","1M","2M","3M","4M","6M✓","8M","12M"};
 		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
 		Spinner spBps = new Spinner(this);
 		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
 		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-		spBps.setAdapter(bpsAd); spBps.setSelection(5); // 6 Mbps
-		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(190), ViewGroup.LayoutParams.WRAP_CONTENT));
+		spBps.setAdapter(bpsAd); spBps.setSelection(5);
+		spBps.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsV[pos]; }
 			public void onNothingSelected(AdapterView<?> p) {}
 		});
 		LinearLayout bpsRow = new LinearLayout(this);
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
-		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		mAudioSrcPanel.addView(bpsRow);
+		bpsRow.addView(smallLabel("Bps:")); bpsRow.addView(spBps);
+		colRight.addView(bpsRow);
 
-		// ── Super-stab (EIS) ─────────────────────────────────────────────────
+		// ── Super-stab (EIS) — в правой колонке ─────────────────────────────
 		mCbEis = new CheckBox(this);
-		mCbEis.setText("Super-stab (EIS)");
-		mCbEis.setTextColor(0xCCCCCCCC); mCbEis.setTextSize(12);
+		mCbEis.setText("Super-stab");
+		mCbEis.setTextColor(0xFF88DDFF); // выделяем голубым — главная фича
+		mCbEis.setTextSize(13);
 		mCbEis.setChecked(false);
 		mCbEis.setOnCheckedChangeListener((cb, checked) -> {
 			mEisEnabled = checked;
 			if (mCamThread != null && mCamThread.isAlive()) {
-				mCamHandler.post(() -> {
-					if (!checked) stopEis();
-					startPreview();
-				});
+				mCamHandler.post(() -> { if (!checked) stopEis(); startPreview(); });
 			}
 		});
+		colRight.addView(mCbEis);
+
+		// Drift-слайдер под чекбоксом
 		mTvEisDrift = smallLabel("0.030");
 		mSeekEisDrift = new SeekBar(this);
-		// 0.005..0.100 шагом 0.005, 19 шагов; default prog=5 → 0.030
-		mSeekEisDrift.setMax(19); mSeekEisDrift.setProgress(5);
-		mSeekEisDrift.setLayoutParams(new LinearLayout.LayoutParams(dp(120), ViewGroup.LayoutParams.WRAP_CONTENT));
+		mSeekEisDrift.setMax(19); mSeekEisDrift.setProgress(5); // default 0.030
+		mSeekEisDrift.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		mSeekEisDrift.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
 				mEisDriftSpeed = 0.005f + p * 0.005f;
@@ -617,13 +606,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
 		});
-		LinearLayout eisRow = new LinearLayout(this);
-		eisRow.setOrientation(LinearLayout.HORIZONTAL); eisRow.setGravity(Gravity.CENTER_VERTICAL);
-		eisRow.addView(mCbEis);
-		eisRow.addView(smallLabel(" Дрейф:"));
-		eisRow.addView(mSeekEisDrift);
-		eisRow.addView(mTvEisDrift);
-		mAudioSrcPanel.addView(eisRow);
+		LinearLayout driftRow = new LinearLayout(this);
+		driftRow.setOrientation(LinearLayout.HORIZONTAL); driftRow.setGravity(Gravity.CENTER_VERTICAL);
+		driftRow.addView(smallLabel("Drift:")); driftRow.addView(mSeekEisDrift); driftRow.addView(mTvEisDrift);
+		colRight.addView(driftRow);
 
 		panel.addView(mAudioSrcPanel);
 
