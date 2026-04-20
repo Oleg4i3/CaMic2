@@ -28,14 +28,25 @@ import android.media.audiofx.AutomaticGainControl;
 import android.media.audiofx.NoiseSuppressor;
 import android.media.audiofx.AcousticEchoCanceler;
 
+import android.graphics.ImageFormat;
+import android.media.ImageReader;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLContext;
+import android.opengl.EGLSurface;
+import android.opengl.EGLExt;
+import android.opengl.GLES11Ext;
+import android.opengl.GLES20;
+import android.graphics.SurfaceTexture;
+
 import java.io.File;
 import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
-
-import android.media.ImageReader;
-import android.graphics.ImageFormat;
 
 /**
 * SimpleCam — минималистичная камера для горизонтального экрана.
@@ -160,45 +171,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile MediaFormat mAudOutFmt = null;
 	private volatile boolean mVidLoopRunning = false;
 
-	// ─── Super EIS ────────────────────────────────────────────────────────────
-	// Анализирующий ImageReader 320×180 (YUV_420_888) + SAD шаблонный матчинг.
-	// Стабилизация применяется сдвигом SCALER_CROP_REGION — никаких изменений
-	// в энкодере, кольцевом буфере и мюксере не требуется.
-	private volatile boolean mEisEnabled    = false;
-	private volatile float   mEisDriftSpeed = 0.03f; // 0..0.1
-	private volatile float   mEisZoomFactor = 1.5f;  // доп. кроп-зум для поля манёвра
-	private CheckBox  mCbEis;
-	private SeekBar   mSeekEisDrift, mSeekEisZoom;
-	private TextView  mTvEisDrift,   mTvEisZoom;
-	private LinearLayout mEisSettingsRow;
-
-	private ImageReader   mEisReader;
-	private HandlerThread mEisThread;
-	private Handler       mEisHandler;
-
-	private static final int EIS_W      = 320, EIS_H    = 180;
-	private static final int EIS_TMPL_W =  48, EIS_TMPL_H = 48;
-	private static final int EIS_IDEAL_X = (EIS_W - EIS_TMPL_W) / 2; // 136
-	private static final int EIS_IDEAL_Y = (EIS_H - EIS_TMPL_H) / 2; // 66
-	private static final int EIS_SEARCH_R   = 20;
-	private static final int EIS_MAX_SHIFT  = 16;
-	private static final int EIS_EDGE_MARGIN = 8;
-
-	// Состояние трекера (доступ только из mEisHandler)
-	private byte[]  mEisTemplate  = null;
-	private float   mEisVirtualX  = EIS_IDEAL_X, mEisVirtualY  = EIS_IDEAL_Y;
-	private float   mEisLastMX    = EIS_IDEAL_X, mEisLastMY    = EIS_IDEAL_Y;
-	private boolean mEisResetReq  = false;
-
-	// Текущий сдвиг кропа для buildAndSendRequest (volatile — читается из cam-thread)
-	private volatile float mEisCropDX = 0f, mEisCropDY = 0f;
-
-	// Данные для оверлея (volatile — читаются из UI-потока)
-	private volatile float mEisOvMatchX = EIS_IDEAL_X, mEisOvMatchY  = EIS_IDEAL_Y;
-	private volatile float mEisOvGhostX = Float.NaN,   mEisOvGhostY  = Float.NaN;
-	private volatile float mEisOvGhostOX = Float.NaN,  mEisOvGhostOY = Float.NaN;
-	private EisOverlayView mEisOverlay;
-
 	// ─── Настройки ───────────────────────────────────────────────────────────
 	private volatile int  mVideoBps = VIDEO_BPS_DEFAULT;
 	private volatile int  mPreBufSecs = 1;          // 1..5 секунд
@@ -208,6 +180,20 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private SeekBar mSeekEv;
 	private TextView mTvEv;
 	
+	// ─── EIS (GL-pipeline стабилизатор) ─────────────────────────────────────
+	// Режим: Camera → SurfaceTexture → EisGlThread (GL ES 2.0) → Encoder + Preview
+	// При EIS=OFF: Camera → Preview + Encoder напрямую (без изменений).
+	private volatile boolean mEisEnabled    = false;
+	private volatile float   mEisDriftSpeed = 0.03f;
+	private EisGlThread      mEisGlThread;
+	private ImageReader      mEisReader;
+	private HandlerThread    mEisLumaThread;
+	private Handler          mEisLumaHandler;
+	private CheckBox         mCbEis;
+	private SeekBar          mSeekEisDrift;
+	private TextView         mTvEisDrift;
+	static final int EIS_W = 320, EIS_H = 180;
+
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
 	private final Runnable mZoomRunnable = new Runnable() {
 		@Override
@@ -255,10 +241,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCamHandler.removeCallbacks(mZoomRunnable);
 		mVidLoopRunning = false;
 		stopAudio();
+		stopEis();
 		finalizeMuxer();
 		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
-		if (mEisReader != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
-		if (mEisThread != null) { mEisThread.quitSafely(); mEisThread = null; }
 		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
 			if (mCapSess != null)
@@ -442,184 +427,87 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		// Шестерёнка слева, статус справа (weight=1)
 		panel.addView(hrow(mSrcToggleBtn, mTvStatus));
 		
-		// Схлопываемая панель: спиннер + soft clip + manual focus
-		// Центрируем по экрану — слайдер Gain слева не перекрывает
+		// ═══════════════════════════════════════════════════════════════════
+		// Схлопываемая панель настроек — 2 колонки рядом:
+		//   Левая  (weight=1): аудио-источник, чекбоксы, EV, Pre-buffer
+		//   Правая (weight=1): анализаторы, битрейт, Super-stab (EIS)
+		// ═══════════════════════════════════════════════════════════════════
 		mAudioSrcPanel = new LinearLayout(this);
-		mAudioSrcPanel.setOrientation(LinearLayout.VERTICAL);
+		mAudioSrcPanel.setOrientation(LinearLayout.HORIZONTAL);
 		mAudioSrcPanel.setVisibility(View.GONE);
-		mAudioSrcPanel.setPadding(dp(8), dp(4), dp(8), dp(4));
-		
+		mAudioSrcPanel.setPadding(dp(4), dp(2), dp(4), dp(2));
+
+		// ── Левая колонка: аудио ─────────────────────────────────────────────
+		LinearLayout colLeft = new LinearLayout(this);
+		colLeft.setOrientation(LinearLayout.VERTICAL);
+		colLeft.setPadding(dp(4), 0, dp(8), 0);
+		LinearLayout.LayoutParams colLP = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+		mAudioSrcPanel.addView(colLeft, colLP);
+
+		// Разделитель
+		View divider = new View(this);
+		divider.setBackgroundColor(0x44FFFFFF);
+		mAudioSrcPanel.addView(divider, new LinearLayout.LayoutParams(dp(1), ViewGroup.LayoutParams.MATCH_PARENT));
+
+		// ── Правая колонка: видео + EIS ──────────────────────────────────────
+		LinearLayout colRight = new LinearLayout(this);
+		colRight.setOrientation(LinearLayout.VERTICAL);
+		colRight.setPadding(dp(8), 0, dp(4), 0);
+		mAudioSrcPanel.addView(colRight, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+		// ════════════ ЛЕВАЯ КОЛОНКА ════════════
+
+		// Аудио-источник
 		mSpinner = new Spinner(this);
-		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item,
-		new ArrayList<String>());
+		ArrayAdapter<String> ad = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<String>());
 		ad.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
 		mSpinner.setAdapter(ad);
-		// Фиксированная ширина вместо weight=1 — не тянется на весь экран
-		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(dp(200), ViewGroup.LayoutParams.WRAP_CONTENT));
+		mSpinner.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 		mSpinner.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-			@Override
-			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
-				if (!mRecording) {
-					stopAudio();
-					startMonitor();
-				}
+			@Override public void onItemSelected(AdapterView<?> p, View v, int pos, long id) {
+				if (!mRecording) { stopAudio(); startMonitor(); }
 			}
-			
-			@Override
-			public void onNothingSelected(AdapterView<?> p) {
-			}
+			@Override public void onNothingSelected(AdapterView<?> p) {}
 		});
-		
 		LinearLayout srcRow = new LinearLayout(this);
-		srcRow.setOrientation(LinearLayout.HORIZONTAL);
-		srcRow.setGravity(Gravity.CENTER_VERTICAL);
-		srcRow.addView(smallLabel("Src: "));
-		srcRow.addView(mSpinner);
-		mAudioSrcPanel.addView(srcRow);
-		
+		srcRow.setOrientation(LinearLayout.HORIZONTAL); srcRow.setGravity(Gravity.CENTER_VERTICAL);
+		srcRow.addView(smallLabel("Src:")); srcRow.addView(mSpinner);
+		colLeft.addView(srcRow);
+
+		// Soft clip + Manual focus
 		mCbSoftClip = new CheckBox(this);
 		mCbSoftClip.setText("Soft clip");
-		mCbSoftClip.setTextColor(0xCCCCCCCC);
-		mCbSoftClip.setTextSize(12);
-		mCbSoftClip.setChecked(true);
-		mSoftClip = true;
+		mCbSoftClip.setTextColor(0xCCCCCCCC); mCbSoftClip.setTextSize(12);
+		mCbSoftClip.setChecked(true); mSoftClip = true;
 		mCbSoftClip.setOnCheckedChangeListener((cb, checked) -> mSoftClip = checked);
-		
+
 		mCbManualFocus = new CheckBox(this);
-		mCbManualFocus.setText("Manual focus");
-		mCbManualFocus.setTextColor(0xCCCCCCCC);
-		mCbManualFocus.setTextSize(12);
+		mCbManualFocus.setText("Man.focus");
+		mCbManualFocus.setTextColor(0xCCCCCCCC); mCbManualFocus.setTextSize(12);
 		mCbManualFocus.setOnCheckedChangeListener((cb, checked) -> {
 			mManualFocus = checked;
 			mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
-			// Сдвигаем кнопку REC влево на полширины когда барабан виден
-			// mBtn теперь в root FrameLayout с фиксированным rightMargin — не трогаем
-			// Чекбокс Focus Assist — только при ручной фокусировке
-			if (mCbFocusAssist != null)
-			mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (!checked) {
-				// Скрываем ассист и отменяем восстановление зума
-				if (mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
-			}
-			if (mCamHandler != null)
-			mCamHandler.post(this::buildAndSendRequest);
+			if (mCbFocusAssist != null) mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (!checked && mFocusAssistHandler != null) mFocusAssistHandler.removeCallbacksAndMessages(null);
+			if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
 		});
-		
 		LinearLayout cbRow = new LinearLayout(this);
-		cbRow.setOrientation(LinearLayout.HORIZONTAL);
-		cbRow.setGravity(Gravity.CENTER_VERTICAL);
-		cbRow.addView(mCbSoftClip);
-		cbRow.addView(mCbManualFocus);
-		mAudioSrcPanel.addView(cbRow);
+		cbRow.setOrientation(LinearLayout.HORIZONTAL); cbRow.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow.addView(mCbSoftClip); cbRow.addView(mCbManualFocus);
+		colLeft.addView(cbRow);
 
-		// Чекбоксы видимости анализаторов
-		CheckBox mCbOsc = new CheckBox(this);
-		mCbOsc.setText("Oscilloscope");
-		mCbOsc.setTextColor(0xCCCCCCCC);
-		mCbOsc.setTextSize(12);
-		mCbOsc.setChecked(false);
-		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
-			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
-			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
-		});
-
-		CheckBox mCbSpec = new CheckBox(this);
-		mCbSpec.setText("Spectrum analyzer");
-		mCbSpec.setTextColor(0xCCCCCCCC);
-		mCbSpec.setTextSize(12);
-		mCbSpec.setChecked(true);
-		mCbSpec.setOnCheckedChangeListener((cb, checked) -> {
-			if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE);
-		});
-
-		LinearLayout cbRow2 = new LinearLayout(this);
-		cbRow2.setOrientation(LinearLayout.HORIZONTAL);
-		cbRow2.setGravity(Gravity.CENTER_VERTICAL);
-		cbRow2.addView(mCbOsc);
-		cbRow2.addView(mCbSpec);
-		mAudioSrcPanel.addView(cbRow2);
-		
 		// Focus Assist
 		mCbFocusAssist = new CheckBox(this);
-		mCbFocusAssist.setText("Focus assist (zoom while focusing)");
-		mCbFocusAssist.setTextColor(0xCCCCCCCC);
-		mCbFocusAssist.setTextSize(12);
+		mCbFocusAssist.setText("Focus assist");
+		mCbFocusAssist.setTextColor(0xCCCCCCCC); mCbFocusAssist.setTextSize(12);
 		mCbFocusAssist.setVisibility(View.GONE);
-		mAudioSrcPanel.addView(mCbFocusAssist);
+		colLeft.addView(mCbFocusAssist);
 
-		// ── Super EIS ────────────────────────────────────────────────────────
-		mCbEis = new CheckBox(this);
-		mCbEis.setText("Super EIS  🔵");
-		mCbEis.setTextColor(0xFF66BBFF);
-		mCbEis.setTextSize(12);
-		mCbEis.setOnCheckedChangeListener((cb, on) -> {
-			if (mRecording) { cb.setChecked(!on); return; } // нельзя менять во время записи
-			mEisEnabled = on;
-			if (mEisSettingsRow != null)
-				mEisSettingsRow.setVisibility(on ? View.VISIBLE : View.GONE);
-			if (mEisOverlay != null)
-				mEisOverlay.setVisibility(on ? View.VISIBLE : View.GONE);
-			// Сбросить трекер и перезапустить сессию камеры
-			mEisTemplate = null; mEisCropDX = 0; mEisCropDY = 0;
-			mEisOvGhostX = Float.NaN; mEisOvGhostY = Float.NaN;
-			restartCameraForEis();
-		});
-		mAudioSrcPanel.addView(mCbEis);
-
-		// Строка настроек EIS (скрыта пока EIS выключен)
-		mEisSettingsRow = new LinearLayout(this);
-		mEisSettingsRow.setOrientation(LinearLayout.VERTICAL);
-		mEisSettingsRow.setVisibility(View.GONE);
-
-		// Дрейф
-		mTvEisDrift = smallLabel("0.030");
-		mSeekEisDrift = new SeekBar(this);
-		mSeekEisDrift.setMax(100); mSeekEisDrift.setProgress(30);
-		mSeekEisDrift.setLayoutParams(new LinearLayout.LayoutParams(dp(130), ViewGroup.LayoutParams.WRAP_CONTENT));
-		mSeekEisDrift.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mEisDriftSpeed = p / 1000f; mTvEisDrift.setText(String.format("%.3f", mEisDriftSpeed));
-			}
-			public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
-		});
-		LinearLayout eisDriftRow = new LinearLayout(this);
-		eisDriftRow.setOrientation(LinearLayout.HORIZONTAL); eisDriftRow.setGravity(Gravity.CENTER_VERTICAL);
-		eisDriftRow.addView(smallLabel("Drift:")); eisDriftRow.addView(mSeekEisDrift); eisDriftRow.addView(mTvEisDrift);
-		mEisSettingsRow.addView(eisDriftRow);
-
-		// Зум EIS
-		mTvEisZoom = smallLabel("1.5×");
-		mSeekEisZoom = new SeekBar(this);
-		mSeekEisZoom.setMax(30); mSeekEisZoom.setProgress(5); // 1.0..4.0 (шаг 0.1)
-		mSeekEisZoom.setLayoutParams(new LinearLayout.LayoutParams(dp(130), ViewGroup.LayoutParams.WRAP_CONTENT));
-		mSeekEisZoom.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mEisZoomFactor = 1.0f + p * 0.1f; mTvEisZoom.setText(String.format("%.1f×", mEisZoomFactor));
-			}
-			public void onStartTrackingTouch(SeekBar s) {} public void onStopTrackingTouch(SeekBar s) {}
-		});
-		LinearLayout eisZoomRow = new LinearLayout(this);
-		eisZoomRow.setOrientation(LinearLayout.HORIZONTAL); eisZoomRow.setGravity(Gravity.CENTER_VERTICAL);
-		eisZoomRow.addView(smallLabel("Zoom:")); eisZoomRow.addView(mSeekEisZoom); eisZoomRow.addView(mTvEisZoom);
-		mEisSettingsRow.addView(eisZoomRow);
-
-		// Кнопка ручного сброса трекера
-		Button btnEisReset = new Button(this);
-		btnEisReset.setText("↺ Сброс трекера");
-		btnEisReset.setTextSize(11); btnEisReset.setTextColor(0xFFFFCC44);
-		btnEisReset.setBackground(null); btnEisReset.setPadding(0, 0, 0, 0);
-		btnEisReset.setOnClickListener(v -> {
-			if (mEisHandler != null) mEisHandler.post(() -> mEisResetReq = true);
-		});
-		mEisSettingsRow.addView(btnEisReset);
-
-		mAudioSrcPanel.addView(mEisSettingsRow);
-
-		// ── EV ──────────────────────────────────────────────────────────────
+		// EV
 		mTvEv = smallLabel("EV  0");
 		mSeekEv = new SeekBar(this);
 		mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin);
-		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
+		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
 			public void onProgressChanged(SeekBar s, int p, boolean u) {
 				mEvComp = mEvMin + p; updateEvLabel(mEvComp);
@@ -631,46 +519,97 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		LinearLayout evRow = new LinearLayout(this);
 		evRow.setOrientation(LinearLayout.HORIZONTAL); evRow.setGravity(Gravity.CENTER_VERTICAL);
 		evRow.addView(mTvEv); evRow.addView(mSeekEv);
-		mAudioSrcPanel.addView(evRow);
+		colLeft.addView(evRow);
 
-		// ── Pre-buffer ───────────────────────────────────────────────────────
+		// Pre-buffer
 		CheckBox cbPB = new CheckBox(this);
-		cbPB.setText("Pre-buffer");
-		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12);
-		cbPB.setChecked(true); // включён по умолчанию
+		cbPB.setText("Pre-buf");
+		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12); cbPB.setChecked(true);
 		cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
-		final TextView tvPBLen = smallLabel("1 s");
+		final TextView tvPBLen = smallLabel("1s");
 		SeekBar sbPB = new SeekBar(this);
 		sbPB.setMax(4); sbPB.setProgress(0);
-		sbPB.setLayoutParams(new LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT));
+		sbPB.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 		sbPB.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mPreBufSecs = p + 1; tvPBLen.setText(mPreBufSecs + " s");
-			}
+			public void onProgressChanged(SeekBar s, int p, boolean u) { mPreBufSecs = p+1; tvPBLen.setText(mPreBufSecs+"s"); }
 			public void onStartTrackingTouch(SeekBar s) {}
 			public void onStopTrackingTouch(SeekBar s) {}
 		});
 		LinearLayout pbRow = new LinearLayout(this);
 		pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL);
 		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
-		mAudioSrcPanel.addView(pbRow);
+		colLeft.addView(pbRow);
 
-		// ── Битрейт видео ────────────────────────────────────────────────────
-		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
+		// ════════════ ПРАВАЯ КОЛОНКА ════════════
+
+		// Осциллограф + Спектр
+		CheckBox mCbOsc = new CheckBox(this);
+		mCbOsc.setText("Osc");
+		mCbOsc.setTextColor(0xCCCCCCCC); mCbOsc.setTextSize(12); mCbOsc.setChecked(false);
+		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
+			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
+			if (mEnvelope     != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
+		});
+		CheckBox mCbSpec = new CheckBox(this);
+		mCbSpec.setText("Spectrum");
+		mCbSpec.setTextColor(0xCCCCCCCC); mCbSpec.setTextSize(12); mCbSpec.setChecked(true);
+		mCbSpec.setOnCheckedChangeListener((cb, checked) -> {
+			if (mSpectrum != null) mSpectrum.setVisibility(checked ? View.VISIBLE : View.GONE);
+		});
+		LinearLayout cbRow2 = new LinearLayout(this);
+		cbRow2.setOrientation(LinearLayout.HORIZONTAL); cbRow2.setGravity(Gravity.CENTER_VERTICAL);
+		cbRow2.addView(mCbOsc); cbRow2.addView(mCbSpec);
+		colRight.addView(cbRow2);
+
+		// Битрейт
+		String[] bpsL={"500k","1M","2M","3M","4M","6M✓","8M","12M"};
 		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
 		Spinner spBps = new Spinner(this);
 		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
 		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-		spBps.setAdapter(bpsAd); spBps.setSelection(5); // 6 Mbps
-		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(190), ViewGroup.LayoutParams.WRAP_CONTENT));
+		spBps.setAdapter(bpsAd); spBps.setSelection(5);
+		spBps.setLayoutParams(new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
 			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsV[pos]; }
 			public void onNothingSelected(AdapterView<?> p) {}
 		});
 		LinearLayout bpsRow = new LinearLayout(this);
 		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
-		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		mAudioSrcPanel.addView(bpsRow);
+		bpsRow.addView(smallLabel("Bps:")); bpsRow.addView(spBps);
+		colRight.addView(bpsRow);
+
+		// ── Super-stab (EIS) — в правой колонке ─────────────────────────────
+		mCbEis = new CheckBox(this);
+		mCbEis.setText("Super-stab");
+		mCbEis.setTextColor(0xFF88DDFF); // выделяем голубым — главная фича
+		mCbEis.setTextSize(13);
+		mCbEis.setChecked(false);
+		mCbEis.setOnCheckedChangeListener((cb, checked) -> {
+			mEisEnabled = checked;
+			if (mCamThread != null && mCamThread.isAlive()) {
+				mCamHandler.post(() -> { if (!checked) stopEis(); startPreview(); });
+			}
+		});
+		colRight.addView(mCbEis);
+
+		// Drift-слайдер под чекбоксом
+		mTvEisDrift = smallLabel("0.030");
+		mSeekEisDrift = new SeekBar(this);
+		mSeekEisDrift.setMax(19); mSeekEisDrift.setProgress(5); // default 0.030
+		mSeekEisDrift.setLayoutParams(new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+		mSeekEisDrift.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+			public void onProgressChanged(SeekBar s, int p, boolean u) {
+				mEisDriftSpeed = 0.005f + p * 0.005f;
+				mTvEisDrift.setText(String.format("%.3f", mEisDriftSpeed));
+				if (mEisGlThread != null) mEisGlThread.setDriftSpeed(mEisDriftSpeed);
+			}
+			public void onStartTrackingTouch(SeekBar s) {}
+			public void onStopTrackingTouch(SeekBar s) {}
+		});
+		LinearLayout driftRow = new LinearLayout(this);
+		driftRow.setOrientation(LinearLayout.HORIZONTAL); driftRow.setGravity(Gravity.CENTER_VERTICAL);
+		driftRow.addView(smallLabel("Drift:")); driftRow.addView(mSeekEisDrift); driftRow.addView(mTvEisDrift);
+		colRight.addView(driftRow);
 
 		panel.addView(mAudioSrcPanel);
 
@@ -714,14 +653,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2; // центр над REC
 		pauseLP.bottomMargin = recBottom + recSize + dp(6);
 		root.addView(mBtnPause, pauseLP);
-
-		// ── EIS overlay — прозрачный вид поверх превью ───────────────────────
-		mEisOverlay = new EisOverlayView(this);
-		FrameLayout.LayoutParams eisOvLP = new FrameLayout.LayoutParams(
-				ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT);
-		eisOvLP.gravity = Gravity.CENTER;
-		mEisOverlay.setVisibility(View.GONE);
-		root.addView(mEisOverlay, eisOvLP);
 
 		return root;
 	}
@@ -930,12 +861,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mCamThread.start();
 			mCamHandler = new Handler(mCamThread.getLooper());
 		}
-		// EIS-поток для анализа кадров
-		if (mEisThread == null || !mEisThread.isAlive()) {
-			mEisThread = new HandlerThread("eis-analysis");
-			mEisThread.start();
-			mEisHandler = new Handler(mEisThread.getLooper());
-		}
 		try {
 			String camId = null;
 			for (String id : mCamMgr.getCameraIdList()) {
@@ -990,39 +915,40 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 	
 	private void startPreview() {
-		if (mCamDev == null || !mSurfaceReady)
-		return;
+		if (mCamDev == null || !mSurfaceReady) return;
 		ensureEncoders();
 		try {
-			if (mCapSess != null) {
-				mCapSess.close();
-				mCapSess = null;
-			}
-			Surface preview = mSv.getHolder().getSurface();
+			if (mCapSess != null) { mCapSess.close(); mCapSess = null; }
 			List<Surface> targets = new ArrayList<>();
-			targets.add(preview);
-			if (mEncSurface != null && mEncSurface.isValid())
-			targets.add(mEncSurface);
+
 			if (mEisEnabled) {
-				setupEisReader();
-				if (mEisReader != null) targets.add(mEisReader.getSurface());
-			}
-			
-			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
-				@Override
-				public void onConfigured(CameraCaptureSession sess) {
-					mCapSess = sess;
-					buildAndSendRequest();
+				// ── EIS-режим ────────────────────────────────────────────────────
+				// Запускаем GL-поток если не запущен
+				if (mEisGlThread == null || !mEisGlThread.isAlive()) {
+					mEisGlThread = new EisGlThread(mEncSurface, mSv.getHolder().getSurface());
+					mEisGlThread.start();
 				}
-				
-				@Override
-				public void onConfigureFailed(CameraCaptureSession sess) {
+				SurfaceTexture st = mEisGlThread.getCameraTexture();
+				if (st != null) { st.setDefaultBufferSize(VIDEO_W, VIDEO_H); targets.add(new Surface(st)); }
+				// ImageReader для template matching
+				startEisReader();
+				if (mEisReader != null) targets.add(mEisReader.getSurface());
+				// Превью рисует GL-поток — НЕ добавляем mSv в сессию
+			} else {
+				// ── Обычный режим ────────────────────────────────────────────────
+				targets.add(mSv.getHolder().getSurface());
+				if (mEncSurface != null && mEncSurface.isValid()) targets.add(mEncSurface);
+			}
+
+			mCamDev.createCaptureSession(targets, new CameraCaptureSession.StateCallback() {
+				@Override public void onConfigured(CameraCaptureSession sess) {
+					mCapSess = sess; buildAndSendRequest();
+				}
+				@Override public void onConfigureFailed(CameraCaptureSession sess) {
 					status("Session config failed");
 				}
 			}, mCamHandler);
-			} catch (Exception e) {
-			status("startPreview: " + e.getMessage());
-		}
+		} catch (Exception e) { status("startPreview: " + e.getMessage()); }
 	}
 	
 	private void buildAndSendRequest() {
@@ -1040,9 +966,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.addTarget(preview);
 			if (mEncSurface != null && mEncSurface.isValid())
 			rb.addTarget(mEncSurface);
-			if (mEisEnabled && mEisReader != null) {
-				try { rb.addTarget(mEisReader.getSurface()); } catch (Exception ignored) {}
-			}
 			
 			if (mManualFocus) {
 				// Ручной фокус: переводим прогресс (0=∞, 1=macro) в диоптрии
@@ -1059,25 +982,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
-				float zoom = mEisEnabled ? mZoomLevel * mEisZoomFactor : mZoomLevel;
-				int cropW = Math.max(1, (int) (mSensorRect.width()  / zoom));
-				int cropH = Math.max(1, (int) (mSensorRect.height() / zoom));
-				int baseCX = mSensorRect.left + mSensorRect.width()  / 2;
-				int baseCY = mSensorRect.top  + mSensorRect.height() / 2;
-				if (mEisEnabled) {
-					// Масштабируем EIS-сдвиг (в пикселях analysis-изображения) в пиксели сенсора
-					float sx = (float) cropW / EIS_W;
-					float sy = (float) cropH / EIS_H;
-					baseCX += (int) (mEisCropDX * sx);
-					baseCY += (int) (mEisCropDY * sy);
-					// Ограничиваем, чтобы не выйти за пределы сенсора
-					baseCX = Math.max(mSensorRect.left + cropW / 2,
-					         Math.min(mSensorRect.right  - cropW / 2, baseCX));
-					baseCY = Math.max(mSensorRect.top  + cropH / 2,
-					         Math.min(mSensorRect.bottom - cropH / 2, baseCY));
-				}
-				int cropX = baseCX - cropW / 2;
-				int cropY = baseCY - cropH / 2;
+				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
+				int cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));
+				int cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;
+				int cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;
 				rb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));
 			}
 			sess.setRepeatingRequest(rb.build(), null, mCamHandler);
@@ -1556,179 +1464,456 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private void status(String s) {
 		runOnUiThread(() -> mTvStatus.setText(s));
 	}
-
-	// =========================================================================
-	// Super EIS — анализ кадров и управление стабилизацией
-	// =========================================================================
-
-	/** Пересоздаёт сессию камеры при переключении EIS (вызывается из UI-потока). */
-	private void restartCameraForEis() {
-		if (mEisReader != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
-		// Пересоздаём превью-сессию с новым набором targets
-		if (mCamHandler != null) mCamHandler.post(this::startPreview);
-	}
-
-	/** Создаёт ImageReader 320×180 YUV_420_888 с листенером на mEisHandler. */
-	private void setupEisReader() {
-		if (mEisReader != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
-		mEisReader = ImageReader.newInstance(EIS_W, EIS_H, ImageFormat.YUV_420_888, 2);
-		// Инициализируем состояние трекера
-		mEisTemplate = null; mEisVirtualX = EIS_IDEAL_X; mEisVirtualY = EIS_IDEAL_Y;
-		mEisLastMX = EIS_IDEAL_X; mEisLastMY = EIS_IDEAL_Y;
-		mEisCropDX = 0; mEisCropDY = 0;
-		mEisReader.setOnImageAvailableListener(reader -> {
-			android.media.Image img = reader.acquireLatestImage();
-			if (img == null) return;
-			try { processEisFrame(img); } finally { img.close(); }
-		}, mEisHandler);
-	}
-
-	/**
-	 * Основной EIS-цикл: извлекает Y-плоскость, делает шаблонный матчинг,
-	 * вычисляет виртуальный центр с low-pass фильтром (drift) и обновляет
-	 * mEisCropDX/DY для buildAndSendRequest().
-	 * Вызывается из mEisHandler — никакой конкуренции с cam-потоком по состоянию.
-	 */
-	private void processEisFrame(android.media.Image image) {
-		if (!mEisEnabled) return;
-
-		// 1. Извлекаем Y-плоскость в линейный массив байт EIS_W×EIS_H
-		android.media.Image.Plane yPlane = image.getPlanes()[0];
-		ByteBuffer yBuf = yPlane.getBuffer();
-		int rowStride   = yPlane.getRowStride();
-		int pixelStride = yPlane.getPixelStride();
-
-		byte[] gray = new byte[EIS_W * EIS_H];
-		if (rowStride == EIS_W && pixelStride == 1) {
-			yBuf.get(gray);
-		} else {
-			for (int row = 0; row < EIS_H; row++) {
-				for (int col = 0; col < EIS_W; col++) {
-					int srcIdx = row * rowStride + col * pixelStride;
-					if (srcIdx < yBuf.limit())
-						gray[row * EIS_W + col] = yBuf.get(srcIdx);
-				}
-			}
-		}
-
-		// 2. Инициализация или ручной сброс шаблона
-		if (mEisTemplate == null || mEisResetReq) {
-			eisReset(gray, false);
-			mEisResetReq = false;
-			return;
-		}
-
-		// 3. Шаблонный матчинг (SAD) в ROI вокруг последней позиции
-		int roiX0 = Math.max(0, (int) mEisLastMX - EIS_SEARCH_R);
-		int roiY0 = Math.max(0, (int) mEisLastMY - EIS_SEARCH_R);
-		int roiX1 = Math.min(EIS_W - EIS_TMPL_W, (int) mEisLastMX + EIS_SEARCH_R);
-		int roiY1 = Math.min(EIS_H - EIS_TMPL_H, (int) mEisLastMY + EIS_SEARCH_R);
-
-		int bestX = (int) mEisLastMX, bestY = (int) mEisLastMY;
-		long bestSAD = Long.MAX_VALUE;
-
-		for (int sy = roiY0; sy <= roiY1; sy++) {
-			for (int sx = roiX0; sx <= roiX1; sx++) {
-				long sad = computeSAD(gray, sx, sy, bestSAD);
-				if (sad < bestSAD) { bestSAD = sad; bestX = sx; bestY = sy; }
-			}
-		}
-
-		float matchX = bestX, matchY = bestY;
-
-		// 4. Валидация: резкий прыжок или выход за край → плавный сброс
-		float jump = (float) Math.hypot(matchX - mEisLastMX, matchY - mEisLastMY);
-		boolean nearEdge = matchX < EIS_EDGE_MARGIN
-				|| matchX + EIS_TMPL_W > EIS_W - EIS_EDGE_MARGIN
-				|| matchY < EIS_EDGE_MARGIN
-				|| matchY + EIS_TMPL_H > EIS_H - EIS_EDGE_MARGIN;
-
-		if (nearEdge || jump > EIS_MAX_SHIFT) {
-			// Сохраняем «призрак» для визуализации и берём новый шаблон
-			eisReset(gray, true);
-			matchX = EIS_IDEAL_X;
-			matchY = EIS_IDEAL_Y;
-		} else {
-			mEisLastMX = matchX;
-			mEisLastMY = matchY;
-		}
-
-		// 5. Low-pass filter (drift): виртуальный центр медленно следует за матчем
-		mEisVirtualX += (matchX - mEisVirtualX) * mEisDriftSpeed;
-		mEisVirtualY += (matchY - mEisVirtualY) * mEisDriftSpeed;
-
-		// 6. Сдвиг кропа = разница «матч» − «виртуальный центр»
-		//    Положительный dx означает: шаблон правее виртуального центра →
-		//    сдвигаем кроп вправо чтобы скомпенсировать
-		mEisCropDX = matchX - mEisVirtualX;
-		mEisCropDY = matchY - mEisVirtualY;
-
-		// 7. Данные для оверлея
-		mEisOvMatchX = matchX;
-		mEisOvMatchY = matchY;
-		if (mEisOverlay != null) mEisOverlay.postInvalidate();
-
-		// 8. Обновляем запрос к камере — применяем сдвиг кропа
-		if (mCamHandler != null) mCamHandler.post(this::buildAndSendRequest);
-	}
-
-	/**
-	 * Сбрасывает шаблон EIS: берёт центральный патч текущего кадра.
-	 * withGhost=true сохраняет координаты «призрака» (жёлтая рамка).
-	 */
-	private void eisReset(byte[] gray, boolean withGhost) {
-		if (withGhost && mEisTemplate != null) {
-			// Запоминаем смещение призрака до сброса
-			mEisOvGhostX  = mEisLastMX;
-			mEisOvGhostY  = mEisLastMY;
-			mEisOvGhostOX = mEisLastMX - EIS_IDEAL_X;
-			mEisOvGhostOY = mEisLastMY - EIS_IDEAL_Y;
-		} else {
-			mEisOvGhostX = Float.NaN; mEisOvGhostY = Float.NaN;
-		}
-
-		// Новый шаблон — центр текущего кадра
-		mEisTemplate = new byte[EIS_TMPL_W * EIS_TMPL_H];
-		for (int r = 0; r < EIS_TMPL_H; r++) {
-			System.arraycopy(gray, (EIS_IDEAL_Y + r) * EIS_W + EIS_IDEAL_X,
-			                 mEisTemplate, r * EIS_TMPL_W, EIS_TMPL_W);
-		}
-
-		// Сохраняем плавность: виртуальный центр сдвигается так, чтобы
-		// не было скачка в кропе
-		float prevDX = mEisLastMX - mEisVirtualX;
-		float prevDY = mEisLastMY - mEisVirtualY;
-		mEisVirtualX = EIS_IDEAL_X - prevDX;
-		mEisVirtualY = EIS_IDEAL_Y - prevDY;
-		mEisLastMX = EIS_IDEAL_X;
-		mEisLastMY = EIS_IDEAL_Y;
-
-		mEisOvMatchX = EIS_IDEAL_X;
-		mEisOvMatchY = EIS_IDEAL_Y;
-		if (mEisOverlay != null) mEisOverlay.postInvalidate();
-	}
-
-	/**
-	 * SAD (sum of absolute differences) между шаблоном и патчем серого изображения
-	 * начиная с позиции (sx, sy). early-exit когда SAD >= bestSoFar.
-	 */
-	private long computeSAD(byte[] gray, int sx, int sy, long bestSoFar) {
-		long sad = 0;
-		for (int ty = 0; ty < EIS_TMPL_H; ty++) {
-			int gRow = (sy + ty) * EIS_W + sx;
-			int tRow = ty * EIS_TMPL_W;
-			for (int tx = 0; tx < EIS_TMPL_W; tx++) {
-				sad += Math.abs((gray[gRow + tx] & 0xFF) - (mEisTemplate[tRow + tx] & 0xFF));
-			}
-			if (sad >= bestSoFar) return sad; // early exit
-		}
-		return sad;
-	}
 	
 	// =========================================================================
 	// Аудио-источники
 	// =========================================================================
 	
+	// =========================================================================
+	// EIS — вспомогательные методы
+	// =========================================================================
+
+	/** Создаёт ImageReader 320×180 YUV для template-matching (luma). */
+	private void startEisReader() {
+		if (mEisReader != null) return;
+		if (mEisLumaThread == null || !mEisLumaThread.isAlive()) {
+			mEisLumaThread = new HandlerThread("eis-luma");
+			mEisLumaThread.start();
+			mEisLumaHandler = new Handler(mEisLumaThread.getLooper());
+		}
+		mEisReader = ImageReader.newInstance(EIS_W, EIS_H, ImageFormat.YUV_420_888, 2);
+		mEisReader.setOnImageAvailableListener(reader -> {
+			android.media.Image img = reader.acquireLatestImage();
+			if (img == null) return;
+			android.media.Image.Plane plane = img.getPlanes()[0];
+			ByteBuffer buf  = plane.getBuffer();
+			int rowStride   = plane.getRowStride();
+			int pixStride   = plane.getPixelStride();
+			byte[] luma     = new byte[EIS_W * EIS_H];
+			if (pixStride == 1) {
+				for (int row = 0; row < EIS_H; row++) {
+					buf.position(row * rowStride); buf.get(luma, row * EIS_W, EIS_W);
+				}
+			} else {
+				for (int row = 0; row < EIS_H; row++) {
+					buf.position(row * rowStride);
+					for (int col = 0; col < EIS_W; col++) luma[row * EIS_W + col] = buf.get(col * pixStride);
+				}
+			}
+			img.close();
+			if (mEisGlThread != null) mEisGlThread.pushLuma(luma);
+		}, mEisLumaHandler);
+	}
+
+	/** Останавливает весь EIS pipeline (ImageReader + GL-поток + luma-поток). */
+	private void stopEis() {
+		if (mEisGlThread != null) { mEisGlThread.quit(); mEisGlThread = null; }
+		if (mEisReader   != null) { try { mEisReader.close(); } catch (Exception ignored) {} mEisReader = null; }
+		if (mEisLumaThread != null) {
+			mEisLumaThread.quitSafely();
+			try { mEisLumaThread.join(300); } catch (Exception ignored) {}
+			mEisLumaThread = null; mEisLumaHandler = null;
+		}
+	}
+
+	// =========================================================================
+	// EisGlThread — точный порт videosuperstab.html (OpenGL ES 2.0)
+	//
+	// Архитектура:
+	//   Camera2 → SurfaceTexture (OES) → GL shift → EGL encoder surface → MediaCodec
+	//                                             → EGL preview surface → SurfaceView
+	//   ImageReader 320×180 YUV → luma-поток → template SAD-matching
+	//
+	// Template matching (зеркало HTML):
+	//   mTemplate  = якорный Y-патч (80×45 пикс в EIS-пространстве)
+	//   mVirtualX/Y = low-pass follower → virtualX/Y в HTML
+	//   mMatchX/Y   = найденная позиция шаблона → matchX/Y в HTML
+	//   dx = matchX − virtualX → uShift uniform → сдвиг OES текстуры
+	//   Красный rect: текущий матч; жёлтый rect: ghost после reset
+	// =========================================================================
+	class EisGlThread extends Thread {
+
+		// ── Параметры template matching ──────────────────────────────────────
+		private static final int   TMPL_W    = 80;
+		private static final int   TMPL_H    = 45;
+		private static final int   SEARCH_R  = 40;
+		private static final int   MAX_SHIFT = 20;
+		private static final int   EDGE_M    = 6;
+		private static final long  SAD_MAX   = (long) TMPL_W * TMPL_H * 90;
+		private final float IDEAL_X = (EIS_W - TMPL_W) / 2f;
+		private final float IDEAL_Y = (EIS_H - TMPL_H) / 2f;
+
+		// ── EGL ──────────────────────────────────────────────────────────────
+		private static final int EGL_RECORDABLE_ANDROID = 0x3142;
+		private EGLDisplay mDisp    = EGL14.EGL_NO_DISPLAY;
+		private EGLContext mCtx     = EGL14.EGL_NO_CONTEXT;
+		private EGLSurface mEncEgl  = EGL14.EGL_NO_SURFACE;
+		private EGLSurface mPrevEgl = EGL14.EGL_NO_SURFACE;
+
+		// ── GL ───────────────────────────────────────────────────────────────
+		private int mOesTex = -1;
+		private SurfaceTexture mCamST;
+		private final float[] mSTMat = new float[16];
+		private int mCamProg, mCamPos, mCamTexAttr, mCamSTUni, mCamShift, mCamSTexUni;
+		private int mRectProg, mRectPos, mRectColor;
+		private FloatBuffer mQuadBuf;   // full-screen quad
+		private FloatBuffer mLineBuf;   // rectangle lines
+
+		// ── Latch: GL готов до чтения getCameraTexture() ─────────────────────
+		private final CountDownLatch mReadyLatch = new CountDownLatch(1);
+		// HandlerThread для SurfaceTexture.setOnFrameAvailableListener —
+		// ОБЯЗАТЕЛЕН: без Handler Android требует Looper на вызывающем потоке;
+		// EisGlThread — обычный Thread без Looper, поэтому колбэк без HandlerThread
+		// никогда не доставляется и GL-поток зависает навечно.
+		private HandlerThread mStListenerThread;
+		private Handler       mStListenerHandler;
+
+		// ── Состояние EIS (точные аналоги переменных из HTML) ────────────────
+		private byte[]  mTemplate  = null;
+		private float   mVirtualX, mVirtualY;
+		private float   mLastMatchX, mLastMatchY;
+		private float   mMatchX, mMatchY;
+		private boolean mHasGhost  = false;
+		private float   mGhostOffX, mGhostOffY;
+		private volatile byte[] mPendingLuma = null;
+		private volatile float  mDriftSpeed  = 0.03f;
+
+		// ── Синхронизация фреймов ─────────────────────────────────────────────
+		private volatile boolean mRunning = true;
+		private final Object mFrameLock = new Object();
+		private volatile boolean mFrameAvail = false;
+
+		// ── Внешние поверхности ──────────────────────────────────────────────
+		private final Surface mEncSurf;
+		private final Surface mPrevSurf;
+
+		EisGlThread(Surface encSurf, Surface prevSurf) {
+			super("eis-gl");
+			mEncSurf  = encSurf;
+			mPrevSurf = prevSurf;
+			mVirtualX = mLastMatchX = mMatchX = (EIS_W - TMPL_W) / 2f;
+			mVirtualY = mLastMatchY = mMatchY = (EIS_H - TMPL_H) / 2f;
+		}
+
+		void setDriftSpeed(float v) { mDriftSpeed = v; }
+		void pushLuma(byte[] luma)  { mPendingLuma = luma; }
+
+		void notifyFrame() {
+			synchronized (mFrameLock) { mFrameAvail = true; mFrameLock.notifyAll(); }
+		}
+
+		SurfaceTexture getCameraTexture() {
+			try { mReadyLatch.await(3, TimeUnit.SECONDS); } catch (InterruptedException e) { /* ok */ }
+			return mCamST;
+		}
+
+		void quit() {
+			mRunning = false;
+			synchronized (mFrameLock) { mFrameLock.notifyAll(); }
+			try { join(600); } catch (InterruptedException e) { /* ok */ }
+		}
+
+		@Override public void run() {
+			try {
+				setupEgl();
+				setupGl();
+				mReadyLatch.countDown(); // SurfaceTexture готова
+
+				while (mRunning) {
+					synchronized (mFrameLock) {
+						while (!mFrameAvail && mRunning) {
+							try { mFrameLock.wait(); } catch (InterruptedException e) { break; }
+						}
+						if (!mRunning) break;
+						mFrameAvail = false;
+					}
+
+					mCamST.updateTexImage();
+					mCamST.getTransformMatrix(mSTMat);
+					long pts = mCamST.getTimestamp(); // nanoseconds
+
+					// Template matching с последней полученной luma
+					byte[] luma = mPendingLuma;
+					if (luma != null) { mPendingLuma = null; processEis(luma); }
+
+					// Сдвиг в нормализованных tex-коорд: dx/EIS_W, dy/EIS_H
+					// HTML: dx = matchX − virtualX (сдвиг в пикселях кадра)
+					// GL: shiftU = dx/EIS_W, shiftV = -dy/EIS_H (Y инвертирован)
+					float shiftU =  (mMatchX - mVirtualX) / EIS_W;
+					float shiftV = -(mMatchY - mVirtualY) / EIS_H;
+
+					// Рендер → Encoder
+					EGL14.eglMakeCurrent(mDisp, mEncEgl, mEncEgl, mCtx);
+					try { EGLExt.eglPresentationTimeANDROID(mDisp, mEncEgl, pts); }
+					catch (Exception ignored) { /* расширение может отсутствовать */ }
+					renderFrame(shiftU, shiftV);
+					EGL14.eglSwapBuffers(mDisp, mEncEgl);
+
+					// Рендер → Preview
+					EGL14.eglMakeCurrent(mDisp, mPrevEgl, mPrevEgl, mCtx);
+					renderFrame(shiftU, shiftV);
+					EGL14.eglSwapBuffers(mDisp, mPrevEgl);
+				}
+			} catch (Exception e) { status("EIS: " + e.getMessage()); }
+			finally { releaseGl(); }
+		}
+
+		// ── EIS: точная копия алгоритма videosuperstab.html ─────────────────
+
+		private void processEis(byte[] luma) {
+			if (mTemplate == null) { initTemplate(luma); return; }
+
+			// ROI вокруг lastMatchX/Y (аналог searchRoi в HTML)
+			int roiX = Math.max(0, (int)(mLastMatchX - SEARCH_R));
+			int roiY = Math.max(0, (int)(mLastMatchY - SEARCH_R));
+			int roiW = Math.min(EIS_W - roiX, TMPL_W + SEARCH_R * 2);
+			int roiH = Math.min(EIS_H - roiY, TMPL_H + SEARCH_R * 2);
+
+			// SAD-поиск шаблона в ROI текущего кадра
+			long bestSad = Long.MAX_VALUE; int bestDx = 0, bestDy = 0;
+			for (int ry = 0; ry + TMPL_H <= roiH; ry++) {
+				for (int rx = 0; rx + TMPL_W <= roiW; rx++) {
+					long sad = 0;
+					for (int row = 0; row < TMPL_H; row++) {
+						int li = (roiY + ry + row) * EIS_W + (roiX + rx);
+						int ti = row * TMPL_W;
+						for (int col = 0; col < TMPL_W; col++)
+							sad += Math.abs((luma[li+col] & 0xFF) - (mTemplate[ti+col] & 0xFF));
+					}
+					if (sad < bestSad) { bestSad = sad; bestDx = rx; bestDy = ry; }
+				}
+			}
+
+			float matchX = roiX + bestDx;
+			float matchY = roiY + bestDy;
+
+			// Условия reset (аналог HTML):
+			//   bestSad > SAD_MAX  ≡ minMax.maxVal < 0.4
+			//   nearEdge           ≡ isNearEdge
+			//   jump > MAX_SHIFT   ≡ jumpDist > MAX_SHIFT
+			float jump = (float) Math.hypot(matchX - mLastMatchX, matchY - mLastMatchY);
+			boolean nearEdge =
+				matchX < EDGE_M || matchX + TMPL_W > EIS_W - EDGE_M ||
+				matchY < EDGE_M || matchY + TMPL_H > EIS_H - EDGE_M;
+
+			if (bestSad > SAD_MAX || nearEdge || jump > MAX_SHIFT) {
+				triggerSmoothReset(luma);
+				matchX = IDEAL_X; matchY = IDEAL_Y;
+			} else {
+				mLastMatchX = matchX; mLastMatchY = matchY;
+			}
+
+			mMatchX = matchX; mMatchY = matchY;
+
+			// virtualX += (matchX − virtualX) * driftSpeed
+			float ds = mDriftSpeed;
+			mVirtualX += (matchX - mVirtualX) * ds;
+			mVirtualY += (matchY - mVirtualY) * ds;
+		}
+
+		/** Аналог triggerSmoothReset() из HTML. */
+		private void triggerSmoothReset(byte[] luma) {
+			// Ghost offset = где был старый шаблон (для жёлтого rect)
+			mGhostOffX = mLastMatchX - IDEAL_X;
+			mGhostOffY = mLastMatchY - IDEAL_Y;
+			mHasGhost  = true;
+			// Сохраняем текущее остаточное смещение
+			float cDx = mLastMatchX - mVirtualX;
+			float cDy = mLastMatchY - mVirtualY;
+			// Новый шаблон из центра текущего кадра
+			mTemplate   = extractBlock(luma, (int)IDEAL_X, (int)IDEAL_Y);
+			// Корректируем virtualX чтобы не было прыжка на выходе
+			mVirtualX   = IDEAL_X - cDx;
+			mVirtualY   = IDEAL_Y - cDy;
+			mLastMatchX = IDEAL_X; mLastMatchY = IDEAL_Y;
+		}
+
+		private void initTemplate(byte[] luma) {
+			mTemplate   = extractBlock(luma, (int)IDEAL_X, (int)IDEAL_Y);
+			mLastMatchX = IDEAL_X; mLastMatchY = IDEAL_Y;
+			mMatchX     = IDEAL_X; mMatchY     = IDEAL_Y;
+			mVirtualX   = IDEAL_X; mVirtualY   = IDEAL_Y;
+			mHasGhost   = false;
+		}
+
+		private byte[] extractBlock(byte[] src, int x, int y) {
+			byte[] blk = new byte[TMPL_W * TMPL_H];
+			for (int row = 0; row < TMPL_H; row++)
+				System.arraycopy(src, (y + row) * EIS_W + x, blk, row * TMPL_W, TMPL_W);
+			return blk;
+		}
+
+		// ── GL rendering ─────────────────────────────────────────────────────
+
+		private void renderFrame(float shiftU, float shiftV) {
+			GLES20.glClearColor(0f, 0f, 0f, 1f);
+			GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT);
+			GLES20.glViewport(0, 0, VIDEO_W, VIDEO_H);
+
+			// ── Стабилизированный кадр камеры ────────────────────────────────
+			GLES20.glUseProgram(mCamProg);
+			GLES20.glActiveTexture(GLES20.GL_TEXTURE0);
+			GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, mOesTex);
+			GLES20.glUniform1i(mCamSTexUni, 0);
+			GLES20.glUniformMatrix4fv(mCamSTUni, 1, false, mSTMat, 0);
+			GLES20.glUniform2f(mCamShift, shiftU, shiftV);
+
+			mQuadBuf.position(0);
+			GLES20.glEnableVertexAttribArray(mCamPos);
+			GLES20.glVertexAttribPointer(mCamPos, 2, GLES20.GL_FLOAT, false, 16, mQuadBuf);
+			mQuadBuf.position(2);
+			GLES20.glEnableVertexAttribArray(mCamTexAttr);
+			GLES20.glVertexAttribPointer(mCamTexAttr, 2, GLES20.GL_FLOAT, false, 16, mQuadBuf);
+			GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP, 0, 4);
+
+			// ── Debug-рамки ───────────────────────────────────────────────────
+			GLES20.glLineWidth(3f);
+			// Красная рамка = текущий матч (как красный rect в HTML)
+			drawEisRect(mMatchX, mMatchY, TMPL_W, TMPL_H, 1f, 0.1f, 0.1f);
+			// Жёлтая рамка = ghost после triggerSmoothReset
+			if (mHasGhost) drawEisRect(mMatchX + mGhostOffX, mMatchY + mGhostOffY,
+			                            TMPL_W, TMPL_H, 1f, 1f, 0f);
+		}
+
+		/** Рисует прямоугольник: EIS-коорд → NDC с учётом инверсии Y. */
+		private void drawEisRect(float ex, float ey, int w, int h, float r, float g, float b) {
+			float x0 =  ex       / EIS_W * 2f - 1f,  x1 = (ex+w) / EIS_W * 2f - 1f;
+			float y0 = 1f - ey   / EIS_H * 2f,        y1 = 1f - (ey+h) / EIS_H * 2f;
+			float[] lines = { x0,y0, x1,y0, x1,y0, x1,y1, x1,y1, x0,y1, x0,y1, x0,y0 };
+			mLineBuf.clear(); mLineBuf.put(lines); mLineBuf.position(0);
+			GLES20.glUseProgram(mRectProg);
+			GLES20.glEnableVertexAttribArray(mRectPos);
+			GLES20.glVertexAttribPointer(mRectPos, 2, GLES20.GL_FLOAT, false, 8, mLineBuf);
+			GLES20.glUniform4f(mRectColor, r, g, b, 1f);
+			GLES20.glDrawArrays(GLES20.GL_LINES, 0, 8);
+		}
+
+		// ── EGL setup / teardown ─────────────────────────────────────────────
+
+		private void setupEgl() {
+			mDisp = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+			int[] ver = new int[2];
+			EGL14.eglInitialize(mDisp, ver, 0, ver, 1);
+			int[] cfgA = {
+				EGL14.EGL_RED_SIZE, 8, EGL14.EGL_GREEN_SIZE, 8,
+				EGL14.EGL_BLUE_SIZE, 8, EGL14.EGL_ALPHA_SIZE, 8,
+				EGL14.EGL_RENDERABLE_TYPE, EGL14.EGL_OPENGL_ES2_BIT,
+				EGL_RECORDABLE_ANDROID, 1, EGL14.EGL_NONE
+			};
+			EGLConfig[] cfgs = new EGLConfig[1]; int[] n = new int[1];
+			EGL14.eglChooseConfig(mDisp, cfgA, 0, cfgs, 0, 1, n, 0);
+			int[] ctxA = { EGL14.EGL_CONTEXT_CLIENT_VERSION, 2, EGL14.EGL_NONE };
+			mCtx     = EGL14.eglCreateContext(mDisp, cfgs[0], EGL14.EGL_NO_CONTEXT, ctxA, 0);
+			int[] sfA = { EGL14.EGL_NONE };
+			mEncEgl  = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], mEncSurf,  sfA, 0);
+			mPrevEgl = EGL14.eglCreateWindowSurface(mDisp, cfgs[0], mPrevSurf, sfA, 0);
+			EGL14.eglMakeCurrent(mDisp, mEncEgl, mEncEgl, mCtx);
+		}
+
+		private void setupGl() {
+			// OES-текстура для кадров камеры
+			int[] t = new int[1]; GLES20.glGenTextures(1, t, 0); mOesTex = t[0];
+			GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, mOesTex);
+			GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR);
+			GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR);
+			mCamST = new SurfaceTexture(mOesTex);
+			// Создаём отдельный HandlerThread — единственный надёжный способ
+			// доставки колбэков SurfaceTexture.OnFrameAvailableListener
+			// когда вызывающий поток не имеет Looper (как наш EisGlThread).
+			mStListenerThread = new HandlerThread("eis-st-listener");
+			mStListenerThread.start();
+			mStListenerHandler = new Handler(mStListenerThread.getLooper());
+			mCamST.setOnFrameAvailableListener(st -> notifyFrame(), mStListenerHandler);
+
+			// Camera program
+			mCamProg    = buildProg(VERT_CAM, FRAG_CAM);
+			mCamPos     = GLES20.glGetAttribLocation (mCamProg, "aPosition");
+			mCamTexAttr = GLES20.glGetAttribLocation (mCamProg, "aTexCoord");
+			mCamSTUni   = GLES20.glGetUniformLocation(mCamProg, "uSTMatrix");
+			mCamShift   = GLES20.glGetUniformLocation(mCamProg, "uShift");
+			mCamSTexUni = GLES20.glGetUniformLocation(mCamProg, "sTexture");
+
+			// Rect program
+			mRectProg   = buildProg(VERT_RECT, FRAG_RECT);
+			mRectPos    = GLES20.glGetAttribLocation (mRectProg, "aPosition");
+			mRectColor  = GLES20.glGetUniformLocation(mRectProg, "uColor");
+
+			// Quad: x,y,u,v (TRIANGLE_STRIP full screen)
+			float[] quad = { -1f,-1f,0f,0f,  1f,-1f,1f,0f,  -1f,1f,0f,1f,  1f,1f,1f,1f };
+			mQuadBuf = ByteBuffer.allocateDirect(quad.length*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+			mQuadBuf.put(quad);
+
+			// Line buffer: 4 lines × 2 pts × 2 floats = 16 floats; ×2 запас
+			mLineBuf = ByteBuffer.allocateDirect(32*4).order(ByteOrder.nativeOrder()).asFloatBuffer();
+		}
+
+		private void releaseGl() {
+			if (mStListenerThread != null) {
+				mStListenerThread.quitSafely();
+				try { mStListenerThread.join(300); } catch (InterruptedException ignored) {}
+				mStListenerThread = null; mStListenerHandler = null;
+			}
+			if (mCamST != null) { mCamST.release(); mCamST = null; }
+			if (mDisp != EGL14.EGL_NO_DISPLAY) {
+				EGL14.eglMakeCurrent(mDisp, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_SURFACE, EGL14.EGL_NO_CONTEXT);
+				if (mEncEgl  != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(mDisp, mEncEgl);
+				if (mPrevEgl != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(mDisp, mPrevEgl);
+				EGL14.eglDestroyContext(mDisp, mCtx);
+				EGL14.eglTerminate(mDisp);
+			}
+		}
+
+		private int buildProg(String v, String f) {
+			int vs = GLES20.glCreateShader(GLES20.GL_VERTEX_SHADER);
+			GLES20.glShaderSource(vs, v); GLES20.glCompileShader(vs);
+			int fs = GLES20.glCreateShader(GLES20.GL_FRAGMENT_SHADER);
+			GLES20.glShaderSource(fs, f); GLES20.glCompileShader(fs);
+			int p = GLES20.glCreateProgram();
+			GLES20.glAttachShader(p, vs); GLES20.glAttachShader(p, fs);
+			GLES20.glLinkProgram(p); return p;
+		}
+
+		// ── GLSL шейдеры ─────────────────────────────────────────────────────
+		// Камера: сдвигаем tex-координаты на uShift; vRaw — до STMatrix, для
+		// проверки границ: OOB → чёрный пиксель (как в HTML: warpAffine + black border)
+		private static final String VERT_CAM =
+			"attribute vec4 aPosition;\n" +
+			"attribute vec2 aTexCoord;\n" +
+			"uniform mat4 uSTMatrix;\n" +
+			"uniform vec2 uShift;\n" +
+			"varying vec2 vTex;\n" +
+			"varying vec2 vRaw;\n" +
+			"void main() {\n" +
+			"  gl_Position = aPosition;\n" +
+			"  vRaw = aTexCoord - uShift;\n" +
+			"  vTex = (uSTMatrix * vec4(vRaw, 0.0, 1.0)).xy;\n" +
+			"}\n";
+
+		private static final String FRAG_CAM =
+			"#extension GL_OES_EGL_image_external : require\n" +
+			"precision mediump float;\n" +
+			"uniform samplerExternalOES sTexture;\n" +
+			"varying vec2 vTex;\n" +
+			"varying vec2 vRaw;\n" +
+			"void main() {\n" +
+			"  if (vRaw.x<0.0||vRaw.x>1.0||vRaw.y<0.0||vRaw.y>1.0) {\n" +
+			"    gl_FragColor = vec4(0.0,0.0,0.0,1.0);\n" +
+			"  } else {\n" +
+			"    gl_FragColor = texture2D(sTexture, vTex);\n" +
+			"  }\n" +
+			"}\n";
+
+		private static final String VERT_RECT =
+			"attribute vec4 aPosition;\n" +
+			"void main() { gl_Position = aPosition; }\n";
+
+		private static final String FRAG_RECT =
+			"precision mediump float;\n" +
+			"uniform vec4 uColor;\n" +
+			"void main() { gl_FragColor = uColor; }\n";
+
+	} // end EisGlThread
+
 	private void buildAudioSources() {
 		List<AudioSrcItem> list = new ArrayList<>();
 		if (Build.VERSION.SDK_INT >= 23) {
@@ -1805,78 +1990,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// =========================================================================
 	// Вспомогательные классы
 	// =========================================================================
-
-	// ─── EIS Overlay: синяя рамка трекинга + жёлтый призрак ─────────────────
-	// Рисуется поверх превью, масштабируя координаты analysis-изображения
-	// (EIS_W×EIS_H) в размеры SurfaceView (с учётом letterbox-центрирования).
-
-	class EisOverlayView extends View {
-		private final Paint mBluePaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
-		private final Paint mYellowPaint = new Paint(Paint.ANTI_ALIAS_FLAG);
-		private final Paint mCrossPaint  = new Paint(Paint.ANTI_ALIAS_FLAG);
-		private final Paint mTextPaint   = new Paint(Paint.ANTI_ALIAS_FLAG);
-
-		EisOverlayView(Context c) {
-			super(c);
-			float d = c.getResources().getDisplayMetrics().density;
-			mBluePaint.setStyle(Paint.Style.STROKE);
-			mBluePaint.setStrokeWidth(3f * d);
-			mBluePaint.setColor(0xFF2266FF);
-			mYellowPaint.setStyle(Paint.Style.STROKE);
-			mYellowPaint.setStrokeWidth(2f * d);
-			mYellowPaint.setColor(0xFFFFFF00);
-			mCrossPaint.setColor(0x552266FF);
-			mCrossPaint.setStyle(Paint.Style.STROKE);
-			mCrossPaint.setStrokeWidth(1.5f * d);
-			mTextPaint.setColor(0xCC2266FF);
-			mTextPaint.setTextSize(9f * d);
-			mTextPaint.setAntiAlias(true);
-		}
-
-		@Override
-		protected void onDraw(Canvas canvas) {
-			if (!mEisEnabled || mSv == null) return;
-
-			int svW = mSv.getWidth();
-			int svH = mSv.getHeight();
-			if (svW == 0 || svH == 0) return;
-
-			// SurfaceView центрирован в FrameLayout; вычисляем смещение
-			float offX = (getWidth()  - svW) / 2f;
-			float offY = (getHeight() - svH) / 2f;
-
-			float scX = (float) svW / EIS_W;
-			float scY = (float) svH / EIS_H;
-			float tmplW = EIS_TMPL_W * scX;
-			float tmplH = EIS_TMPL_H * scY;
-
-			// ── Синяя рамка: текущая позиция шаблона ──────────────────────────
-			float mx = offX + mEisOvMatchX * scX;
-			float my = offY + mEisOvMatchY * scY;
-			canvas.drawRect(mx, my, mx + tmplW, my + tmplH, mBluePaint);
-
-			// ── Жёлтая рамка: «призрак» (позиция до последнего smooth-reset) ──
-			float gx = mEisOvGhostX, gy = mEisOvGhostY;
-			if (!Float.isNaN(gx) && !Float.isNaN(gy)) {
-				float gmx = offX + gx * scX;
-				float gmy = offY + gy * scY;
-				canvas.drawRect(gmx, gmy, gmx + tmplW, gmy + tmplH, mYellowPaint);
-			}
-
-			// ── Прицел в идеальной центральной позиции ─────────────────────────
-			float cx = offX + (EIS_IDEAL_X + EIS_TMPL_W / 2f) * scX;
-			float cy = offY + (EIS_IDEAL_Y + EIS_TMPL_H / 2f) * scY;
-			float arm = svW * 0.03f;
-			canvas.drawLine(cx - arm, cy, cx + arm, cy, mCrossPaint);
-			canvas.drawLine(cx, cy - arm, cx, cy + arm, mCrossPaint);
-
-			// ── Числовой дрейф ────────────────────────────────────────────────
-			float ddx = Math.abs(mEisCropDX), ddy = Math.abs(mEisCropDY);
-			canvas.drawText(String.format("EIS Δ%.1f,%.1f", ddx, ddy),
-			                offX + 8, offY + mTextPaint.getTextSize() + 4, mTextPaint);
-		}
-	}
-
+	
 	private static class AudioSrcItem {
 		final String name;
 		final int audioSource;
