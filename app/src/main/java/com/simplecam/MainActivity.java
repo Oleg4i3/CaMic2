@@ -207,7 +207,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
                 .addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON | WindowManager.LayoutParams.FLAG_FULLSCREEN);
         mFocusAssistHandler = new Handler(Looper.getMainLooper());
         // Инициализируем OpenCV (для EIS)
-        org.opencv.android.OpenCVLoader.initLocal();
+      //  org.opencv.android.OpenCVLoader.initLocal();
         setContentView(buildLayout());
         mCamMgr = (CameraManager) getSystemService(CAMERA_SERVICE);
         showAirplaneModeReminder();
