@@ -42,7 +42,9 @@ import java.util.concurrent.TimeUnit;
  * Снизу — панель управления с круглой кнопкой REC.
  */
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
-
+  static {
+        System.loadLibrary("opencv_java4");
+    }
     // ─── Константы ────────────────────────────────────────────────────────────
     private static final int VIDEO_W = 1280;
     private static final int VIDEO_H = 720;
