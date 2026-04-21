@@ -20,7 +20,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── 1. Добавляем OpenCV в build.gradle ───────────────────────────
+      # ── 1. Добавляем OpenCV в build.gradle ──────────────────────────────────
       - name: Patch app/build.gradle — add OpenCV dependency
         run: |
           python3 - << 'PYEOF'
@@ -33,11 +33,9 @@ jobs:
           if 'quickbirdstudios' in txt:
               print("OpenCV already present, skipping"); sys.exit(0)
 
-          # Заменяем пустой dependencies {} на блок с OpenCV
           txt = txt.replace(
               'dependencies {}',
               'dependencies {\n'
-              '    // Принудительно выравниваем версии Kotlin\n'
               '    constraints {\n'
               '        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk7:1.8.22")\n'
               '        implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.8.22")\n'
@@ -45,16 +43,11 @@ jobs:
               '    implementation \'com.quickbirdstudios:opencv:4.5.3.0\'\n'
               '}'
           )
-
-          # Если блок уже непустой — просто дописываем строку перед закрывающей }
           if 'quickbirdstudios' not in txt:
-              txt = re.sub(
-                  r'(dependencies\s*\{)',
+              txt = re.sub(r'(dependencies\s*\{)',
                   r"\1\n    implementation 'com.quickbirdstudios:opencv:4.5.3.0'",
-                  txt, count=1
-              )
+                  txt, count=1)
 
-          # minSdk не ниже 24 (требование OpenCV)
           txt = re.sub(r'minSdk\s+2[0-3]\b', 'minSdk 24', txt)
 
           with open(path, 'w') as f:
@@ -62,31 +55,27 @@ jobs:
           print("build.gradle patched OK")
           PYEOF
 
-      # ── 2. Правим gradle.properties ─────────────────────────────────────────
+      # ── 2. gradle.properties — включаем AndroidX ────────────────────────────
       - name: Patch gradle.properties
         run: |
-          # Включаем AndroidX (нужен для quickbirdstudios:opencv)
           sed -i 's/android\.useAndroidX=false/android.useAndroidX=true/' gradle.properties || true
-          grep -q 'android.useAndroidX'  gradle.properties || echo 'android.useAndroidX=true'  >> gradle.properties
+          grep -q 'android.useAndroidX'    gradle.properties || echo 'android.useAndroidX=true'    >> gradle.properties
           grep -q 'android.enableJetifier' gradle.properties || echo 'android.enableJetifier=true' >> gradle.properties
 
-      # ── 3. Патчим MainActivity.java — добавляем EIS ─────────────────────────
+      # ── 3. Патчим MainActivity.java ─────────────────────────────────────────
       - name: Patch MainActivity.java — inject EIS OpenCV Stabilizer
         run: |
           python3 - << 'PYEOF'
           import sys, os
 
-          # Ищем файл в стандартном месте CaMic
           candidates = [
               'app/src/main/java/com/simplecam/MainActivity.java',
               'app/src/main/java/com/example/simplecam/MainActivity.java',
           ]
           src_path = None
           for c in candidates:
-              if os.path.exists(c):
-                  src_path = c
-                  break
-          if src_path is None:
+              if os.path.exists(c): src_path = c; break
+          if not src_path:
               print("ERROR: MainActivity.java not found"); sys.exit(1)
 
           with open(src_path, encoding='utf-8') as f:
@@ -95,14 +84,21 @@ jobs:
           if '// EIS_PATCHED' in src:
               print("Already patched, skipping"); sys.exit(0)
 
-          # ── Патч 1: добавляем поле mCbEis в декларацию CheckBox-ов ──────────
-          src = src.replace(
-              'private CheckBox mCbSoftClip, mCbManualFocus, mCbFocusAssist;',
-              'private CheckBox mCbSoftClip, mCbManualFocus, mCbFocusAssist, mCbEis; // EIS_PATCHED'
-          )
+          ok = []
+          def patch(name, old, new, s):
+              if old in s:
+                  ok.append(name); return s.replace(old, new)
+              print(f"WARNING: anchor not found for {name}"); return s
 
-          # ── Патч 2: блок полей EIS перед секцией «Zoom-цикл» ────────────────
-          EIS_FIELDS = (
+          # P1 — поле mCbEis
+          src = patch('P1',
+              'private CheckBox mCbSoftClip, mCbManualFocus, mCbFocusAssist;',
+              'private CheckBox mCbSoftClip, mCbManualFocus, mCbFocusAssist, mCbEis; // EIS_PATCHED',
+              src)
+
+          # P2 — блок полей EIS перед «Zoom-цикл»
+          src = patch('P2',
+              '\t// ─── Zoom-цикл',
               '\t// ─── EIS (OpenCV цифровой стабилизатор) ─────────────────────────────────\n'
               '\tprivate static final int EIS_W = 640, EIS_H = 360;\n'
               '\tprivate static final int EIS_TMPL_W = 160, EIS_TMPL_H = 90;\n'
@@ -111,87 +107,68 @@ jobs:
               '\tprivate static final int EIS_SEARCH_R = 60;\n'
               '\tprivate static final int EIS_MAX_JUMP = 40;\n'
               '\tprivate static final int EIS_EDGE_MARGIN = 20;\n'
-              '\t\n'
-              '\tprivate volatile boolean mEisEnabled = false;\n'
+              '\tprivate volatile boolean mEisEnabled    = false;\n'
+              '\tprivate volatile float   mEisDriftSpeed = 0.03f;\n'
               '\tprivate android.media.ImageReader mEisReader = null;\n'
               '\tprivate volatile double mEisShiftX = 0, mEisShiftY = 0;\n'
               '\tprivate org.opencv.core.Mat mEisTemplate = null;\n'
-              '\tprivate int  mEisLastMatchX = EIS_IDEAL_X, mEisLastMatchY = EIS_IDEAL_Y;\n'
-              '\tprivate double mEisVirtualX  = EIS_IDEAL_X, mEisVirtualY  = EIS_IDEAL_Y;\n'
+              '\tprivate int    mEisLastMatchX = EIS_IDEAL_X, mEisLastMatchY = EIS_IDEAL_Y;\n'
+              '\tprivate double mEisVirtualX   = EIS_IDEAL_X, mEisVirtualY   = EIS_IDEAL_Y;\n'
               '\t\n'
-          )
-          src = src.replace(
               '\t// ─── Zoom-цикл',
-              EIS_FIELDS + '\t// ─── Zoom-цикл'
-          )
+              src)
 
-          # ── Патч 3: инициализация OpenCV в onCreate ──────────────────────────
-          src = src.replace(
+          # P3 — OpenCV init в onCreate
+          src = patch('P3',
               '\t\tshowAirplaneModeReminder();\n\t\tcheckPerms();',
               '\t\tshowAirplaneModeReminder();\n'
               '\t\torg.opencv.android.OpenCVLoader.initDebug();\n'
-              '\t\tcheckPerms();'
-          )
+              '\t\tcheckPerms();',
+              src)
 
-          # ── Патч 4: добавляем EIS ImageReader в список targets (startPreview) ─
-          OLD_TARGETS = (
+          # P4 — EIS ImageReader в список targets сессии Camera2
+          src = patch('P4',
               '\t\t\ttargets.add(preview);\n'
               '\t\t\tif (mEncSurface != null && mEncSurface.isValid())\n'
               '\t\t\ttargets.add(mEncSurface);\n'
               '\t\t\t\n'
-              '\t\t\tmCamDev.createCaptureSession'
-          )
-          NEW_TARGETS = (
+              '\t\t\tmCamDev.createCaptureSession',
               '\t\t\ttargets.add(preview);\n'
               '\t\t\tif (mEncSurface != null && mEncSurface.isValid())\n'
               '\t\t\ttargets.add(mEncSurface);\n'
-              '\t\t\t// EIS: добавляем ImageReader как ещё один получатель кадров\n'
               '\t\t\tif (mEisEnabled) { setupEisReader(); if (mEisReader != null) targets.add(mEisReader.getSurface()); }\n'
               '\t\t\t\n'
-              '\t\t\tmCamDev.createCaptureSession'
-          )
-          if OLD_TARGETS in src:
-              src = src.replace(OLD_TARGETS, NEW_TARGETS)
-          else:
-              print("WARNING: startPreview targets block not found — check indentation")
+              '\t\t\tmCamDev.createCaptureSession',
+              src)
 
-          # ── Патч 5: добавляем EIS поверхность как target в CaptureRequest ───
-          OLD_RB_ENC = (
+          # P5 — EIS surface как addTarget в CaptureRequest
+          src = patch('P5',
               '\t\t\tif (mEncSurface != null && mEncSurface.isValid())\n'
               '\t\t\trb.addTarget(mEncSurface);\n'
               '\t\t\t\n'
-              '\t\t\tif (mManualFocus)'
-          )
-          NEW_RB_ENC = (
+              '\t\t\tif (mManualFocus)',
               '\t\t\tif (mEncSurface != null && mEncSurface.isValid())\n'
               '\t\t\trb.addTarget(mEncSurface);\n'
               '\t\t\tif (mEisEnabled && mEisReader != null)\n'
               '\t\t\trb.addTarget(mEisReader.getSurface());\n'
               '\t\t\t\n'
-              '\t\t\tif (mManualFocus)'
-          )
-          if OLD_RB_ENC in src:
-              src = src.replace(OLD_RB_ENC, NEW_RB_ENC)
-          else:
-              print("WARNING: buildAndSendRequest encoder target block not found")
+              '\t\t\tif (mManualFocus)',
+              src)
 
-          # ── Патч 6: применяем EIS-сдвиг к SCALER_CROP_REGION ───────────────
-          OLD_CROP = (
+          # P6 — EIS-сдвиг в SCALER_CROP_REGION
+          src = patch('P6',
               '\t\t\tif (mSensorRect != null) {\n'
               '\t\t\t\tint cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));\n'
               '\t\t\t\tint cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));\n'
               '\t\t\t\tint cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;\n'
               '\t\t\t\tint cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;\n'
               '\t\t\t\trb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));\n'
-              '\t\t\t}'
-          )
-          NEW_CROP = (
+              '\t\t\t}',
               '\t\t\tif (mSensorRect != null) {\n'
               '\t\t\t\tint cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));\n'
               '\t\t\t\tint cropH = Math.max(1, (int) (mSensorRect.height() / mZoomLevel));\n'
               '\t\t\t\tint cropX = mSensorRect.left + (mSensorRect.width() - cropW) / 2;\n'
               '\t\t\t\tint cropY = mSensorRect.top + (mSensorRect.height() - cropH) / 2;\n'
-              '\t\t\t\t// EIS: смещаем кроп-регион на вычисленный стабилизатором сдвиг\n'
               '\t\t\t\tif (mEisEnabled && mEisReader != null) {\n'
               '\t\t\t\t\tdouble sx = (double) cropW / EIS_W;\n'
               '\t\t\t\t\tdouble sy = (double) cropH / EIS_H;\n'
@@ -203,72 +180,75 @@ jobs:
               '\t\t\t\t\t        Math.min(mSensorRect.bottom - cropH, cropY - dy));\n'
               '\t\t\t\t}\n'
               '\t\t\t\trb.set(CaptureRequest.SCALER_CROP_REGION, new Rect(cropX, cropY, cropX + cropW, cropY + cropH));\n'
-              '\t\t\t}'
-          )
-          if OLD_CROP in src:
-              src = src.replace(OLD_CROP, NEW_CROP)
-          else:
-              print("WARNING: SCALER_CROP_REGION block not found — EIS shift won't apply")
+              '\t\t\t}',
+              src)
 
-          # ── Патч 7: чекбокс EIS в настройках (после FocusAssist) ────────────
-          OLD_FA = (
-              '\t\tmCbFocusAssist = new CheckBox(this);\n'
-              '\t\tmCbFocusAssist.setText("Focus assist (zoom while focusing)");\n'
-              '\t\tmCbFocusAssist.setTextColor(0xCCCCCCCC);\n'
-              '\t\tmCbFocusAssist.setTextSize(12);\n'
-              '\t\tmCbFocusAssist.setVisibility(View.GONE);\n'
-              '\t\tmAudioSrcPanel.addView(mCbFocusAssist);'
-          )
-          NEW_FA = (
-              '\t\tmCbFocusAssist = new CheckBox(this);\n'
-              '\t\tmCbFocusAssist.setText("Focus assist (zoom while focusing)");\n'
-              '\t\tmCbFocusAssist.setTextColor(0xCCCCCCCC);\n'
-              '\t\tmCbFocusAssist.setTextSize(12);\n'
-              '\t\tmCbFocusAssist.setVisibility(View.GONE);\n'
-              '\t\tmAudioSrcPanel.addView(mCbFocusAssist);\n'
-              '\t\t// ── EIS toggle ──────────────────────────────────────────────────\n'
+          # P7 — строка [EIS чекбокс | Drift метка | слайдер] ПЕРЕД битрейтом
+          EIS_ROW = (
+              '\t\t// ── EIS + Drift speed ──────────────────────────────────────────────────\n'
+              '\t\tLinearLayout eisRow = new LinearLayout(this);\n'
+              '\t\teisRow.setOrientation(LinearLayout.HORIZONTAL);\n'
+              '\t\teisRow.setGravity(Gravity.CENTER_VERTICAL);\n'
               '\t\tmCbEis = new CheckBox(this);\n'
-              '\t\tmCbEis.setText("EIS (OpenCV стабилизатор)");\n'
+              '\t\tmCbEis.setText("EIS");\n'
               '\t\tmCbEis.setTextColor(0xCCCCCCCC);\n'
               '\t\tmCbEis.setTextSize(12);\n'
               '\t\tmCbEis.setOnCheckedChangeListener((v, checked) -> {\n'
               '\t\t\tmEisEnabled = checked;\n'
               '\t\t\tif (!checked) { mEisShiftX = 0; mEisShiftY = 0; }\n'
-              '\t\t\tstartPreview(); // перезапуск сессии с/без EIS ImageReader\n'
+              '\t\t\tstartPreview();\n'
               '\t\t});\n'
-              '\t\tmAudioSrcPanel.addView(mCbEis);'
+              '\t\tfinal TextView tvDrift = new TextView(this);\n'
+              '\t\ttvDrift.setText(" Drift:0.03 ");\n'
+              '\t\ttvDrift.setTextColor(0xCCCCCCCC);\n'
+              '\t\ttvDrift.setTextSize(11);\n'
+              '\t\tSeekBar sbDrift = new SeekBar(this);\n'
+              '\t\tsbDrift.setMax(19);\n'
+              '\t\tsbDrift.setProgress(2);\n'
+              '\t\tsbDrift.setLayoutParams(new LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT));\n'
+              '\t\tsbDrift.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {\n'
+              '\t\t\tpublic void onProgressChanged(SeekBar s, int p, boolean u) {\n'
+              '\t\t\t\tmEisDriftSpeed = 0.01f + p * 0.01f;\n'
+              '\t\t\t\ttvDrift.setText(String.format(java.util.Locale.US, " D:%.2f ", mEisDriftSpeed));\n'
+              '\t\t\t}\n'
+              '\t\t\tpublic void onStartTrackingTouch(SeekBar s) {}\n'
+              '\t\t\tpublic void onStopTrackingTouch(SeekBar s) {}\n'
+              '\t\t});\n'
+              '\t\teisRow.addView(mCbEis);\n'
+              '\t\teisRow.addView(tvDrift);\n'
+              '\t\teisRow.addView(sbDrift);\n'
+              '\t\tmAudioSrcPanel.addView(eisRow);\n'
+              '\t\t// ── Битрейт ─────────────────────────────────────────────────────────\n'
           )
-          if OLD_FA in src:
-              src = src.replace(OLD_FA, NEW_FA)
-          else:
-              print("WARNING: FocusAssist block not found — EIS checkbox won't appear")
+          src = patch('P7',
+              '\t\tbpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);\n'
+              '\t\tmAudioSrcPanel.addView(bpsRow);',
+              EIS_ROW +
+              '\t\tbpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);\n'
+              '\t\tmAudioSrcPanel.addView(bpsRow);',
+              src)
 
-          # ── Патч 8: освобождаем EIS ресурсы при уничтожении ─────────────────
-          OLD_CLEANUP = (
-              '\t\tif (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}'
-          )
-          NEW_CLEANUP = (
+          # P8 — очистка в onDestroy
+          src = patch('P8',
+              '\t\tif (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}',
               '\t\tif (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}\n'
               '\t\tif (mEisReader!=null){try{mEisReader.close();}catch(Exception e){} mEisReader=null;}\n'
-              '\t\tif (mEisTemplate!=null){mEisTemplate.release(); mEisTemplate=null;}'
-          )
-          src = src.replace(OLD_CLEANUP, NEW_CLEANUP)
+              '\t\tif (mEisTemplate!=null){mEisTemplate.release(); mEisTemplate=null;}',
+              src)
 
-          # ── Патч 9: два новых метода перед последней закрывающей скобкой ────
+          # P9 — два новых метода перед последней } класса
           EIS_METHODS = (
               '\n'
               '\t// =========================================================================\n'
-              '\t// EIS — настройка ImageReader и обработка кадров (OpenCV)\n'
+              '\t// EIS — настройка ImageReader и обработка кадров\n'
               '\t// =========================================================================\n'
               '\n'
-              '\t/** Создаёт (пере)создаёт ImageReader для EIS-стабилизатора. */\n'
               '\tprivate void setupEisReader() {\n'
               '\t\tif (mEisReader != null) { try { mEisReader.close(); } catch (Exception e) {} mEisReader = null; }\n'
               '\t\tif (mEisTemplate != null) { mEisTemplate.release(); mEisTemplate = null; }\n'
               '\t\tmEisShiftX = 0; mEisShiftY = 0;\n'
               '\t\tmEisLastMatchX = EIS_IDEAL_X; mEisLastMatchY = EIS_IDEAL_Y;\n'
               '\t\tmEisVirtualX   = EIS_IDEAL_X; mEisVirtualY   = EIS_IDEAL_Y;\n'
-              '\n'
               '\t\tmEisReader = android.media.ImageReader.newInstance(\n'
               '\t\t\t\tEIS_W, EIS_H, android.graphics.ImageFormat.YUV_420_888, 2);\n'
               '\t\tmEisReader.setOnImageAvailableListener(reader -> {\n'
@@ -277,21 +257,12 @@ jobs:
               '\t\t}, mCamHandler);\n'
               '\t}\n'
               '\n'
-              '\t/**\n'
-              '\t * Обрабатывает один кадр EIS-потока.\n'
-              '\t * Алгоритм: template matching на Y-плоскости YUV-кадра пониженного разрешения.\n'
-              '\t * Результат: mEisShiftX/mEisShiftY — сдвиг в пикселях изображения EIS_WxEIS_H.\n'
-              '\t * В buildAndSendRequest() эти сдвиги масштабируются и применяются к SCALER_CROP_REGION.\n'
-              '\t */\n'
               '\tprivate void processEisFrame(android.media.Image image) {\n'
               '\t\tif (!mEisEnabled) return;\n'
-              '\n'
-              '\t\t// Извлекаем Y-плоскость (яркость) — это и есть grayscale\n'
               '\t\tandroid.media.Image.Plane yPlane = image.getPlanes()[0];\n'
-              '\t\tjava.nio.ByteBuffer yBuf   = yPlane.getBuffer();\n'
+              '\t\tjava.nio.ByteBuffer yBuf = yPlane.getBuffer();\n'
               '\t\tint stride = yPlane.getRowStride();\n'
               '\t\tint w = image.getWidth(), h = image.getHeight();\n'
-              '\n'
               '\t\torg.opencv.core.Mat gray = new org.opencv.core.Mat(h, w, org.opencv.core.CvType.CV_8UC1);\n'
               '\t\tbyte[] data = new byte[h * w];\n'
               '\t\tif (stride == w) {\n'
@@ -300,102 +271,76 @@ jobs:
               '\t\t\tbyte[] row = new byte[stride];\n'
               '\t\t\tfor (int y = 0; y < h; y++) {\n'
               '\t\t\t\tyBuf.position(y * stride);\n'
-              '\t\t\t\tint n = Math.min(stride, w);\n'
-              '\t\t\t\tyBuf.get(row, 0, n);\n'
+              '\t\t\t\tyBuf.get(row, 0, Math.min(stride, w));\n'
               '\t\t\t\tSystem.arraycopy(row, 0, data, y * w, w);\n'
               '\t\t\t}\n'
               '\t\t}\n'
               '\t\tgray.put(0, 0, data);\n'
-              '\n'
-              '\t\t// Корректируем ориентацию под реальную ориентацию сенсора\n'
               '\t\tif      (mSensorOrientation == 90)  org.opencv.core.Core.rotate(gray, gray, org.opencv.core.Core.ROTATE_90_CLOCKWISE);\n'
               '\t\telse if (mSensorOrientation == 270) org.opencv.core.Core.rotate(gray, gray, org.opencv.core.Core.ROTATE_90_COUNTERCLOCKWISE);\n'
               '\t\telse if (mSensorOrientation == 180) org.opencv.core.Core.rotate(gray, gray, org.opencv.core.Core.ROTATE_180);\n'
-              '\n'
               '\t\tint gw = gray.cols(), gh = gray.rows();\n'
-              '\n'
               '\t\tif (mEisTemplate == null) {\n'
-              '\t\t\t// Первый кадр: берём шаблон из центра\n'
-              '\t\t\tif (EIS_IDEAL_X + EIS_TMPL_W <= gw && EIS_IDEAL_Y + EIS_TMPL_H <= gh) {\n'
+              '\t\t\tif (EIS_IDEAL_X + EIS_TMPL_W <= gw && EIS_IDEAL_Y + EIS_TMPL_H <= gh)\n'
               '\t\t\t\tmEisTemplate = new org.opencv.core.Mat(\n'
-              '\t\t\t\t\tgray, new org.opencv.core.Rect(EIS_IDEAL_X, EIS_IDEAL_Y, EIS_TMPL_W, EIS_TMPL_H)\n'
-              '\t\t\t\t).clone();\n'
-              '\t\t\t}\n'
-              '\t\t\tgray.release();\n'
-              '\t\t\treturn;\n'
+              '\t\t\t\t\t\tgray, new org.opencv.core.Rect(EIS_IDEAL_X, EIS_IDEAL_Y, EIS_TMPL_W, EIS_TMPL_H)).clone();\n'
+              '\t\t\tgray.release(); return;\n'
               '\t\t}\n'
-              '\n'
-              '\t\t// Поиск шаблона в окрестности последней позиции\n'
               '\t\tint roiX = Math.max(0, mEisLastMatchX - EIS_SEARCH_R);\n'
               '\t\tint roiY = Math.max(0, mEisLastMatchY - EIS_SEARCH_R);\n'
               '\t\tint roiW = Math.min(gw - roiX, EIS_TMPL_W + EIS_SEARCH_R * 2);\n'
               '\t\tint roiH = Math.min(gh - roiY, EIS_TMPL_H + EIS_SEARCH_R * 2);\n'
-              '\n'
               '\t\tif (roiW <= EIS_TMPL_W || roiH <= EIS_TMPL_H) { gray.release(); return; }\n'
-              '\n'
               '\t\torg.opencv.core.Mat roi    = new org.opencv.core.Mat(gray,\n'
               '\t\t\t\tnew org.opencv.core.Rect(roiX, roiY, roiW, roiH));\n'
               '\t\torg.opencv.core.Mat result = new org.opencv.core.Mat();\n'
               '\t\torg.opencv.imgproc.Imgproc.matchTemplate(\n'
               '\t\t\t\troi, mEisTemplate, result, org.opencv.imgproc.Imgproc.TM_CCOEFF_NORMED);\n'
               '\t\torg.opencv.core.Core.MinMaxLocResult mm = org.opencv.core.Core.minMaxLoc(result);\n'
-              '\n'
               '\t\tint matchX = roiX + (int) mm.maxLoc.x;\n'
               '\t\tint matchY = roiY + (int) mm.maxLoc.y;\n'
               '\t\tdouble jump = Math.hypot(matchX - mEisLastMatchX, matchY - mEisLastMatchY);\n'
-              '\t\tboolean edge = matchX < EIS_EDGE_MARGIN\n'
-              '\t\t           || matchX + EIS_TMPL_W > gw - EIS_EDGE_MARGIN\n'
-              '\t\t           || matchY < EIS_EDGE_MARGIN\n'
-              '\t\t           || matchY + EIS_TMPL_H > gh - EIS_EDGE_MARGIN;\n'
-              '\n'
+              '\t\tboolean edge = matchX < EIS_EDGE_MARGIN || matchX + EIS_TMPL_W > gw - EIS_EDGE_MARGIN\n'
+              '\t\t\t\t|| matchY < EIS_EDGE_MARGIN || matchY + EIS_TMPL_H > gh - EIS_EDGE_MARGIN;\n'
               '\t\tif (mm.maxVal < 0.4 || edge || jump > EIS_MAX_JUMP) {\n'
-              '\t\t\t// Плохое совпадение или уход к краю — сбрасываем шаблон\n'
               '\t\t\tmEisTemplate.release();\n'
-              '\t\t\tif (EIS_IDEAL_X + EIS_TMPL_W <= gw && EIS_IDEAL_Y + EIS_TMPL_H <= gh) {\n'
+              '\t\t\tif (EIS_IDEAL_X + EIS_TMPL_W <= gw && EIS_IDEAL_Y + EIS_TMPL_H <= gh)\n'
               '\t\t\t\tmEisTemplate = new org.opencv.core.Mat(\n'
-              '\t\t\t\t\tgray, new org.opencv.core.Rect(EIS_IDEAL_X, EIS_IDEAL_Y, EIS_TMPL_W, EIS_TMPL_H)\n'
-              '\t\t\t\t).clone();\n'
-              '\t\t\t}\n'
+              '\t\t\t\t\t\tgray, new org.opencv.core.Rect(EIS_IDEAL_X, EIS_IDEAL_Y, EIS_TMPL_W, EIS_TMPL_H)).clone();\n'
               '\t\t\tmEisLastMatchX = EIS_IDEAL_X; mEisLastMatchY = EIS_IDEAL_Y;\n'
               '\t\t\tmEisVirtualX   = EIS_IDEAL_X; mEisVirtualY   = EIS_IDEAL_Y;\n'
               '\t\t\tmEisShiftX = 0; mEisShiftY = 0;\n'
               '\t\t} else {\n'
               '\t\t\tmEisLastMatchX = matchX; mEisLastMatchY = matchY;\n'
-              '\t\t\t// Виртуальная позиция медленно следует за реальной (НЧ-фильтр)\n'
-              '\t\t\t// Коэффициент 0.03: медленный дрейф игнорируется, тряска — нет\n'
-              '\t\t\tmEisVirtualX += (matchX - mEisVirtualX) * 0.03;\n'
-              '\t\t\tmEisVirtualY += (matchY - mEisVirtualY) * 0.03;\n'
-              '\t\t\t// Сдвиг = быстрое отклонение от виртуальной "точки покоя"\n'
-              '\t\t\tmEisShiftX = matchX - mEisVirtualX;\n'
-              '\t\t\tmEisShiftY = matchY - mEisVirtualY;\n'
+              '\t\t\t// mEisDriftSpeed: 0.01=плавно/сильнее гасит, 0.20=резко/слабее\n'
+              '\t\t\tmEisVirtualX += (matchX - mEisVirtualX) * mEisDriftSpeed;\n'
+              '\t\t\tmEisVirtualY += (matchY - mEisVirtualY) * mEisDriftSpeed;\n'
+              '\t\t\tmEisShiftX    = matchX - mEisVirtualX;\n'
+              '\t\t\tmEisShiftY    = matchY - mEisVirtualY;\n'
               '\t\t}\n'
-              '\n'
               '\t\tgray.release(); roi.release(); result.release();\n'
               '\t}\n'
           )
-
-          # Вставляем методы перед последней } (конец класса)
           last_brace = src.rfind('\n}')
           src = src[:last_brace] + '\n' + EIS_METHODS + src[last_brace:]
 
           with open(src_path, 'w', encoding='utf-8') as f:
               f.write(src)
-          print(f"MainActivity.java patched OK ({src_path})")
+          print(f"Patches applied: {', '.join(ok)}")
+          print(f"Saved: {src_path}")
           PYEOF
 
-      # ── 4. Настройка Gradle Wrapper ─────────────────────────────────────────
+      # ── 4. Gradle Wrapper ────────────────────────────────────────────────────
       - name: Setup Gradle Wrapper
         run: |
-          if [ ! -f gradlew ]; then
-            gradle wrapper --gradle-version 8.4
-          fi
+          if [ ! -f gradlew ]; then gradle wrapper --gradle-version 8.4; fi
           chmod +x gradlew
 
       # ── 5. Сборка ────────────────────────────────────────────────────────────
       - name: Build APK
         run: ./gradlew assembleDebug --stacktrace
 
-      # ── 6. Загрузка артефакта ────────────────────────────────────────────────
+      # ── 6. Артефакт ──────────────────────────────────────────────────────────
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
