@@ -20,7 +20,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      # ── 1. Добавляем OpenCV в build.gradle ──────────────────────────────────
+      # ── 1. Добавляем OpenCV в build.gradle ───────────────────────────
       - name: Patch app/build.gradle — add OpenCV dependency
         run: |
           python3 - << 'PYEOF'
