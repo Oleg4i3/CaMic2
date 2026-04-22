@@ -333,7 +333,9 @@ jobs:
       # ── 4. Gradle Wrapper ────────────────────────────────────────────────────
       - name: Setup Gradle Wrapper
         run: |
-          if [ ! -f gradlew ]; then gradle wrapper --gradle-version 8.4; fi
+          if [ ! -f gradlew ]; then gradle wrapper --gradle-version 8.7; fi
+          # Если wrapper уже есть но старый — обновляем distributionUrl
+          sed -i 's|gradle-[0-9.]*-\(all\|bin\)|gradle-8.7-all|g' gradle/wrapper/gradle-wrapper.properties 2>/dev/null || true
           chmod +x gradlew
 
       # ── 5. Сборка ────────────────────────────────────────────────────────────
