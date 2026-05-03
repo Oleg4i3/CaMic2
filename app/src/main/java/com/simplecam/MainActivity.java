@@ -46,9 +46,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// ─── Константы ────────────────────────────────────────────────────────────
 	private static final int VIDEO_W = 1280;
 	private static final int VIDEO_H = 720;
-	private static final int VIDEO_BPS_DEFAULT = 6_000_000;
+	private static final int VIDEO_BPS = 6_000_000;
 	private static final int VIDEO_FPS = 30;
-	private static final int AUDIO_SR = 48000;
+	private static final int AUDIO_SR = 44100;
 	private static final int REQ_PERMS = 1;
 	private static final float MAX_ZOOM_SPEED = 0.08f;
 	
@@ -58,10 +58,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private VerticalSeekBar mSeekGain;
 	private FocusDrumView mFocusDrum; // барабан ручного фокуса
 	private TextView mTvGain, mTvStatus, mTvFocus;
-	private Button mBtn, mSrcToggleBtn, mBtnPause;
-	private volatile boolean mPaused = false;
-	private long mPauseStartNano = 0L, mPauseEndNano = 0L;
-	private GradientDrawable mBtnBgPause;
+	private Button mBtn, mSrcToggleBtn;
 	private VuMeterView mVu;
 	private OscilloscopeView mOscilloscope;
 	private EnvelopeView mEnvelope;
@@ -103,68 +100,31 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private volatile float mGain = 1f;
 	private volatile boolean mSoftClip = false;
 	private volatile int mAudChannels = 2;
-
+	
 	private MediaCodec mVidEnc, mAudEnc;
 	private MediaMuxer mMuxer;
 	private Surface mEncSurface;
 	private AudioRecord mAudRec;
-	private Thread mAudThread;
-
+	private Thread mAudThread, mVidThread;
+	
 	private int mVidTrack = -1, mAudTrack = -1;
 	private volatile boolean mMuxReady;
 	private final Object mMuxLock = new Object();
-
+	
 	// ─── MediaStore ───────────────────────────────────────────────────────────
 	private Uri mPendingUri;
 	private ParcelFileDescriptor mPfd;
-
+	
+	// ─── Синхронизация ────────────────────────────────────────────────────────
+	private volatile CountDownLatch mSessionLatch;
+	
 	// ─── Аудио-источники ──────────────────────────────────────────────────────
 	private final List<AudioSrcItem> mSrcList = new ArrayList<>();
-
-	// ─── Аудио-поток ─────────────────────────────────────────────────────────
+	
+	// ─── Единый аудио-поток ───────────────────────────────────────────────────
 	private volatile boolean mAudRunning;
-
-	// ═══════════════════════════════════════════════════════════════════════════
-	// Pre-buffer: кольцевые буферы закодированных фреймов.
-	//
-	// Ключевая идея БЕСШОВНОСТИ:
-	//   mVidWriteMode / mAudWriteMode — атомарные флаги:
-	//     0 = RING  (фреймы идут в кольцо)
-	//     1 = FLUSH (дренажный поток сбрасывает кольцо в мюксер, потом LIVE)
-	//     2 = LIVE  (фреймы идут прямо в мюксер)
-	//   Переключение RING→FLUSH→LIVE делает тот же поток, что дренирует
-	//   энкодер, — поэтому между последним фреймом кольца и первым живым
-	//   фреймом нет ни одного пропущенного пакета.
-	// ═══════════════════════════════════════════════════════════════════════════
-	private static class EncodedFrame {
-		final byte[] data; final long pts; final int flags;
-		EncodedFrame(ByteBuffer src, MediaCodec.BufferInfo bi) {
-			data = new byte[bi.size];
-			src.position(bi.offset); src.get(data, 0, bi.size);
-			pts = bi.presentationTimeUs; flags = bi.flags;
-		}
-		boolean isKey() { return (flags & MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0; }
-	}
-	private final java.util.ArrayDeque<EncodedFrame> mVidRing = new java.util.ArrayDeque<>();
-	private final java.util.ArrayDeque<EncodedFrame> mAudRing = new java.util.ArrayDeque<>();
-	private final Object mVidRingLock = new Object();
-	private final Object mAudRingLock = new Object();
-	// 0=RING 1=FLUSH 2=LIVE
-	private volatile int mVidWriteMode = 0;
-	private volatile int mAudWriteMode = 0;
-	private volatile long mMuxBasePts  = 0L;
-	private volatile MediaFormat mVidOutFmt = null;
-	private volatile MediaFormat mAudOutFmt = null;
-	private volatile boolean mVidLoopRunning = false;
-
-	// ─── Настройки ───────────────────────────────────────────────────────────
-	private volatile int  mVideoBps = VIDEO_BPS_DEFAULT;
-	private volatile int  mPreBufSecs = 1;          // 1..5 секунд
-	private volatile boolean mPreBufferEnabled = true;
-	private volatile int  mEvComp = 0;
-	private int mEvMin = -6, mEvMax = 6;
-	private SeekBar mSeekEv;
-	private TextView mTvEv;
+	private volatile boolean mEncoding;
+	private CountDownLatch mAudDoneLatch;
 	
 	// ─── Zoom-цикл ────────────────────────────────────────────────────────────
 	private final Runnable mZoomRunnable = new Runnable() {
@@ -211,11 +171,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		super.onDestroy();
 		if (mCamHandler != null)
 		mCamHandler.removeCallbacks(mZoomRunnable);
-		mVidLoopRunning = false;
 		stopAudio();
-		finalizeMuxer();
-		if (mVidEnc!=null){try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null;}
-		if (mEncSurface!=null){try{mEncSurface.release();}catch(Exception e){} mEncSurface=null;}
 		try {
 			if (mCapSess != null)
 			mCapSess.close();
@@ -272,7 +228,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		oscLP.rightMargin = dp(60);
 		oscLP.topMargin = dp(6);
 		root.addView(mOscilloscope, oscLP);
-		mOscilloscope.setVisibility(View.GONE);
 
 		// ── Огибающая (бегущий 10-секундный осциллограф) — тот же оверлей ──────
 		mEnvelope = new EnvelopeView(this);
@@ -282,11 +237,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		envLP.leftMargin = dp(50);
 		envLP.rightMargin = dp(60);
 		envLP.topMargin = dp(6);
+		mEnvelope.setVisibility(View.GONE);
 		root.addView(mEnvelope, envLP);
 		
-		mBtnBgIdle  = makeOval(0xFFDDCC00);
-		mBtnBgRec   = makeOval(0xFFCC1100);
-		mBtnBgPause = makeOval(0xFF1155CC);
+		mBtnBgIdle = makeOval(0xFFDDCC00);
+		mBtnBgRec = makeOval(0xFFCC1100);
 		
 		// Внешний вертикальный контейнер: рабочая зона + нижняя панель
 		LinearLayout outer = new LinearLayout(this);
@@ -449,7 +404,13 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			mManualFocus = checked;
 			mFocusColumn.setVisibility(checked ? View.VISIBLE : View.GONE);
 			// Сдвигаем кнопку REC влево на полширины когда барабан виден
-			// mBtn теперь в root FrameLayout с фиксированным rightMargin — не трогаем
+			if (mBtn != null) {
+				LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) mBtn.getLayoutParams();
+				// drum=44dp + lever=54dp + 4dp gap → 102dp; без барабана = 58dp
+				// сдвиг = половина ширины кнопки (52dp/2 = 26dp) → 84dp
+				lp.rightMargin = checked ? dp(84) : dp(58);
+				mBtn.requestLayout();
+			}
 			// Чекбокс Focus Assist — только при ручной фокусировке
 			if (mCbFocusAssist != null)
 			mCbFocusAssist.setVisibility(checked ? View.VISIBLE : View.GONE);
@@ -473,7 +434,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		mCbOsc.setText("Oscilloscope");
 		mCbOsc.setTextColor(0xCCCCCCCC);
 		mCbOsc.setTextSize(12);
-		mCbOsc.setChecked(false);
+		mCbOsc.setChecked(true);
 		mCbOsc.setOnCheckedChangeListener((cb, checked) -> {
 			if (mOscilloscope != null) mOscilloscope.setVisibility(checked ? View.VISIBLE : View.GONE);
 			if (mEnvelope != null) mEnvelope.setVisibility(checked ? View.GONE : View.VISIBLE);
@@ -495,113 +456,42 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 		cbRow2.addView(mCbSpec);
 		mAudioSrcPanel.addView(cbRow2);
 		
-		// Focus Assist
+		// Focus Assist — появляется только при ручной фокусировке
 		mCbFocusAssist = new CheckBox(this);
 		mCbFocusAssist.setText("Focus assist (zoom while focusing)");
 		mCbFocusAssist.setTextColor(0xCCCCCCCC);
 		mCbFocusAssist.setTextSize(12);
-		mCbFocusAssist.setVisibility(View.GONE);
+		mCbFocusAssist.setVisibility(View.GONE); // скрыт до включения Manual focus
 		mAudioSrcPanel.addView(mCbFocusAssist);
-
-		// ── EV ──────────────────────────────────────────────────────────────
-		mTvEv = smallLabel("EV  0");
-		mSeekEv = new SeekBar(this);
-		mSeekEv.setMax(mEvMax - mEvMin); mSeekEv.setProgress(-mEvMin);
-		mSeekEv.setLayoutParams(new LinearLayout.LayoutParams(dp(160), ViewGroup.LayoutParams.WRAP_CONTENT));
-		mSeekEv.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mEvComp = mEvMin + p; updateEvLabel(mEvComp);
-				if (mCamHandler != null) mCamHandler.post(MainActivity.this::buildAndSendRequest);
-			}
-			public void onStartTrackingTouch(SeekBar s) {}
-			public void onStopTrackingTouch(SeekBar s) {}
-		});
-		LinearLayout evRow = new LinearLayout(this);
-		evRow.setOrientation(LinearLayout.HORIZONTAL); evRow.setGravity(Gravity.CENTER_VERTICAL);
-		evRow.addView(mTvEv); evRow.addView(mSeekEv);
-		mAudioSrcPanel.addView(evRow);
-
-		// ── Pre-buffer ───────────────────────────────────────────────────────
-		CheckBox cbPB = new CheckBox(this);
-		cbPB.setText("Pre-buffer");
-		cbPB.setTextColor(0xCCCCCCCC); cbPB.setTextSize(12);
-		cbPB.setChecked(true); // включён по умолчанию
-		cbPB.setOnCheckedChangeListener((cb, on) -> mPreBufferEnabled = on);
-		final TextView tvPBLen = smallLabel("1 s");
-		SeekBar sbPB = new SeekBar(this);
-		sbPB.setMax(4); sbPB.setProgress(0);
-		sbPB.setLayoutParams(new LinearLayout.LayoutParams(dp(110), ViewGroup.LayoutParams.WRAP_CONTENT));
-		sbPB.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
-			public void onProgressChanged(SeekBar s, int p, boolean u) {
-				mPreBufSecs = p + 1; tvPBLen.setText(mPreBufSecs + " s");
-			}
-			public void onStartTrackingTouch(SeekBar s) {}
-			public void onStopTrackingTouch(SeekBar s) {}
-		});
-		LinearLayout pbRow = new LinearLayout(this);
-		pbRow.setOrientation(LinearLayout.HORIZONTAL); pbRow.setGravity(Gravity.CENTER_VERTICAL);
-		pbRow.addView(cbPB); pbRow.addView(sbPB); pbRow.addView(tvPBLen);
-		mAudioSrcPanel.addView(pbRow);
-
-		// ── Битрейт видео ────────────────────────────────────────────────────
-		String[] bpsL={"500 kbps","1 Mbps","2 Mbps","3 Mbps","4 Mbps","6 Mbps (def)","8 Mbps","12 Mbps"};
-		int[] bpsV={500_000,1_000_000,2_000_000,3_000_000,4_000_000,6_000_000,8_000_000,12_000_000};
-		Spinner spBps = new Spinner(this);
-		ArrayAdapter<String> bpsAd = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, bpsL);
-		bpsAd.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-		spBps.setAdapter(bpsAd); spBps.setSelection(5); // 6 Mbps
-		spBps.setLayoutParams(new LinearLayout.LayoutParams(dp(190), ViewGroup.LayoutParams.WRAP_CONTENT));
-		spBps.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-			public void onItemSelected(AdapterView<?> p, View v, int pos, long id) { mVideoBps = bpsV[pos]; }
-			public void onNothingSelected(AdapterView<?> p) {}
-		});
-		LinearLayout bpsRow = new LinearLayout(this);
-		bpsRow.setOrientation(LinearLayout.HORIZONTAL); bpsRow.setGravity(Gravity.CENTER_VERTICAL);
-		bpsRow.addView(smallLabel("Bps: ")); bpsRow.addView(spBps);
-		mAudioSrcPanel.addView(bpsRow);
-
+		
 		panel.addView(mAudioSrcPanel);
 
 		// ── Строка: спектр-анализатор (слева, weight=1) + кнопка REC (справа) ──
 		// REC справа, с отступом rightMargin=58dp чтобы не перекрыть рычаг зума (54dp)
-		// Спектр — только анализатор, занимает всю ширину нижней панели
-		mSpectrum = new SpectrumView(this);
-		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(
-			ViewGroup.LayoutParams.MATCH_PARENT, dp(72));
-		specLP.rightMargin = dp(120); // не заходить под кнопки REC+PAUSE
-		panel.addView(mSpectrum, specLP);
-
-		// ── REC и PAUSE фиксированы в root (FrameLayout), не сдвигаются ──────
-		// REC — большая круглая кнопка, прикреплена к правому нижнему углу
-		int recSize = dp(68);
-		int recRight = dp(62); // 54dp зум-рычаг + 8dp зазор
-		int recBottom = dp(8);
-
 		mBtn = new Button(this);
 		mBtn.setText("REC");
 		mBtn.setTextColor(Color.WHITE);
-		mBtn.setTextSize(13);
+		mBtn.setTextSize(11);
 		mBtn.setBackground(mBtnBgIdle);
 		mBtn.setOnClickListener(v -> onRecordClick());
-		FrameLayout.LayoutParams recLP = new FrameLayout.LayoutParams(recSize, recSize);
-		recLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
-		recLP.rightMargin = recRight;
-		recLP.bottomMargin = recBottom;
-		root.addView(mBtn, recLP);
 
-		// PAUSE — маленькая кнопка над REC, видна только во время записи
-		mBtnPause = new Button(this);
-		mBtnPause.setText("⏸");
-		mBtnPause.setTextColor(Color.WHITE);
-		mBtnPause.setTextSize(16);
-		mBtnPause.setBackground(mBtnBgPause);
-		mBtnPause.setVisibility(View.GONE);
-		mBtnPause.setOnClickListener(v -> onPauseClick());
-		FrameLayout.LayoutParams pauseLP = new FrameLayout.LayoutParams(dp(44), dp(44));
-		pauseLP.gravity = Gravity.BOTTOM | Gravity.RIGHT;
-		pauseLP.rightMargin = recRight + (recSize - dp(44)) / 2; // центр над REC
-		pauseLP.bottomMargin = recBottom + recSize + dp(6);
-		root.addView(mBtnPause, pauseLP);
+		mSpectrum = new SpectrumView(this);
+
+		LinearLayout specRecRow = new LinearLayout(this);
+		specRecRow.setOrientation(LinearLayout.HORIZONTAL);
+		specRecRow.setGravity(Gravity.CENTER_VERTICAL);
+
+		LinearLayout.LayoutParams specLP = new LinearLayout.LayoutParams(0, dp(72), 1f);
+		specRecRow.addView(mSpectrum, specLP);
+
+		LinearLayout.LayoutParams btnLP = new LinearLayout.LayoutParams(dp(52), dp(52));
+		btnLP.rightMargin = dp(58); // clearance for zoom lever (54dp) + 4dp gap
+		btnLP.leftMargin = dp(4);
+		mBtn.setLayoutParams(btnLP);
+		specRecRow.addView(mBtn);
+
+		panel.addView(specRecRow, new LinearLayout.LayoutParams(
+			ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
 		return root;
 	}
@@ -671,14 +561,10 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	}
 	
 	private void updateFocusLabel(float value) {
-		if (mTvFocus == null) return;
+		if (mTvFocus == null)
+		return;
 		String txt = value < 0.005f ? "∞" : String.format("%.1f", value * mMinFocusDist) + "m⁻¹";
 		mTvFocus.setText(txt);
-	}
-
-	private void updateEvLabel(int ev) {
-		if (mTvEv == null) return;
-		runOnUiThread(() -> mTvEv.setText(ev == 0 ? "EV  0" : String.format("EV %+d", ev)));
 	}
 	
 	// ── Helpers ───────────────────────────────────────────────────────────────
@@ -827,9 +713,8 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					if (maxZ != null)
 					mMaxZoom = maxZ;
 					Float minFocus = ch.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE);
-					if (minFocus != null) mMinFocusDist = minFocus;
-					android.util.Range<Integer> evR = ch.get(CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE);
-					if (evR != null) { mEvMin = evR.getLower(); mEvMax = evR.getUpper(); }
+					if (minFocus != null)
+					mMinFocusDist = minFocus;
 					break;
 				}
 			}
@@ -843,7 +728,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 					startPreview();
 					buildAudioSources();
 					mCamHandler.post(mZoomRunnable);
-					runOnUiThread(() -> { if (mSeekEv!=null){mSeekEv.setMax(mEvMax-mEvMin);mSeekEv.setProgress(-mEvMin);updateEvLabel(0);} });
 				}
 				
 				@Override
@@ -866,7 +750,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	private void startPreview() {
 		if (mCamDev == null || !mSurfaceReady)
 		return;
-		ensureEncoders();
 		try {
 			if (mCapSess != null) {
 				mCapSess.close();
@@ -883,6 +766,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				public void onConfigured(CameraCaptureSession sess) {
 					mCapSess = sess;
 					buildAndSendRequest();
+					CountDownLatch l = mSessionLatch;
+					if (l != null) {
+						l.countDown();
+						mSessionLatch = null;
+					}
 				}
 				
 				@Override
@@ -923,7 +811,6 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			}
 			
 			rb.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON);
-			rb.set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, mEvComp);
 			
 			if (mSensorRect != null) {
 				int cropW = Math.max(1, (int) (mSensorRect.width() / mZoomLevel));
@@ -941,43 +828,12 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// REC / STOP
 	// =========================================================================
 	
-	private void onPauseClick() {
-		mPaused = !mPaused;
-		if (mPaused) {
-			// Пауза: переводим в RING, кольца очищаем
-			mPauseStartNano = System.nanoTime();
-			mVidWriteMode = 0;
-			mAudWriteMode = 0;
-			synchronized(mVidRingLock) { mVidRing.clear(); }
-			synchronized(mAudRingLock) { mAudRing.clear(); }
-			mBtnPause.setText("▶");
-			mBtnPause.setBackground(makeOval(0xFF228833));
-			status("⏸ Paused");
-		} else {
-			// Снятие с паузы: LIVE сразу, без пре-буфера
-			// mMuxBasePts сдвигаем: следующий фрейм будет записан с текущим PTS минус BasePts
-			// Корректируем BasePts так, чтобы не было прыжка PTS в файле.
-			// Самый простой способ: выставить mVidWriteMode=2 и mAudWriteMode=2 напрямую.
-			// PTS коррекция: запоминаем момент паузы и момент возобновления,
-			// сдвигаем BasePts на длину паузы.
-			mPauseEndNano = System.nanoTime();
-			long pauseDurUs = (mPauseEndNano - mPauseStartNano) / 1000L;
-			mMuxBasePts += pauseDurUs; // вычитаем паузу из всех будущих PTS
-			mVidWriteMode = 2; // LIVE
-			mAudWriteMode = 2;
-			mBtnPause.setText("⏸");
-			mBtnPause.setBackground(mBtnBgPause);
-			status("● REC (resumed)");
-		}
-	}
-
 	private void onRecordClick() {
 		if (mRecording) {
 			mRecording = false;
 			mBtn.setEnabled(false);
 			status("Stopping…");
-			new Thread(this::doStop).start();
-		} else {
+			} else {
 			mBtn.setEnabled(false);
 			status("Starting…");
 			new Thread(this::doStart).start();
@@ -988,334 +844,9 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 	// Запуск записи
 	// =========================================================================
 	
-
-	// =========================================================================
-	// Энкодеры: создание / видео-петля
-	// =========================================================================
-
-	/** Идемпотентно создаёт видео+аудио энкодеры и запускает videoPreviewLoop. */
-	private synchronized void ensureEncoders() {
-		// Видео-энкодер
-		if (mVidEnc == null || mEncSurface == null || !mEncSurface.isValid()) {
-			try {
-				if (mVidEnc != null) { try{mVidEnc.stop();mVidEnc.release();}catch(Exception e){} mVidEnc=null; }
-				if (mEncSurface != null) { try{mEncSurface.release();}catch(Exception e){} mEncSurface=null; }
-				MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
-				vf.setInteger(MediaFormat.KEY_BIT_RATE, mVideoBps);
-				vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
-				vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
-				vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface);
-				vf.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline);
-				vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
-				mVidEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
-				mVidEnc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-				mEncSurface = mVidEnc.createInputSurface();
-				mVidEnc.start();
-				mVidOutFmt = null;
-				synchronized(mVidRingLock) { mVidRing.clear(); }
-				mVidWriteMode = 0;
-			} catch (Exception e) { status("VidEnc err: " + e.getMessage()); return; }
-		}
-		// Видео-петля
-		if (!mVidLoopRunning) {
-			Thread t = new Thread(this::videoPreviewLoop, "vid-preview");
-			t.setDaemon(true); t.start();
-		}
-	}
-
-	/**
-	 * Непрерывно дренирует видео-энкодер.
-	 * Переключение RING→FLUSH→LIVE происходит ЗДЕСЬ, в этом же потоке —
-	 * никаких гонок, никаких пропущенных фреймов между кольцом и файлом.
-	 */
-	private void videoPreviewLoop() {
-		mVidLoopRunning = true;
-		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-		while (mVidLoopRunning) {
-			MediaCodec enc = mVidEnc;
-			if (enc == null) { try{Thread.sleep(20);}catch(Exception e){} continue; }
-			int out;
-			try { out = enc.dequeueOutputBuffer(info, 40_000); }
-			catch (Exception e) { break; }
-
-			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-				synchronized(mVidRingLock) { mVidOutFmt = enc.getOutputFormat(); }
-				continue;
-			}
-			if (out < 0) continue;
-
-			try {
-				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-				if (cfg || info.size <= 0) continue;
-				ByteBuffer data = enc.getOutputBuffer(out);
-				int mode = mVidWriteMode;
-
-				if (mode == 0) {
-					// ── RING: добавляем в кольцо, обрезаем по mPreBufSecs ──
-					EncodedFrame f = new EncodedFrame(data, info);
-					synchronized(mVidRingLock) {
-						mVidRing.addLast(f);
-						while (mVidRing.size() > 1) {
-							long span = mVidRing.peekLast().pts - mVidRing.peekFirst().pts;
-							if (span <= (long) mPreBufSecs * 1_200_000L) break;
-							mVidRing.removeFirst();
-						}
-					}
-				} else if (mode == 1) {
-					// ── FLUSH: сбрасываем кольцо в мюксер, затем текущий кадр ──
-					// Всё делаем здесь — атомарно, в одном потоке.
-					synchronized(mVidRingLock) {
-						// Пропускаем до первого I-frame
-						boolean foundKey = false;
-						for (EncodedFrame rf : mVidRing) {
-							if (!foundKey && !rf.isKey()) continue;
-							foundKey = true;
-							ByteBuffer rb = ByteBuffer.wrap(rf.data);
-							MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
-							bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags);
-							synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, rb, bi); }
-						}
-						mVidRing.clear();
-					}
-					// Текущий кадр — первый живой
-					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-					mVidWriteMode = 2; // LIVE
-				} else {
-					// ── LIVE: прямо в мюксер ──
-					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mVidTrack, data, n); }
-				}
-			} finally { enc.releaseOutputBuffer(out, false); }
-		}
-		mVidLoopRunning = false;
-	}
-
-	// =========================================================================
-	// Аудио-пайплайн
-	// =========================================================================
-
-	@SuppressLint("MissingPermission")
-	private void startMonitor() {
-		if (mAudRunning || !mPermsOk) return;
-		int pos = mSpinner.getSelectedItemPosition();
-		AudioSrcItem src2 = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
-		int audioSrc = src2 != null ? src2.audioSource : MediaRecorder.AudioSource.MIC;
-
-		int chanCfg = AudioFormat.CHANNEL_IN_STEREO; int channels = 2;
-		int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
-		if (minBuf <= 0) { chanCfg = AudioFormat.CHANNEL_IN_MONO; channels = 1;
-			minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT); }
-		int bufSize = Math.max(minBuf, AUDIO_SR * channels * 2 / 5);
-		AudioRecord rec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
-		if (rec.getState() != AudioRecord.STATE_INITIALIZED && channels == 2) {
-			rec.release(); chanCfg = AudioFormat.CHANNEL_IN_MONO; channels = 1;
-			minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
-			bufSize = Math.max(minBuf, AUDIO_SR * 2 / 5);
-			rec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
-		}
-		if (rec.getState() != AudioRecord.STATE_INITIALIZED) { rec.release(); return; }
-		if (Build.VERSION.SDK_INT >= 23 && src2 != null && src2.device != null)
-			rec.setPreferredDevice(src2.device);
-		disableAudioEffects(rec.getAudioSessionId());
-		mAudRec = rec; mAudChannels = channels;
-
-		// Создаём аудио-энкодер
-		try {
-			MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SR, channels);
-			af.setInteger(MediaFormat.KEY_BIT_RATE, channels == 1 ? 192_000 : 320_000);
-			af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
-			mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
-			mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
-			mAudEnc.start();
-			mAudOutFmt = null;
-			synchronized(mAudRingLock) { mAudRing.clear(); }
-			mAudWriteMode = 0;
-		} catch (Exception e) { status("AudEnc err: " + e.getMessage()); mAudEnc = null; }
-
-		mAudRunning = true;
-		mAudThread = new Thread(this::audioMainLoop, "aud-main");
-		mAudThread.setDaemon(true); mAudThread.start();
-	}
-
-	private void stopAudio() {
-		mAudRunning = false;
-		if (mAudRec != null) try { mAudRec.stop(); } catch (Exception ignored) {}
-		if (mAudThread != null) { try { mAudThread.join(600); } catch (Exception ignored) {} mAudThread = null; }
-		if (mAudRec != null) { try { mAudRec.release(); } catch (Exception ignored) {} mAudRec = null; }
-		if (mAudEnc != null) { try { mAudEnc.stop(); mAudEnc.release(); } catch (Exception ignored) {} mAudEnc = null; }
-		mAudOutFmt = null;
-		synchronized(mAudRingLock) { mAudRing.clear(); }
-	}
-
-	private void disableAudioEffects(int sid) {
-		try { if (AutomaticGainControl.isAvailable()) { AutomaticGainControl a = AutomaticGainControl.create(sid); if (a!=null){a.setEnabled(false);a.release();} } } catch (Exception ignored) {}
-		try { if (NoiseSuppressor.isAvailable()) { NoiseSuppressor n = NoiseSuppressor.create(sid); if (n!=null){n.setEnabled(false);n.release();} } } catch (Exception ignored) {}
-		try { if (AcousticEchoCanceler.isAvailable()) { AcousticEchoCanceler e = AcousticEchoCanceler.create(sid); if (e!=null){e.setEnabled(false);e.release();} } } catch (Exception ignored) {}
-	}
-
-	/**
-	 * Аудио-петля: читает PCM, кодирует AAC, дренирует в кольцо или мюксер.
-	 * Переключение RING→FLUSH→LIVE — в этом же потоке, атомарно.
-	 */
-	private void audioMainLoop() {
-		final AudioRecord rec = mAudRec;
-		final int ch = mAudChannels;
-		final int chunkSamples = AUDIO_SR * ch / 50; // 20 мс
-		short[] buf = new short[chunkSamples];
-		// Абсолютный старт в мкс — тот же CLOCK_MONOTONIC, что у видео-сенсора
-		final long startUs = System.nanoTime() / 1000L;
-		long totalFrames = 0L;
-
-		rec.startRecording();
-		while (mAudRunning) {
-			int r = rec.read(buf, 0, chunkSamples);
-			if (r <= 0) continue;
-
-			// ── gain / soft-clip ──────────────────────────────────────────────
-			final float g = mGain; final boolean sc = mSoftClip;
-			long sumSq = 0;
-			for (int i = 0; i < r; i++) {
-				float s = buf[i] * g;
-				if (sc) {
-					final float T = 32768f * 0.7f, knee = 32768f - T;
-					float ab = Math.abs(s);
-					if (ab > T) s = Math.signum(s) * (T + knee * (float)Math.tanh((ab-T)/knee));
-				}
-				if (s > 32767f) s = 32767f; else if (s < -32768f) s = -32768f;
-				buf[i] = (short) s; sumSq += (long) buf[i] * buf[i];
-			}
-			float peakAmp = 0f;
-			for (int i = 0; i < r; i++) { float a = Math.abs(buf[i]) / 32768f; if (a > peakAmp) peakAmp = a; }
-			mVu.setPeak(peakAmp);
-			mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
-			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
-			if (mEnvelope     != null) mEnvelope.pushSamples(buf, r, ch);
-			if (mSpectrum     != null) mSpectrum.pushSamples(buf, r, ch);
-
-			// ── кодируем PCM→AAC ──────────────────────────────────────────────
-			MediaCodec enc = mAudEnc;
-			if (enc == null) continue;
-			// PTS: абсолютный System.nanoTime (мкс) — тот же домен, что у видео
-			long pts = startUs + totalFrames * 1_000_000L / AUDIO_SR;
-			totalFrames += r / ch;
-			int idx = enc.dequeueInputBuffer(5_000);
-			if (idx >= 0) {
-				ByteBuffer bb = enc.getInputBuffer(idx);
-				bb.clear();
-				for (int i = 0; i < r; i++) { bb.put((byte)(buf[i]&0xFF)); bb.put((byte)(buf[i]>>8&0xFF)); }
-				enc.queueInputBuffer(idx, 0, r * 2, pts, 0);
-			}
-			drainAudioEncoder(enc);
-		}
-		mVu.setLevel(0f);
-		try { rec.stop(); } catch (Exception ignored) {}
-	}
-
-	/**
-	 * Дренирует аудио-энкодер. Переключение RING→FLUSH→LIVE — здесь, атомарно.
-	 */
-	private void drainAudioEncoder(MediaCodec enc) {
-		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
-		while (true) {
-			int out = enc.dequeueOutputBuffer(info, 0);
-			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
-				synchronized(mAudRingLock) { mAudOutFmt = enc.getOutputFormat(); }
-				continue;
-			}
-			if (out < 0) break;
-			try {
-				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
-				if (cfg || info.size <= 0) continue;
-				ByteBuffer data = enc.getOutputBuffer(out);
-				int mode = mAudWriteMode;
-
-				if (mode == 0) {
-					// RING
-					EncodedFrame f = new EncodedFrame(data, info);
-					synchronized(mAudRingLock) {
-						mAudRing.addLast(f);
-						while (mAudRing.size() > 1) {
-							long span = mAudRing.peekLast().pts - mAudRing.peekFirst().pts;
-							if (span <= (long) mPreBufSecs * 1_200_000L) break;
-							mAudRing.removeFirst();
-						}
-					}
-				} else if (mode == 1) {
-					// FLUSH: сбрасываем кольцо начиная с первого аудио-фрейма >= mMuxBasePts
-					synchronized(mAudRingLock) {
-						boolean started = false;
-						for (EncodedFrame rf : mAudRing) {
-							if (!started && rf.pts < mMuxBasePts) continue;
-							started = true;
-							ByteBuffer rb = ByteBuffer.wrap(rf.data);
-							MediaCodec.BufferInfo bi = new MediaCodec.BufferInfo();
-							bi.set(0, rf.data.length, rf.pts - mMuxBasePts, rf.flags);
-							synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, rb, bi); }
-						}
-						mAudRing.clear();
-					}
-					// Текущий аудио-пакет
-					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); }
-					mAudWriteMode = 2; // LIVE
-				} else {
-					// LIVE
-					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
-					n.set(info.offset, info.size, info.presentationTimeUs - mMuxBasePts, info.flags);
-					synchronized(mMuxLock) { if (mMuxReady) mMuxer.writeSampleData(mAudTrack, data, n); }
-				}
-			} finally { enc.releaseOutputBuffer(out, false); }
-			if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0) break;
-		}
-	}
-
-	// =========================================================================
-	// REC: doStart / doStop / finalizeMuxer
-	// =========================================================================
-
-	/**
-	 * doStart():
-	 *  1. Вычисляем mMuxBasePts = PTS первого I-frame в видео-кольце.
-	 *     Аудио-кольцо совпадает по clock → синхронизировано автоматически.
-	 *  2. Создаём мюксер и добавляем треки.
-	 *  3. Устанавливаем mVidWriteMode=FLUSH, mAudWriteMode=FLUSH.
-	 *  4. Каждый поток сам (атомарно!) сбрасывает кольцо и продолжает LIVE.
-	 *  Нет снимков, нет гонок, нет разрывов.
-	 */
 	@SuppressLint("MissingPermission")
 	private void doStart() {
 		try {
-			// Ждём форматов от энкодеров (максимум 2 с)
-			for (int wait = 0; wait < 40 && (mVidOutFmt == null || mAudOutFmt == null); wait++) {
-				Thread.sleep(50);
-			}
-			if (mVidOutFmt == null || mAudOutFmt == null) {
-				runOnUiThread(() -> { mBtn.setEnabled(true); status("Encoder not ready — retry"); });
-				return;
-			}
-
-			// ── Вычисляем mMuxBasePts по первому I-frame в видео-кольце ───────
-			long basePts;
-			synchronized(mVidRingLock) {
-				if (mPreBufferEnabled) {
-					basePts = Long.MAX_VALUE;
-					for (EncodedFrame f : mVidRing) {
-						if (f.isKey()) { basePts = f.pts; break; }
-					}
-					if (basePts == Long.MAX_VALUE) basePts = 0;
-				} else {
-					// Без пре-буфера: берём PTS следующего I-frame (придёт через ≤1 с)
-					// Пока ждём его — просто ставим текущее время
-					basePts = System.nanoTime() / 1000L;
-				}
-			}
-			mMuxBasePts = basePts;
-
-			// ── Создаём MediaStore-запись ──────────────────────────────────────
 			String displayPath;
 			if (Build.VERSION.SDK_INT >= 29) {
 				ContentValues cv = new ContentValues();
@@ -1327,9 +858,11 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 				mPfd = getContentResolver().openFileDescriptor(mPendingUri, "rw");
 				mMuxer = new MediaMuxer(mPfd.getFileDescriptor(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
 				displayPath = "DCIM/CaMic";
-			} else {
+				} else {
 				@SuppressWarnings("deprecation")
-				File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM), "CaMic");
+				File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DCIM),
+				"CaMic");
+				//noinspection ResultOfMethodCallIgnored
 				dir.mkdirs();
 				File f = new File(dir, "VID_" + System.currentTimeMillis() + ".mp4");
 				mMuxer = new MediaMuxer(f.getAbsolutePath(), MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4);
@@ -1338,73 +871,443 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
 			@SuppressWarnings("deprecation")
 			int rot = getWindowManager().getDefaultDisplay().getRotation() * 90;
 			mMuxer.setOrientationHint((mSensorOrientation - rot + 360) % 360);
-
-			// ── Добавляем треки, стартуем мюксер ──────────────────────────────
-			synchronized(mMuxLock) {
-				mVidTrack = mMuxer.addTrack(mVidOutFmt);
-				mAudTrack = mMuxer.addTrack(mAudOutFmt);
-				mMuxer.start();
-				mMuxReady = true;
+			
+			MediaFormat vf = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, VIDEO_W, VIDEO_H);
+			vf.setInteger(MediaFormat.KEY_BIT_RATE, VIDEO_BPS);
+			vf.setInteger(MediaFormat.KEY_FRAME_RATE, VIDEO_FPS);
+			vf.setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, 1);
+			vf.setInteger(MediaFormat.KEY_COLOR_FORMAT, CodecCapabilities.COLOR_FormatSurface);
+			vf.setInteger(MediaFormat.KEY_PROFILE, CodecProfileLevel.AVCProfileBaseline);
+			vf.setInteger(MediaFormat.KEY_LEVEL, CodecProfileLevel.AVCLevel31);
+			mVidEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_VIDEO_AVC);
+			mVidEnc.configure(vf, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+			mEncSurface = mVidEnc.createInputSurface();
+			mVidEnc.start();
+			
+			stopAudio();
+			int pos = mSpinner.getSelectedItemPosition();
+			AudioSrcItem src = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
+			int audioSrc = src != null ? src.audioSource : MediaRecorder.AudioSource.DEFAULT;
+			
+			int chanCfg = AudioFormat.CHANNEL_IN_STEREO;
+			int channels = 2;
+			int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+			if (minBuf <= 0) {
+				chanCfg = AudioFormat.CHANNEL_IN_MONO;
+				channels = 1;
+				minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
 			}
-
-			// ── Переводим потоки в режим FLUSH → они сами сбросят кольца ──────
+			int bufSize = Math.max(minBuf, AUDIO_SR * channels * 2 / 5);
+			mAudRec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+			if (mAudRec.getState() != AudioRecord.STATE_INITIALIZED && channels == 2) {
+				mAudRec.release();
+				chanCfg = AudioFormat.CHANNEL_IN_MONO;
+				channels = 1;
+				minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+				bufSize = Math.max(minBuf, AUDIO_SR * 2 / 5);
+				mAudRec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+			}
+			if (mAudRec.getState() != AudioRecord.STATE_INITIALIZED) {
+				mAudRec.release();
+				channels = 2;
+				chanCfg = AudioFormat.CHANNEL_IN_STEREO;
+				minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+				mAudRec = new AudioRecord(MediaRecorder.AudioSource.DEFAULT, AUDIO_SR, chanCfg,
+				AudioFormat.ENCODING_PCM_16BIT, Math.max(minBuf, AUDIO_SR * 4 / 5));
+				status("Source unavailable, using Default");
+			}
+			mAudChannels = channels;
+			if (Build.VERSION.SDK_INT >= 23 && src != null && src.device != null)
+			mAudRec.setPreferredDevice(src.device);
+			disableAudioEffects(mAudRec.getAudioSessionId());
+			
+			MediaFormat af = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, AUDIO_SR, mAudChannels);
+			af.setInteger(MediaFormat.KEY_BIT_RATE, mAudChannels == 1 ? 96_000 : 192_000);
+			af.setInteger(MediaFormat.KEY_AAC_PROFILE, CodecProfileLevel.AACObjectLC);
+			mAudEnc = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC);
+			mAudEnc.configure(af, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE);
+			mAudEnc.start();
+			
+			mVidTrack = -1;
+			mAudTrack = -1;
+			mMuxReady = false;
+			
+			mAudDoneLatch = new CountDownLatch(1);
 			mRecording = true;
-			if (mPreBufferEnabled) {
-				mVidWriteMode = 1; // FLUSH
-				mAudWriteMode = 1; // FLUSH
-			} else {
-				mVidWriteMode = 2; // LIVE сразу
-				mAudWriteMode = 2;
-			}
-
+			
+			
+			mSessionLatch = new CountDownLatch(1);
+			runOnUiThread(this::startPreview);
+			if (!mSessionLatch.await(4, TimeUnit.SECONDS))
+			throw new Exception("Camera session timeout");
+			Thread.sleep(100);
+			startAudioThread(true);
+			
 			final String fp = displayPath;
+			mVidThread = new Thread(() -> videoLoop(fp), "vid");
+			mVidThread.start();
+			
 			runOnUiThread(() -> {
-				mBtn.setText("⏹ STOP"); mBtn.setBackground(mBtnBgRec); mBtn.setEnabled(true);
-				mBtnPause.setVisibility(View.VISIBLE);
-				mBtnPause.setText("⏸"); mBtnPause.setBackground(mBtnBgPause);
-				mPaused = false;
+				mBtn.setText("⏹ STOP");
+				mBtn.setBackground(mBtnBgRec);
+				mBtn.setEnabled(true);
 				status("● REC  →  " + fp);
 			});
-		} catch (Exception e) {
-			mRecording = false; mVidWriteMode = 0; mAudWriteMode = 0;
-			finalizeMuxer();
+			} catch (Exception e) {
+			mRecording = false;
+			cleanup(null);
 			runOnUiThread(() -> {
-				mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true);
-				mBtnPause.setVisibility(View.GONE);
+				mBtn.setText("⏺ REC");
+				mBtn.setBackground(mBtnBgIdle);
+				mBtn.setEnabled(true);
 				status("Error: " + e.getMessage());
 			});
 		}
 	}
-
-	private void doStop() {
-		// Даём энкодерам 200 мс выдать буферизованные пакеты
-		try { Thread.sleep(200); } catch (Exception ignored) {}
-		mVidWriteMode = 0; mAudWriteMode = 0; // обратно в RING
-		finalizeMuxer();
-	}
-
-	private void finalizeMuxer() {
-		synchronized(mMuxLock) {
-			try { if (mMuxer != null) { if (mMuxReady) mMuxer.stop(); mMuxer.release(); } }
-			catch (Exception ignored) {}
-			mMuxer = null; mMuxReady = false; mVidTrack = -1; mAudTrack = -1;
+	
+	// =========================================================================
+	// Аудио-пайплайн
+	// =========================================================================
+	
+	@SuppressLint("MissingPermission")
+	private void startMonitor() {
+		if (mAudRunning || !mPermsOk)
+		return;
+		int pos = mSpinner.getSelectedItemPosition();
+		AudioSrcItem src = (pos >= 0 && pos < mSrcList.size()) ? mSrcList.get(pos) : null;
+		int audioSrc = src != null ? src.audioSource : MediaRecorder.AudioSource.MIC;
+		
+		int chanCfg = AudioFormat.CHANNEL_IN_STEREO;
+		int channels = 2;
+		int minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+		if (minBuf <= 0) {
+			chanCfg = AudioFormat.CHANNEL_IN_MONO;
+			channels = 1;
+			minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
 		}
-		try { if (mPfd != null) { mPfd.close(); mPfd = null; } } catch (Exception ignored) {}
+		int bufSize = Math.max(minBuf, AUDIO_SR * channels * 2 / 5);
+		AudioRecord rec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+		if (rec.getState() != AudioRecord.STATE_INITIALIZED && channels == 2) {
+			rec.release();
+			chanCfg = AudioFormat.CHANNEL_IN_MONO;
+			channels = 1;
+			minBuf = AudioRecord.getMinBufferSize(AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT);
+			bufSize = Math.max(minBuf, AUDIO_SR * 2 / 5);
+			rec = new AudioRecord(audioSrc, AUDIO_SR, chanCfg, AudioFormat.ENCODING_PCM_16BIT, bufSize);
+		}
+		if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
+			rec.release();
+			return;
+		}
+		if (Build.VERSION.SDK_INT >= 23 && src != null && src.device != null)
+		rec.setPreferredDevice(src.device);
+		disableAudioEffects(rec.getAudioSessionId());
+		mAudRec = rec;
+		mAudChannels = channels;
+		startAudioThread(false);
+	}
+	
+	private void startAudioThread(boolean encoding) {
+		mAudRunning = true;
+		mEncoding = encoding;
+		mAudThread = new Thread(this::audioMainLoop, "aud-main");
+		mAudThread.setDaemon(true);
+		mAudThread.start();
+	}
+	
+	private void stopAudio() {
+		mAudRunning = false;
+		AudioRecord rec = mAudRec;
+		if (rec != null)
+		try {
+			rec.stop();
+			} catch (Exception ignored) {
+		}
+		if (mAudThread != null) {
+			try {
+				mAudThread.join(500);
+				} catch (InterruptedException ignored) {
+			}
+			mAudThread = null;
+		}
+		if (mAudRec != null) {
+			try {
+				mAudRec.release();
+				} catch (Exception ignored) {
+			}
+			mAudRec = null;
+		}
+	}
+	
+	private void disableAudioEffects(int sid) {
+		try {
+			if (AutomaticGainControl.isAvailable()) {
+				AutomaticGainControl a = AutomaticGainControl.create(sid);
+				if (a != null) {
+					a.setEnabled(false);
+					a.release();
+				}
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (NoiseSuppressor.isAvailable()) {
+				NoiseSuppressor n = NoiseSuppressor.create(sid);
+				if (n != null) {
+					n.setEnabled(false);
+					n.release();
+				}
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (AcousticEchoCanceler.isAvailable()) {
+				AcousticEchoCanceler e = AcousticEchoCanceler.create(sid);
+				if (e != null) {
+					e.setEnabled(false);
+					e.release();
+				}
+			}
+			} catch (Exception ignored) {
+		}
+	}
+	
+		
+		
+		private void audioMainLoop() {
+		final AudioRecord rec = mAudRec;
+		final int ch = mAudChannels;
+		final int chunkSamples = AUDIO_SR * ch / 50;
+		short[] buf = new short[chunkSamples];
+
+		long totalFrames = 0L;   // кумулятивный счёт фреймов (per channel)
+
+		rec.startRecording();
+
+		while (mAudRunning) {
+			int r = rec.read(buf, 0, chunkSamples);
+			if (r <= 0) continue;
+
+			// ─── обработка громкости / soft-clip / визуализация (без изменений) ───
+			final float g = mGain;
+			final boolean sc = mSoftClip;
+			long sumSq = 0;
+			for (int i = 0; i < r; i++) {
+				float s = buf[i] * g;
+				if (sc) {
+					final float T = 32768f * 0.7f;
+					final float knee = 32768f - T;
+					float abs = Math.abs(s);
+					if (abs > T)
+						s = Math.signum(s) * (T + knee * (float) Math.tanh((abs - T) / knee));
+				}
+				if (s > 32767f) s = 32767f;
+				else if (s < -32768f) s = -32768f;
+				buf[i] = (short) s;
+				sumSq += (long) buf[i] * buf[i];
+			}
+
+			float peakAmp = 0f;
+			for (int _pi = 0; _pi < r; _pi++) {
+				float _a = Math.abs(buf[_pi]) / 32768f;
+				if (_a > peakAmp) peakAmp = _a;
+			}
+			mVu.setPeak(peakAmp);
+			mVu.setLevel((float) Math.sqrt((double) sumSq / r) / 32768f);
+
+			if (mOscilloscope != null) mOscilloscope.pushSamples(buf, r, ch);
+			if (mEnvelope != null) mEnvelope.pushSamples(buf, r, ch);
+			if (mSpectrum != null) mSpectrum.pushSamples(buf, r, ch);
+
+			if (!mEncoding) continue;
+
+			if (!mRecording) {
+				int idx = mAudEnc.dequeueInputBuffer(50_000);
+				if (idx >= 0)
+					mAudEnc.queueInputBuffer(idx, 0, 0, 0, MediaCodec.BUFFER_FLAG_END_OF_STREAM);
+				drainAudioCodec(true);
+				mEncoding = false;
+				CountDownLatch latch = mAudDoneLatch;
+				if (latch != null) latch.countDown();
+				continue;
+			}
+
+			// ─── PTS с компенсацией реальной задержки камеры ─────
+			int numFrames = r / ch;
+			long audioTimeUs = totalFrames * 1_000_000L / AUDIO_SR;
+			long pts = Math.max(0L, audioTimeUs - 215_000L);   // ← сюда  число в микросекундах
+			totalFrames += numFrames;
+			
+			
+			int idx = mAudEnc.dequeueInputBuffer(10_000);
+			if (idx >= 0) {
+				ByteBuffer bb = mAudEnc.getInputBuffer(idx);
+				bb.clear();
+				for (int i = 0; i < r; i++) {
+					bb.put((byte) (buf[i] & 0xFF));
+					bb.put((byte) (buf[i] >> 8 & 0xFF));
+				}
+				mAudEnc.queueInputBuffer(idx, 0, r * 2, pts, 0);
+			}
+
+			drainAudioCodec(false);
+		}
+
+		mVu.setLevel(0f);
+		try { rec.stop(); } catch (Exception ignored) {}
+	}
+		
+	private void drainAudioCodec(boolean eos) {
+		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+		while (true) {
+			int out = mAudEnc.dequeueOutputBuffer(info, eos ? 50_000 : 0);
+			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+				synchronized (mMuxLock) {
+					mAudTrack = mMuxer.addTrack(mAudEnc.getOutputFormat());
+					tryStartMuxer();
+				}
+				} else if (out >= 0) {
+				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+				if (mMuxReady && !cfg && info.size > 0) {
+					ByteBuffer data = mAudEnc.getOutputBuffer(out);
+					synchronized (mMuxLock) {
+						if (mMuxReady)
+						mMuxer.writeSampleData(mAudTrack, data, info);
+					}
+				}
+				mAudEnc.releaseOutputBuffer(out, false);
+				if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0)
+				break;
+			} else
+			break;
+		}
+	}
+	
+	// =========================================================================
+	// Видео-поток
+	// =========================================================================
+	
+	private void videoLoop(String path) {
+		MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
+		boolean eosSent = false;
+		long baseTs = -1;
+		while (true) {
+			if (!mRecording && !eosSent) {
+				try {
+					mVidEnc.signalEndOfInputStream();
+					} catch (Exception ignored) {
+				}
+				eosSent = true;
+			}
+			int out = mVidEnc.dequeueOutputBuffer(info, 20_000);
+			if (out == MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+				synchronized (mMuxLock) {
+					mVidTrack = mMuxer.addTrack(mVidEnc.getOutputFormat());
+					tryStartMuxer();
+				}
+				} else if (out >= 0) {
+				boolean cfg = (info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+				if (mMuxReady && !cfg && info.size > 0) {
+					if (baseTs < 0)
+					baseTs = info.presentationTimeUs;
+					ByteBuffer data = mVidEnc.getOutputBuffer(out);
+					MediaCodec.BufferInfo n = new MediaCodec.BufferInfo();
+					n.set(info.offset, info.size, info.presentationTimeUs - baseTs, info.flags);
+					synchronized (mMuxLock) {
+						if (mMuxReady)
+						mMuxer.writeSampleData(mVidTrack, data, n);
+					}
+				}
+				mVidEnc.releaseOutputBuffer(out, false);
+				if ((info.flags & MediaCodec.BUFFER_FLAG_END_OF_STREAM) != 0)
+				break;
+			}
+		}
+		try {
+			if (mAudDoneLatch != null)
+			mAudDoneLatch.await(5000, TimeUnit.MILLISECONDS);
+			} catch (InterruptedException ignored) {
+		}
+		cleanup(path);
+	}
+	
+	private void tryStartMuxer() {
+		if (!mMuxReady && mVidTrack >= 0 && mAudTrack >= 0) {
+			mMuxer.start();
+			mMuxReady = true;
+			if (mVidEnc != null)
+			try {
+				Bundle p = new Bundle();
+				p.putInt(MediaCodec.PARAMETER_KEY_REQUEST_SYNC_FRAME, 0);
+				mVidEnc.setParameters(p);
+				} catch (Exception ignored) {
+			}
+		}
+	}
+	
+	// =========================================================================
+	// Финализация
+	// =========================================================================
+	
+	private void cleanup(String savedPath) {
+		try {
+			if (mVidEnc != null) {
+				mVidEnc.stop();
+				mVidEnc.release();
+				mVidEnc = null;
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (mAudEnc != null) {
+				mAudEnc.stop();
+				mAudEnc.release();
+				mAudEnc = null;
+			}
+			} catch (Exception ignored) {
+		}
+		try {
+			if (mEncSurface != null) {
+				mEncSurface.release();
+				mEncSurface = null;
+			}
+			} catch (Exception ignored) {
+		}
+		synchronized (mMuxLock) {
+			try {
+				if (mMuxer != null) {
+					if (mMuxReady)
+					mMuxer.stop();
+					mMuxer.release();
+					mMuxer = null;
+					mMuxReady = false;
+				}
+				} catch (Exception ignored) {
+			}
+		}
+		try {
+			if (mPfd != null) {
+				mPfd.close();
+				mPfd = null;
+			}
+			} catch (Exception ignored) {
+		}
 		if (Build.VERSION.SDK_INT >= 29 && mPendingUri != null) {
 			ContentValues cv = new ContentValues();
 			cv.put(MediaStore.Video.Media.IS_PENDING, 0);
 			getContentResolver().update(mPendingUri, cv, null, null);
 			mPendingUri = null;
 		}
+		final String msg = savedPath != null ? "Saved: " + savedPath : "Stopped";
 		runOnUiThread(() -> {
-			mBtn.setText("⏺ REC"); mBtn.setBackground(mBtnBgIdle); mBtn.setEnabled(true);
-			mBtnPause.setVisibility(View.GONE);
-			mPaused = false;
-			status("Saved");
+			mBtn.setText("⏺ REC");
+			mBtn.setBackground(mBtnBgIdle);
+			mBtn.setEnabled(true);
+			status(msg);
+			startPreview();
 		});
 	}
-
-
+	
 	private void status(String s) {
 		runOnUiThread(() -> mTvStatus.setText(s));
 	}
